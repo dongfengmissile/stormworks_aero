@@ -20,6 +20,49 @@ unsafe extern "system" fn editor_update_detour(a1: usize, a2: usize, a3: usize, 
     }
     // A panic cannot unwind out of an extern "system" fn: contain it here.
     let _ = std::panic::catch_unwind(|| crate::editor::on_tick(a1));
+    if TOOLBAR_HOOKED.load(Ordering::Relaxed) {
+        let _ = std::panic::catch_unwind(|| crate::toolbar::on_tick(a1));
+    }
+}
+
+static TOOLBAR_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Native "Aero wings" toolbar button: the toolbar init, editor event and mouse button hooks.
+/// All three or none (a button that does nothing, or a mode nobody leaves, is worse than none).
+unsafe fn install_toolbar_hooks() {
+    use crate::toolbar::*;
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    let targets: [(&str, usize, &[u8], *mut c_void); 3] = [
+        ("toolbar init", RVA_TOOLBAR_INIT, &[0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x08, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0xc0, 0x02, 0x00, 0x00], toolbar_init_detour as *mut c_void),
+        ("editor event", RVA_EDITOR_EVENT, &[0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x78, 0xfc, 0xff, 0xff, 0x48, 0x81, 0xec, 0x48, 0x04, 0x00, 0x00, 0x0f, 0x29, 0x70], editor_event_detour as *mut c_void),
+        ("editor mouse button", RVA_EDITOR_MOUSE_BUTTON, &[0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0xb8, 0xfb, 0xff, 0xff, 0x48, 0x81, 0xec, 0x08, 0x05, 0x00, 0x00, 0x0f, 0x29, 0x70], mouse_button_detour as *mut c_void),
+    ];
+    for (name, rva, pro, _) in &targets {
+        if !bytes_match(base + rva, pro) {
+            log_line(&format!("{name} prologue mismatch at {:#x}; no Aero wings toolbar button", base + rva));
+            return;
+        }
+    }
+    let mut origs = [std::ptr::null_mut(); 3];
+    for (i, (name, rva, _, detour)) in targets.iter().enumerate() {
+        match MinHook::create_hook((base + rva) as *mut c_void, *detour) {
+            Ok(o) => origs[i] = o,
+            Err(e) => {
+                log_line(&format!("create {name} hook: {e:?}; no Aero wings toolbar button"));
+                return;
+            }
+        }
+    }
+    let _ = ORIGINAL_INIT.set(std::mem::transmute::<*mut c_void, ToolbarInit>(origs[0]));
+    let _ = ORIGINAL_EVENT.set(std::mem::transmute::<*mut c_void, EditorEvent>(origs[1]));
+    let _ = ORIGINAL_MOUSE.set(std::mem::transmute::<*mut c_void, MouseButton>(origs[2]));
+    for (name, rva, _, _) in &targets {
+        if let Err(e) = MinHook::enable_hook((base + rva) as *mut c_void) {
+            log_line(&format!("enable {name} hook: {e:?}"));
+        }
+    }
+    TOOLBAR_HOOKED.store(true, Ordering::Relaxed);
+    log_line("toolbar hooks installed (Aero wings button)");
 }
 
 type PostStepSync = unsafe extern "system" fn(usize);
@@ -250,5 +293,10 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
     let _ = ORIGINAL_EDITOR_UPDATE.set(std::mem::transmute::<*mut c_void, EditorUpdate>(original));
     MinHook::enable_hook(target as *mut c_void).map_err(|e| format!("enable editor update hook: {e:?}"))?;
     log_line(&format!("editor update hooked at {target:#x}"));
+    if crate::plugin::toolbar_disabled() {
+        log_line("Aero wings toolbar button disabled by request (aero_disable_toolbar)");
+    } else {
+        install_toolbar_hooks();
+    }
     Ok(())
 }

@@ -43,3 +43,5 @@ mod paint;
 mod plugin;
 #[cfg(windows)]
 mod state;
+#[cfg(windows)]
+mod toolbar;

@@ -275,17 +275,16 @@ pub fn triangle_voxels(verts: &[u8], stride: usize, indices: &[u16]) -> Vec<[i32
         .collect()
 }
 
-/// Runs (first index, index count) of consecutive triangles in `[first, first+count)` whose voxel is stalled.
-pub fn stalled_runs(tri: &[[i32; 3]], first: u32, count: u32, set: &std::collections::HashSet<[i32; 3]>) -> Vec<(u32, u32)> {
+/// Runs (first index, index count, colour) of consecutive triangles in `[first, first+count)` whose
+/// voxel has a colour in `colours`, split where the colour changes.
+pub fn colour_runs(tri: &[[i32; 3]], first: u32, count: u32, colours: &std::collections::HashMap<[i32; 3], u32>) -> Vec<(u32, u32, u32)> {
     let (t0, t1) = ((first / 3) as usize, (((first + count) / 3) as usize).min(tri.len()));
-    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut runs: Vec<(u32, u32, u32)> = Vec::new();
     for t in t0..t1 {
-        if !set.contains(&tri[t]) {
-            continue;
-        }
+        let Some(&col) = colours.get(&tri[t]) else { continue };
         match runs.last_mut() {
-            Some(r) if r.0 + r.1 == t as u32 * 3 => r.1 += 3,
-            _ => runs.push((t as u32 * 3, 3)),
+            Some(r) if r.0 + r.1 == t as u32 * 3 && r.2 == col => r.1 += 3,
+            _ => runs.push((t as u32 * 3, 3, col)),
         }
     }
     runs
@@ -294,7 +293,7 @@ pub fn stalled_runs(tri: &[[i32; 3]], first: u32, count: u32, set: &std::collect
 #[cfg(test)]
 mod paint_tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     #[test]
     fn faces_map_to_their_voxel_and_runs_merge() {
@@ -317,10 +316,12 @@ mod paint_tests {
         }
         let tri = triangle_voxels(&verts, 28, &[0, 1, 2, 3, 4, 5, 0, 1, 2]);
         assert_eq!(tri, vec![[1, 0, 0], [-2, 3, 4], [1, 0, 0]]);
-        let set: HashSet<[i32; 3]> = [[1, 0, 0]].into();
-        assert_eq!(stalled_runs(&tri, 0, 9, &set), vec![(0, 3), (6, 3)]);
-        let set: HashSet<[i32; 3]> = [[1, 0, 0], [-2, 3, 4]].into();
-        assert_eq!(stalled_runs(&tri, 0, 9, &set), vec![(0, 9)]);
-        assert_eq!(stalled_runs(&tri, 3, 6, &set), vec![(3, 6)]);
+        let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7)].into();
+        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 3, 7), (6, 3, 7)]);
+        let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7), ([-2, 3, 4], 7)].into();
+        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 9, 7)]);
+        assert_eq!(colour_runs(&tri, 3, 6, &set), vec![(3, 6, 7)]);
+        let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7), ([-2, 3, 4], 9)].into();
+        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 3, 7), (3, 3, 9), (6, 3, 7)]);
     }
 }

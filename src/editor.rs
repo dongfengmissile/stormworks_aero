@@ -19,10 +19,13 @@ pub(crate) struct Snapshot {
 pub(crate) static LATEST: Mutex<Option<Arc<Snapshot>>> = Mutex::new(None);
 /// Set by the overlay while its window is open; reading is skipped otherwise.
 pub(crate) static WANTED: AtomicBool = AtomicBool::new(false);
-/// Set by the overlay while the plugin model is drawn in the workbench view.
-pub(crate) static WORLD_WANTED: AtomicBool = AtomicBool::new(false);
+/// Workbench paint (F8), set by the overlay: (key that changes with the colours, voxel colours per
+/// body index as `Comp::body` numbers them); None = off.
+/// Set by the overlay while it picks blocks on the workbench vehicle with the cursor.
+pub(crate) static PICK_WANTED: AtomicBool = AtomicBool::new(false);
 /// Body frame (aero axes, metres) -> OpenGL clip space of the editor camera, row vectors.
 pub(crate) static WORLD_CLIP: Mutex<Option<[f64; 16]>> = Mutex::new(None);
+pub(crate) static PAINT: Mutex<Option<(u64, Vec<Arc<crate::paint::VoxelColours>>)>> = Mutex::new(None);
 
 /// Milliseconds (since bootstrap) of the last editor tick: the editor is open if recent.
 pub(crate) static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
@@ -173,7 +176,7 @@ unsafe fn read_clip(editor: usize) -> Option<[f64; 16]> {
 pub(crate) unsafe fn on_tick(editor: usize) {
     LAST_TICK_MS.store(now_ms().max(1), Ordering::Relaxed);
     let tick = TICKS.fetch_add(1, Ordering::Relaxed);
-    if WORLD_WANTED.load(Ordering::Relaxed) {
+    if PICK_WANTED.load(Ordering::Relaxed) {
         let _fault = crate::fault::enter(crate::fault::stage::EDITOR_SNAPSHOT);
         let _cache = RegionCacheScope::new();
         let clip = read_clip(editor);
@@ -181,6 +184,19 @@ pub(crate) unsafe fn on_tick(editor: usize) {
             log_line(&format!("editor: camera/vehicle transform rejected (editor {editor:#x})"));
         }
         *WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()) = clip;
+    }
+    let paint = PAINT.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    {
+        let _fault = crate::fault::enter(crate::fault::stage::EDITOR_SNAPSHOT);
+        let _cache = RegionCacheScope::new();
+        let (key, colours) = match paint {
+            Some((key, per_body)) => {
+                let bodies = vehicle_bodies(read_usize_at(editor + OFF_EDITOR_VEHICLE)).unwrap_or_default();
+                (key, bodies.into_iter().zip(per_body).filter(|(_, c)| !c.is_empty()).collect())
+            }
+            None => (0, HashMap::new()),
+        };
+        crate::paint::publish_workbench(key, &colours);
     }
     if !WANTED.load(Ordering::Relaxed) || tick % 10 != 0 {
         return;

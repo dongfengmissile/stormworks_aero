@@ -21,9 +21,6 @@ use crate::wing::{Role, AEROFOILS};
 
 const VIEW_W: usize = 760;
 const VIEW_H: usize = 460;
-/// In-world model texture, stretched over the whole screen (projection is NDC-based).
-const WORLD_W: usize = 960;
-const WORLD_H: usize = 540;
 
 const CL_COLOR: [f32; 4] = [0.0, 1.0, 1.0, 1.0];
 const CD_COLOR: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
@@ -31,7 +28,7 @@ const CM_COLOR: [f32; 4] = [1.0, 0.92, 0.016, 1.0];
 const LD_COLOR: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 const FLAPS: [&str; 4] = ["0 (up)", "1 (init climb)", "2 (takeoff)", "3 (landing)"];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tool {
     Inspect,
     Wing,
@@ -64,6 +61,9 @@ pub(crate) struct Overlay {
     vehicle_name: String,
     /// Last automatic `.aero` lookup (ms).
     auto_ms: u64,
+    /// A folder scan was skipped by the 2 s throttle: retry it (else a vehicle that is not being
+    /// edited never gets its designations).
+    auto_pending: bool,
     des: Designations,
 
     // Model, built off the render thread.
@@ -118,16 +118,17 @@ pub(crate) struct Overlay {
     dragged: bool,
     /// Designations before each wing / role edit (Ctrl+Z).
     undo: Vec<Designations>,
+    /// Designations undone, for redo (cleared by a new edit).
+    redo: Vec<Designations>,
 
-    // Plugin model drawn in the workbench view instead of the game's (F8).
+    /// Workbench vehicle painted by wing role / aerofoil (F8).
     world: bool,
-    world_tex: Option<TextureId>,
-    world_img: Option<Image>,
-    world_upload: bool,
-    /// Camera and face list the current world image was rendered with.
-    world_key: Option<([f64; 16], usize)>,
-    /// The game's show/hide vehicle key is due (sent once the game gets keys again).
-    press_hide: bool,
+    /// The game's "Aero wings" toolbar mode is on (picking on the real vehicle).
+    bench: bool,
+    /// Paint was switched on by entering that mode (switch it off again on leaving).
+    bench_painted: bool,
+    /// What the published paint was computed from: (model, aerofoil colours, designated wing count).
+    paint_key: Option<(usize, bool, usize)>,
     /// Flight data readout (F9).
     flight_data: bool,
 }
@@ -144,6 +145,7 @@ impl Overlay {
             use_file: false,
             vehicle_name: String::new(),
             auto_ms: 0,
+            auto_pending: false,
             des: Designations::default(),
             model: None,
             faces: Arc::new(Vec::new()),
@@ -185,22 +187,21 @@ impl Overlay {
             hover_face: None,
             dragged: false,
             undo: Vec::new(),
+            redo: Vec::new(),
             world: false,
-            world_tex: None,
-            world_img: None,
-            world_upload: false,
-            world_key: None,
-            press_hide: false,
+            paint_key: None,
+            bench: false,
+            bench_painted: false,
             flight_data: false,
         }
     }
 
-    /// Swap the workbench view between the game's vehicle and the plugin's voxel model.
+    /// Paint the workbench vehicle by wing role / aerofoil, or stop.
     fn set_world(&mut self, on: bool) {
-        if on != self.world {
-            self.world = on;
-            self.world_key = None;
-            self.press_hide = !self.press_hide;
+        self.world = on;
+        self.paint_key = None;
+        if !on {
+            *editor::PAINT.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 
@@ -244,24 +245,78 @@ impl Overlay {
         });
     }
 
-    fn draw_world(&mut self, ui: &Ui) {
-        if !editor::editor_active() {
+    /// The game's "Aero wings" toolbar mode: paint on, a small tool window, clicks on the vehicle
+    /// applied with the current tool.
+    fn bench_mode(&mut self, ui: &Ui) {
+        let on = crate::toolbar::active();
+        editor::PICK_WANTED.store(on, Ordering::Relaxed);
+        if on != self.bench {
+            self.bench = on;
+            if on {
+                self.bench_painted = !self.world;
+                self.set_world(true);
+                let _ = crate::toolbar::take_click(); // a press from before the mode
+            } else if self.bench_painted {
+                self.set_world(false);
+            }
+        }
+        if !on {
             return;
         }
-        let clip = *editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner());
-        let (Some(clip), Some(m)) = (clip, self.model.clone()) else { return };
-        let key = (clip, Arc::as_ptr(&self.faces) as usize);
-        if !self.world_upload && self.world_key != Some(key) {
-            // shortcut: CPU render on the render thread (~20 ms while the camera moves), move to a worker if it stutters.
-            let faces = self.faces.clone();
-            let pr = view::Projection::from_clip(clip, WORLD_W, WORLD_H);
-            self.world_img = Some(view::render_with(&faces, &|i| self.face_color(&m, i, None), &pr, WORLD_W, WORLD_H, [0; 4]));
-            self.world_upload = true;
-            self.world_key = Some(key);
+        // Tool, role and aerofoil come from the game-style side shelves.
+        let tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
+        if tool != self.tool {
+            self.tool = tool;
+            self.view_dirty = true;
         }
-        if let Some(tex) = self.world_tex {
-            ui.get_background_draw_list().add_image(tex, [0.0, 0.0], ui.io().display_size).build();
+        self.role_pick = crate::toolbar::ROLE.load(Ordering::Relaxed).min(4);
+        self.foil_pick = crate::toolbar::FOIL.load(Ordering::Relaxed).min(AEROFOILS.len() - 1);
+        for _ in 0..crate::toolbar::UNDO_REQ.swap(0, Ordering::Relaxed) {
+            self.undo_designation();
         }
+        for _ in 0..crate::toolbar::REDO_REQ.swap(0, Ordering::Relaxed) {
+            self.redo_designation();
+        }
+        if let (Some(at), Some(m)) = (crate::toolbar::take_click(), self.model.clone()) {
+            let io = ui.io();
+            let clip = editor::WORLD_CLIP.lock().map(|c| c.is_some()).unwrap_or(false);
+            let pick = self.pick_world(at, io.display_size);
+            let (cell, comp) = pick.and_then(|f| self.faces.get(f)).map_or((usize::MAX, u32::MAX), |f| (f.cell, f.comp));
+            log_line(&format!("bench pick at {at:?}: camera {} face {pick:?} cell {cell} comp {comp} tool {:?}", if clip { "ok" } else { "MISSING" }, self.tool));
+            match pick {
+                Some(face) => {
+                    // The wing shelf's mode stands in for Shift / Ctrl (which still work).
+                    let wm = if self.tool == Tool::Wing { crate::toolbar::WING_MODE.load(Ordering::Relaxed) } else { 0 };
+                    self.apply_tool(&m, face, io.key_shift || wm == 1, io.key_ctrl || wm == 2)
+                }
+                None => self.status = "no block under the cursor".into(),
+            }
+        }
+    }
+
+    /// Publish the workbench paint (voxel colours per body) when the model or colouring changed.
+    fn publish_paint(&mut self) {
+        let Some(m) = self.model.clone() else { return };
+        let key = (Arc::as_ptr(&m) as usize, self.tool == Tool::Foil, self.des.wings.len());
+        if self.paint_key == Some(key) {
+            return;
+        }
+        self.paint_key = Some(key);
+        let g = &m.grid;
+        let mut per_body: Vec<crate::paint::VoxelColours> = Vec::new();
+        for cell in 0..g.owner.len() {
+            let o = g.owner[cell];
+            let Some(col) = self.cell_color(&m, cell) else { continue };
+            let b = if o != EMPTY && o != INTERIOR { m.comps[o as usize].body as usize } else { continue };
+            if per_body.len() <= b {
+                per_body.resize_with(b + 1, Default::default);
+            }
+            per_body[b].insert(g.cell(cell), crate::paint::rgba(col));
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&key, &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        *editor::PAINT.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, per_body.into_iter().map(Arc::new).collect()));
     }
 
     fn sidecar(&self) -> Option<PathBuf> {
@@ -311,14 +366,17 @@ impl Overlay {
     fn auto_designations(&mut self) {
         let Some(snap) = self.snapshot.clone() else { return };
         if self.des.match_score(&snap.comps).is_some_and(|x| x.0 >= 0.5) {
+            self.auto_pending = false;
             self.prune_stale();
             return;
         }
         let now = editor::now_ms();
-        if now.saturating_sub(self.auto_ms) < 2000 {
-            return; // every edit changes the snapshot: don't rescan the folder each time
+        if self.auto_ms != 0 && now.saturating_sub(self.auto_ms) < 2000 {
+            self.auto_pending = true; // every edit changes the snapshot: don't rescan the folder each time
+            return;
         }
-        self.auto_ms = now;
+        self.auto_ms = now.max(1);
+        self.auto_pending = false;
         match Designations::best_match(&self.vehicles_dir, &snap.comps, 0.5) {
             Some((d, name, score, missing)) => {
                 self.undo.clear();
@@ -387,6 +445,8 @@ impl Overlay {
                 self.snapshot = latest;
                 self.model_dirty = true;
                 self.auto_designations();
+            } else if self.auto_pending {
+                self.auto_designations();
             }
         }
         if !self.model_dirty || self.building.load(Ordering::Acquire) {
@@ -434,7 +494,7 @@ impl Overlay {
     fn header(&mut self, ui: &Ui) {
         let in_editor = editor::editor_active();
         let mut world = self.world;
-        if ui.checkbox("Plugin model in the workbench view (F8)", &mut world) {
+        if ui.checkbox("Paint wings in the workbench (F8)", &mut world) {
             self.set_world(world);
         }
         ui.same_line();
@@ -765,7 +825,8 @@ impl Overlay {
         plot(ui, "area", [ui.content_region_avail()[0], 280.0], &xs, &series, n, "Position along the vehicle, m (nose right)");
     }
 
-    fn tab_voxels(&mut self, ui: &Ui, m: &Arc<Model>) {
+    /// Tool choice with its role / aerofoil pickers (voxel tab and the workbench pick mode).
+    fn tool_controls(&mut self, ui: &Ui) {
         let tool_before = self.tool;
         if ui.radio_button_bool("Inspect", self.tool == Tool::Inspect) {
             self.tool = Tool::Inspect;
@@ -812,6 +873,24 @@ impl Overlay {
                 a.kappa - a.t_c
             ));
         }
+    }
+
+    /// Face of the workbench vehicle under a view point (normalised, x right, y down, -1..1),
+    /// through the editor camera (CPU id render at half resolution; only run on a click).
+    fn pick_world(&self, at: [f32; 2], display: [f32; 2]) -> Option<usize> {
+        let clip = (*editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()))?;
+        let (w, h) = (((display[0] / 2.0) as usize).max(16), ((display[1] / 2.0) as usize).max(16));
+        let (fx, fy) = ((at[0] + 1.0) * 0.5 * w as f32, (at[1] + 1.0) * 0.5 * h as f32);
+        if !(0.0..w as f32).contains(&fx) || !(0.0..h as f32).contains(&fy) {
+            return None;
+        }
+        let (x, y) = (fx as usize, fy as usize);
+        let img = view::render_with(&self.faces, &|_| [0, 0, 0], &view::Projection::from_clip(clip, w, h), w, h, [0; 4]);
+        img.id.get(y * w + x).filter(|&&id| id != 0).map(|&id| id as usize - 1)
+    }
+
+    fn tab_voxels(&mut self, ui: &Ui, m: &Arc<Model>) {
+        self.tool_controls(ui);
         ui.same_line();
         if ui.button("Reset view") {
             self.frame_camera(m);
@@ -990,6 +1069,7 @@ impl Overlay {
             }
         }
         if self.des != before {
+            self.redo.clear();
             self.undo.push(before);
             if self.undo.len() > 200 {
                 self.undo.remove(0);
@@ -999,6 +1079,7 @@ impl Overlay {
     }
 
     fn push_undo(&mut self) {
+        self.redo.clear();
         self.undo.push(self.des.clone());
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -1008,23 +1089,29 @@ impl Overlay {
     fn undo_designation(&mut self) {
         match self.undo.pop() {
             Some(d) => {
-                self.des = d;
+                self.redo.push(std::mem::replace(&mut self.des, d));
                 self.designations_changed();
             }
             None => self.status = "nothing to undo".into(),
         }
     }
 
-    fn face_color(&self, m: &Model, face: usize, hover_comp: Option<u32>) -> [u8; 3] {
-        let des = &self.des;
-        let cell = self.faces[face].cell;
-        let o = self.faces[face].comp;
-        let mut c: [u8; 3] = match m.panel_of[cell] {
-            usize::MAX if o != EMPTY && o != INTERIOR && des.wings.contains(&m.comps[o as usize].pos) => [40, 60, 150],
-            usize::MAX => {
-                let b = if o != EMPTY && o != INTERIOR { m.comps[o as usize].body } else { 0 };
-                if b == 0 { [150, 150, 150] } else { [135, 145, 160] }
+    fn redo_designation(&mut self) {
+        match self.redo.pop() {
+            Some(d) => {
+                self.undo.push(std::mem::replace(&mut self.des, d));
+                self.designations_changed();
             }
+            None => self.status = "nothing to redo".into(),
+        }
+    }
+
+    /// Wing colour of a grid cell (role, or aerofoil in the aerofoil tool); None for non-wing cells.
+    fn cell_color(&self, m: &Model, cell: usize) -> Option<[u8; 3]> {
+        let o = m.grid.owner[cell];
+        Some(match m.panel_of[cell] {
+            usize::MAX if o != EMPTY && o != INTERIOR && self.des.wings.contains(&m.comps[o as usize].pos) => [40, 60, 150],
+            usize::MAX => return None,
             p if self.tool == Tool::Foil => FOIL_COLORS[m.panels[p].foil % FOIL_COLORS.len()],
             p => match m.panels[p].role {
                 Role::None => [90, 150, 230],
@@ -1033,7 +1120,16 @@ impl Overlay {
                 Role::Yaw => [70, 210, 90],
                 Role::Flap => [230, 220, 60],
             },
-        };
+        })
+    }
+
+    fn face_color(&self, m: &Model, face: usize, hover_comp: Option<u32>) -> [u8; 3] {
+        let cell = self.faces[face].cell;
+        let o = self.faces[face].comp;
+        let mut c = self.cell_color(m, cell).unwrap_or_else(|| {
+            let b = if o != EMPTY && o != INTERIOR { m.comps[o as usize].body } else { 0 };
+            if b == 0 { [150, 150, 150] } else { [135, 145, 160] }
+        });
         if hover_comp == Some(o) {
             c = c.map(|v: u8| v.saturating_add(70));
         }
@@ -1230,22 +1326,10 @@ impl ImguiRenderLoop for Overlay {
             Ok(t) => self.tex = Some(t),
             Err(e) => log_line(&format!("voxel view texture failed: {e:?}")),
         }
-        match render_context.load_texture(&vec![0u8; WORLD_W * WORLD_H * 4], WORLD_W as u32, WORLD_H as u32) {
-            Ok(t) => self.world_tex = Some(t),
-            Err(e) => log_line(&format!("world view texture failed: {e:?}")),
-        }
         log_line("overlay initialised (F7 toggles the aero analysis window)");
     }
 
     fn before_render<'a>(&'a mut self, _ctx: &mut Context, render_context: &'a mut dyn RenderContext) {
-        if self.world_upload {
-            self.world_upload = false;
-            if let (Some(tex), Some(img)) = (self.world_tex, self.world_img.as_ref()) {
-                if let Err(e) = render_context.replace_texture(tex, &img.rgba, img.w as u32, img.h as u32) {
-                    log_line(&format!("world view upload failed: {e:?}"));
-                }
-            }
-        }
         if self.upload {
             self.upload = false;
             if let (Some(tex), Some(img)) = (self.tex, self.img.as_ref()) {
@@ -1261,9 +1345,8 @@ impl ImguiRenderLoop for Overlay {
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_ok();
         if !ok {
             self.open = false;
-            self.world = false;
+            self.set_world(false);
             editor::WANTED.store(false, Ordering::Relaxed);
-            editor::WORLD_WANTED.store(false, Ordering::Relaxed);
             log_line("overlay frame panicked; window closed (see the PANIC line above)");
         }
     }
@@ -1276,6 +1359,8 @@ impl ImguiRenderLoop for Overlay {
 impl Overlay {
     fn frame(&mut self, ui: &Ui) {
         let _fault = crate::fault::enter(crate::fault::stage::OVERLAY_RENDER);
+        crate::paint::new_frame();
+        crate::toolbar::upload_icons();
         // imgui-rs builds the draw-list slice from a null pointer when a frame draws nothing,
         // which panics under debug assertions (and is UB anyway): always emit one invisible quad.
         ui.get_foreground_draw_list().add_rect([-4.0, -4.0], [-3.0, -3.0], [0.0, 0.0, 0.0, 0.01]).filled(true).build();
@@ -1284,15 +1369,6 @@ impl Overlay {
         }
         if ui.is_key_pressed(Key::F8) {
             self.set_world(!self.world);
-        }
-        if self.press_hide {
-            if ui.io().want_capture_keyboard {
-                // Our window holds the keyboard, so the game would not see the key: drop focus first.
-                unsafe { imgui::sys::igSetWindowFocus_Str(std::ptr::null()) };
-            } else {
-                press_game_key(b'H');
-                self.press_hide = false;
-            }
         }
         if ui.is_key_pressed(Key::F9) {
             self.flight_data = !self.flight_data;
@@ -1303,12 +1379,12 @@ impl Overlay {
             draw_force_arrows(ui);
         }
         editor::WANTED.store(self.open || self.world, Ordering::Relaxed);
-        editor::WORLD_WANTED.store(self.world, Ordering::Relaxed);
         if self.open || self.world {
             self.pump_model();
         }
+        self.bench_mode(ui);
         if self.world {
-            self.draw_world(ui);
+            self.publish_paint();
         }
         if !self.open {
             return;
@@ -1348,7 +1424,7 @@ impl Overlay {
     }
 
     fn filter(&self, io: &Io) -> MessageFilter {
-        if !self.open {
+        if !self.open && !self.bench {
             return MessageFilter::empty();
         }
         let mut f = MessageFilter::empty();
@@ -1361,24 +1437,6 @@ impl Overlay {
             f |= MessageFilter::InputKeyboard | MessageFilter::InputRaw;
         }
         f
-    }
-}
-
-/// Tap a key in the game window, as if the user pressed it (the editor reads keys from
-/// WM_KEYDOWN/UP through GLFW's window procedure, scancode in lParam).
-/// shortcut: assumes the default show/hide vehicle binding (H); read the binding table
-/// (get_input_settings 0x21abb0, current key at +0x2C of each 0x58 record) if users rebind it.
-fn press_game_key(vk: u8) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, PostMessageW, WM_KEYDOWN, WM_KEYUP};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return;
-        }
-        let sc = (MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as isize) << 16;
-        PostMessageW(hwnd, WM_KEYDOWN, vk as usize, 1 | sc);
-        PostMessageW(hwnd, WM_KEYUP, vk as usize, 1 | sc | (3 << 30));
     }
 }
 

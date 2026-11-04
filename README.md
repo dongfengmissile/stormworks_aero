@@ -14,7 +14,9 @@ Press **F7** in the workbench to open the analysis window, laid out like FAR's e
 - **Transonic Design**: area ruling. Cross-section area curve, its curvature, the Mach 1 pressure coefficient, max cross-section, Mach 1 wave drag area and critical Mach.
 - **Voxels & Wings**: the vehicle's voxels in a 3D view, with the centre of mass and centre of lift.
 
-Press **F8** in the workbench (or tick the box at the top of the window) to swap the game's vehicle for the plugin's voxel model, drawn in the workbench view itself, so you can fly the editor camera around what the analysis sees. F8 again swaps back. It hides the game's vehicle with the editor's show/hide key, so this assumes that key is still bound to H.
+Press **F8** in the workbench (or tick the box at the top of the window) to paint the workbench vehicle's wing blocks in the game's own render, in the same colours as the voxel view: by control role (plain wing blue, pitch orange, roll magenta, yaw green, flap yellow), by aerofoil while the aerofoil tool is selected, and dark blue for designated wing blocks outside a panel. Other blocks keep their own colours. F8 again turns it off. The analysis window does not need to be open.
+
+The workbench toolbar also gets an **Aero wings** button (propeller icon, after the microcontroller button). It turns that wing paint on and lets you designate on the real vehicle, with game-style side shelves at the left edge: the tool (wing blocks, control role, aerofoil), and next to it the role or aerofoil to give (names in the tooltips). Clicking a block of the vehicle applies the selected tool. While the mode is on, the game's own tools ignore left clicks; pick any other toolbar tool to leave it. `aero_disable_toolbar` in the game folder removes the button.
 
 ## In-game flight (experimental)
 

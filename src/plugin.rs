@@ -20,6 +20,11 @@ fn disabled(dir: &Path, marker: &str, env: &str) -> bool {
     std::env::var(env).as_deref() == Ok("1") || dir.join(marker).exists()
 }
 
+static TOOLBAR_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn toolbar_disabled() -> bool {
+    TOOLBAR_OFF.load(Ordering::SeqCst)
+}
+
 static PAINT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) fn paint_disabled() -> bool {
     PAINT_OFF.load(Ordering::SeqCst)
@@ -72,6 +77,7 @@ fn bootstrap() {
     if disabled(&plugin_dir, "aero_disable_hook", "AERO_NO_HOOK") {
         log_line("editor hook disabled by request (aero_disable_hook / AERO_NO_HOOK)");
     } else {
+        TOOLBAR_OFF.store(disabled(&plugin_dir, "aero_disable_toolbar", "AERO_NO_TOOLBAR"), Ordering::SeqCst);
         match unsafe { crate::hooks::install_hooks() } {
             Ok(()) => log_line("hooks installed"),
             Err(e) => log_line(&e),
