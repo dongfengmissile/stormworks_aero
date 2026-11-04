@@ -37,6 +37,14 @@ windows-sys = { version = "0.61", features = [
 [profile.dev]
 # The editor hook runs every tick; unoptimised Rust there costs real FPS.
 opt-level = 2
+# Line tables are enough to map crash addresses to source lines (full DWARF made the DLL ~46 MB).
+debug = "line-tables-only"
 
 [profile.test]
 opt-level = 2
+
+[profile.release]
+# Shipped DLL: no symbol table, whole-program optimisation (smaller and a bit faster).
+strip = true
+lto = true
+codegen-units = 1
