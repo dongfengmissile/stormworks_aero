@@ -49,7 +49,7 @@ Wings in Stormworks are usually built from blocks, so the plugin has to be told 
 | Control role | give a control surface or hinged sub-grid a role: pitch, roll, yaw, flap |
 | Aerofoil | give a wing an aerofoil (hover the aircraft icons for their names) |
 
-Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil tool. Vanilla wings and control surfaces are wings automatically. Designations are saved to `data/vehicles/<name>.aero` and loaded automatically when the vehicle is.
+Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil tool. Vanilla wings and control surfaces are wings automatically. Designations are saved to `data/vehicles/<name>.aero` and loaded automatically when the vehicle is. **Beware** that if you edited your vehicle while the plugin was not injected, it might not get assigned its aero file if the voxels differ too much, so you'll have to mark wing blocks again.
 
 ## Keys
 
@@ -61,23 +61,11 @@ Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil t
 
 ## In flight
 
-The plugin flight model is on by default (toggle at the top of the F7 window). It switches off the game's air forces for every vehicle and applies its own: wings with their aerofoils, control surfaces (hinged sub-grids deflect by moving), fuselage lift and drag, ground effect, and Stormworks' own air density curve. Water forces are unchanged. Vanilla control fins don't deflect in the plugin's model yet.
+The plugin flight model is on by default (toggle at the top of the F7 window). It switches off the game's aerodynamic forces for every vehicle and applies its own: wings with their aerofoils, control surfaces (hinged sub-grids deflect by moving), fuselage lift and drag, ground effect, and Stormworks' own air density curve. Water forces are unchanged.
 
-## Kill switches
+## Credits
 
-A file with this name next to the DLL turns a part off:
-
-| file | |
-|---|---|
-| `aero_disable_flight` | in-game flight model |
-| `aero_disable_toolbar` | Aero wings button |
-| `aero_disable_paint` | block painting |
-| `aero_disable_overlay` | F7 / F8 / F9 windows |
-| `aero_disable_hook` | workbench reading |
-
-## Credits and license
-
-The aerodynamics are a port of FAR Continued (Ferram Aerospace Research, © ferram4 and the KSPModStewards contributors), which is GPLv3. This plugin is therefore GPLv3 too (see `LICENSE`).
+The aerodynamics are a port of FAR Continued (Ferram Aerospace Research, © ferram4 and the KSPModStewards contributors).
 
 ## Disclaimer
 
