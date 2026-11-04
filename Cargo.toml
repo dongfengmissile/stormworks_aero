@@ -1,0 +1,42 @@
+[package]
+name = "stormworks_aero"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lib]
+name = "StormworksAero"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+logging = []
+
+[[bin]]
+name = "aero_inject"
+path = "src/bin/aero_inject.rs"
+
+[target.'cfg(windows)'.dependencies]
+minhook = "0.9"
+# Same overlay stack as video_get_2 and swQolSuite (hooks wglSwapBuffers + the window proc).
+hudhook = { version = "0.7.1", default-features = false, features = ["opengl3"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev]
+# The editor hook runs every tick; unoptimised Rust there costs real FPS.
+opt-level = 2
+
+[profile.test]
+opt-level = 2

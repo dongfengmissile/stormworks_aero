@@ -1,0 +1,23 @@
+# The hudhook overlay pulls C++ (imgui, via the cc crate) into this cdylib.
+# cc's default `cpp_link_stdlib` adds `-lstdc++`, which links libstdc++
+# DYNAMICALLY -> hard import on libstdc++-6.dll. The game process cannot
+# resolve that DLL, so the injector's remote LoadLibraryW fails silently.
+# - CXXSTDLIB="" makes cc emit no C++ runtime link directive at all.
+# - `-l:libstdc++.a` (static archive) then satisfies all C++ symbols at link
+#   time; rustflags land at the end of the linker command, which is fine
+#   because nothing else defines those symbols.
+[env]
+CXXSTDLIB = ""
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-arg=-l:libstdc++.a",
+    # The static libstdc++ archive adds new undefined refs (sprintf, pthread
+    # mutexes, etc.); the CRT archives above were already scanned, so list
+    # them again afterwards for the single-pass linker.
+    "-C", "link-arg=-l:libpthread.a",
+    "-C", "link-arg=-lmsvcrt",
+    "-C", "link-arg=-lmingwex",
+    "-C", "link-arg=-lkernel32",
+    "-C", "link-arg=-luser32",
+]

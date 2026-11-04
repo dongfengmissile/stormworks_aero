@@ -1,0 +1,139 @@
+//! The vehicle as the analysis sees it: a flat list of placed components.
+//! Filled either from the live workbench (see `editor.rs`) or a saved vehicle XML.
+
+use crate::xml;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Comp {
+    /// Definition name (`d` attribute; file name of the definition).
+    pub def: String,
+    /// Voxel position in the vehicle grid.
+    pub pos: [i32; 3],
+    /// Voxel-space transform, row-major, as stored by the game (`r` attribute / comp+0x30):
+    /// a rotation, possibly stretched by XML editing.
+    pub rot: [i32; 9],
+    /// Body (sub-grid) index within this vehicle; 0 is the first body.
+    pub body: u32,
+}
+
+pub const IDENTITY: [i32; 9] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+impl Comp {
+    /// Grid cell of a definition-local voxel offset (offset as a row vector times `rot`;
+    /// the same convention the infrared plugin verified in game).
+    pub fn cell(&self, o: [i32; 3]) -> [i32; 3] {
+        let r = &self.rot;
+        [
+            self.pos[0] + r[0] * o[0] + r[3] * o[1] + r[6] * o[2],
+            self.pos[1] + r[1] * o[0] + r[4] * o[1] + r[7] * o[2],
+            self.pos[2] + r[2] * o[0] + r[5] * o[1] + r[8] * o[2],
+        ]
+    }
+}
+
+/// A component transform: a rotation, or a stretched one from XML editing
+/// (e.g. `0,0,-23,0,1,0,3,0,0`), or a flattened one that hides the part
+/// (`0,0,0,0,0,0,0,0,1`: no volume, mass kept). Garbage reads are rejected: huge.
+pub fn transform_ok(r: &[i32; 9]) -> bool {
+    r.iter().all(|v| v.abs() <= 1024)
+}
+
+/// `(p ⊙ mirror)·R`: mirror flags (bit 0 x, 1 y, 2 z) negate rows of the transform.
+pub fn flipped(mut r: [i32; 9], flags: i32) -> [i32; 9] {
+    for a in 0..3 {
+        if flags >> a & 1 != 0 {
+            r[a * 3..a * 3 + 3].iter_mut().for_each(|v| *v = -*v);
+        }
+    }
+    r
+}
+
+/// A rotation is a signed permutation; anything else is garbage.
+pub fn valid_rotation(r: &[i32; 9]) -> bool {
+    r.iter().all(|v| (-1..=1).contains(v))
+        && (0..3).all(|i| (0..3).filter(|&j| r[i * 3 + j] != 0).count() == 1)
+        && (0..3).all(|j| (0..3).filter(|&i| r[i * 3 + j] != 0).count() == 1)
+}
+
+/// Components of every body of a saved vehicle XML (microcontroller internals skipped).
+pub fn parse_vehicle_xml(text: &str) -> Vec<Comp> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut body: i64 = -1;
+    let mut cur: Option<Comp> = None;
+    // `t` on <c>: mirror flags of the part (1 = x, 2 = y, 4 = z), applied before `r`.
+    let mut flip = 0;
+    let ends = |stack: &[&str], tail: &[&str]| stack.ends_with(tail);
+    for tag in xml::tags(text) {
+        if tag.close {
+            if tag.name == "c" && ends(&stack, &["body", "components", "c"]) {
+                out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), ..c }));
+            }
+            if let Some(i) = stack.iter().rposition(|n| *n == tag.name) {
+                stack.truncate(i);
+            }
+            continue;
+        }
+        match tag.name {
+            "body" if ends(&stack, &["bodies"]) => body += 1,
+            "c" if ends(&stack, &["body", "components"]) => {
+                cur = Some(Comp {
+                    def: tag.get("d").unwrap_or("01_block").to_string(),
+                    pos: [0; 3],
+                    rot: IDENTITY,
+                    body: body.max(0) as u32,
+                });
+                flip = tag.int0("t");
+                if tag.empty {
+                    out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), ..c }));
+                }
+            }
+            "o" if ends(&stack, &["components", "c"]) => {
+                if let (Some(c), Some(r)) = (cur.as_mut(), tag.get("r")) {
+                    let v: Vec<i32> = r.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    if let Ok(rot) = <[i32; 9]>::try_from(v) {
+                        if transform_ok(&rot) {
+                            c.rot = rot;
+                        }
+                    }
+                }
+            }
+            "vp" if ends(&stack, &["c", "o"]) => {
+                if let Some(c) = cur.as_mut() {
+                    c.pos = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
+                }
+            }
+            _ => {}
+        }
+        if !tag.empty {
+            stack.push(tag.name);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bodies_and_skips_mc_internals() {
+        let s = r#"<vehicle><bodies><body unique_id="1"><components>
+            <c><o r="0,0,-1,-1,0,0,0,1,0"><vp x="-2" z="3"/></o></c>
+            <c d="02_wedge" t="5"><o><vp x="1"/></o></c>
+            <c d="microprocessor"><o><vp y="1"/><microprocessor_definition><group><components><c><object/></c></components></group></microprocessor_definition></o></c>
+            </components></body><body unique_id="2"><components><c d="02_wedge"><o/></c></components></body></bodies></vehicle>"#;
+        let mut v = parse_vehicle_xml(s);
+        let w = v.remove(1);
+        assert_eq!(w.rot, [-1, 0, 0, 0, 1, 0, 0, 0, -1], "t=5 mirrors x and z");
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].def, "01_block");
+        assert_eq!(v[0].pos, [-2, 0, 3]);
+        assert_eq!(v[0].rot, [0, 0, -1, -1, 0, 0, 0, 1, 0]);
+        assert_eq!(v[1].def, "microprocessor");
+        assert_eq!(v[1].pos, [0, 1, 0]);
+        assert_eq!((v[2].def.as_str(), v[2].body, v[2].pos), ("02_wedge", 1, [0, 0, 0]));
+        // row vector times rot: x offset 1 -> (0,0,-1)
+        assert_eq!(v[0].cell([1, 0, 0]), [-2, 0, 2]);
+    }
+}
