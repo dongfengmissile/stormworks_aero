@@ -56,7 +56,7 @@ Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil t
 | key | |
 |---|---|
 | F7 | analysis window: AoA / Mach sweeps, stability derivatives, response simulation, area ruling, voxel view |
-| F8 | paint wing blocks in the workbench |
+| F8 | paint wing blocks in the workbench (legacy) |
 | F9 | in flight: flight data (airspeed, Mach, AoA, Cl, Cd, L/D, thrust, air density, static margin…), lift/drag arrows, CG / CoL / CoT markers, stalled blocks painted red |
 
 ## In flight
