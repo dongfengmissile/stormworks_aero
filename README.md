@@ -51,7 +51,7 @@ Wings in Stormworks are usually built from blocks, so the plugin has to be told 
 
 Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil tool. Vanilla wings and control surfaces are wings automatically. Designations are saved to `data/vehicles/<name>.aero` and loaded automatically when the vehicle is. **Beware** that if you edited your vehicle while the plugin was not injected, it might not get assigned its aero file if the voxels differ too much, so you'll have to mark wing blocks again.
 
-## Keys
+## Keybindings
 
 | key | |
 |---|---|
