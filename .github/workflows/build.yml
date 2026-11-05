@@ -48,7 +48,7 @@ jobs:
           cargo +stable build --locked --target x86_64-pc-windows-gnu \
             --profile "$PROFILE" --features "$FEATURES" --lib --bin aero_inject
 
-      - name: Package DLL, EXE and licenses
+      - name: Package DLL and EXE only
         env:
           BUILD_DIRECTORY: ${{ matrix.directory }}
           ARCHIVE_NAME: ${{ matrix.archive }}
@@ -56,9 +56,8 @@ jobs:
           mkdir -p package dist
           cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/StormworksAero.dll" package/
           cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/aero_inject.exe" package/
-          cp LICENSE THIRD_PARTY_NOTICES.txt package/
           cd package
-          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll aero_inject.exe LICENSE THIRD_PARTY_NOTICES.txt
+          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll aero_inject.exe
 
       - name: Upload build ZIP
         uses: actions/upload-artifact@v7
