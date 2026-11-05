@@ -16,10 +16,10 @@ What happened, and what did you expect?
 3. 
 
 ## Log
-Attach `<Stormworks install>/logs/infrared_bootstrap.log`. Remove any sensitive information before sharing.
+Attach `<Stormworks install>/logs/aero.log`. Remove any sensitive information before sharing.
 
 ## Environment
-- Stormworks Infrared version:
+- Stormworks Aero version:
 - Stormworks version:
 - Operating system:
 
