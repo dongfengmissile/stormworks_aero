@@ -16,6 +16,11 @@ rustflags = [
     # mutexes, etc.); the CRT archives above were already scanned, so list
     # them again afterwards for the single-pass linker.
     "-C", "link-arg=-l:libpthread.a",
+    # winpthreads needs _gnu_exception_handler (libmingw32) and libstdc++'s TLS needs
+    # __emutls_get_address (libgcc_eh, static; libgcc_s would import the GCC DLL); older mingw
+    # (Ubuntu's GCC 13, CI) doesn't pick them up otherwise.
+    "-C", "link-arg=-lmingw32",
+    "-C", "link-arg=-lgcc_eh",
     "-C", "link-arg=-lmsvcrt",
     "-C", "link-arg=-lmingwex",
     "-C", "link-arg=-lkernel32",
