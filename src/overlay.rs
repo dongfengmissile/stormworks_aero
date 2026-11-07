@@ -34,6 +34,8 @@ enum Tool {
     Wing,
     Role,
     Foil,
+    /// Mark wing blocks as a separate wing (own panels and wing, e.g. for another aerofoil).
+    Split,
 }
 
 struct Built {
@@ -264,7 +266,10 @@ impl Overlay {
             return;
         }
         // Tool, role and aerofoil come from the game-style side shelves.
-        let tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
+        let mut tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
+        if tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 3 {
+            tool = Tool::Split; // the wing shelf's "New wing" button
+        }
         if tool != self.tool {
             self.tool = tool;
             self.view_dirty = true;
@@ -297,7 +302,7 @@ impl Overlay {
     /// Publish the workbench paint (voxel colours per body) when the model or colouring changed.
     fn publish_paint(&mut self) {
         let Some(m) = self.model.clone() else { return };
-        let key = (Arc::as_ptr(&m) as usize, self.tool == Tool::Foil, self.des.wings.len());
+        let key = (Arc::as_ptr(&m) as usize, self.tool == Tool::Foil, self.des.wings.len() + self.des.splits.len());
         if self.paint_key == Some(key) {
             return;
         }
@@ -843,6 +848,10 @@ impl Overlay {
         if ui.radio_button_bool("Aerofoil", self.tool == Tool::Foil) {
             self.tool = Tool::Foil;
         }
+        ui.same_line();
+        if ui.radio_button_bool("Separate wing", self.tool == Tool::Split) {
+            self.tool = Tool::Split;
+        }
         if (tool_before == Tool::Foil) != (self.tool == Tool::Foil) {
             self.view_dirty = true; // panel colours switch between roles and aerofoils
         }
@@ -901,6 +910,7 @@ impl Overlay {
             Tool::Wing => "Click: toggle a wing block. Shift+click: add the whole thin slab. Ctrl+click: remove the slab. Ctrl+Z: undo.",
             Tool::Role => "Click a vanilla control surface, or any block of a hinged sub-grid, to give it the selected role. Ctrl+Z: undo.",
             Tool::Foil => "Click a wing to give the whole wing (and the surfaces on it) the selected aerofoil. Shift+click: one panel only. Ctrl+Z: undo.",
+            Tool::Split => "Click a wing panel to make it a separate wing (lighter colour), or back. Shift+click: one block. Ctrl+Z: undo.",
         });
 
         let avail = ui.content_region_avail();
@@ -1017,14 +1027,17 @@ impl Overlay {
         match self.tool {
             Tool::Inspect => return,
             Tool::Wing => {
-                if shift || ctrl {
-                    for pos in slab(m, f) {
-                        if ctrl {
-                            self.des.wings.remove(&pos);
-                        } else {
-                            self.des.wings.insert(pos);
-                        }
+                if ctrl {
+                    let marked = self.des.wings.clone();
+                    for pos in slab(m, f, Some(&marked)) {
+                        self.des.wings.remove(&pos);
                     }
+                } else if shift {
+                    let add = slab(m, f, None);
+                    if add.is_empty() {
+                        self.status = "not a wing slab there (too thick, or the inside of the hull is behind it)".into();
+                    }
+                    self.des.wings.extend(add);
                 } else if !self.des.wings.remove(&comp.pos) {
                     self.des.wings.insert(comp.pos);
                 }
@@ -1047,6 +1060,27 @@ impl Overlay {
                     if self.foil_pick != self.des.default_foil {
                         let at = if j == pi { comp.pos } else { owners[0] };
                         self.des.foils.insert(at, self.foil_pick);
+                    }
+                }
+            }
+            Tool::Split => {
+                let Some(&pi) = m.panel_of.get(f.cell).filter(|&&p| p != usize::MAX) else {
+                    self.status = "that block is not part of a wing panel".into();
+                    return;
+                };
+                if shift {
+                    if !self.des.splits.remove(&comp.pos) {
+                        self.des.splits.insert(comp.pos);
+                    }
+                } else {
+                    // The whole panel: unmark it if it is marked, else mark all its blocks.
+                    let owners: Vec<[i32; 3]> = m.panels[pi].cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect();
+                    if m.separate.get(pi).copied().unwrap_or(false) {
+                        for p in &owners {
+                            self.des.splits.remove(p);
+                        }
+                    } else {
+                        self.des.splits.extend(owners);
                     }
                 }
             }
@@ -1109,7 +1143,8 @@ impl Overlay {
     /// Wing colour of a grid cell (role, or aerofoil in the aerofoil tool); None for non-wing cells.
     fn cell_color(&self, m: &Model, cell: usize) -> Option<[u8; 3]> {
         let o = m.grid.owner[cell];
-        Some(match m.panel_of[cell] {
+        let p = m.panel_of[cell];
+        let c = match p {
             usize::MAX if o != EMPTY && o != INTERIOR && self.des.wings.contains(&m.comps[o as usize].pos) => [40, 60, 150],
             usize::MAX => return None,
             p if self.tool == Tool::Foil => FOIL_COLORS[m.panels[p].foil % FOIL_COLORS.len()],
@@ -1120,7 +1155,9 @@ impl Overlay {
                 Role::Yaw => [70, 210, 90],
                 Role::Flap => [230, 220, 60],
             },
-        })
+        };
+        // Separate wings in a lighter shade, so the split shows.
+        Some(if p != usize::MAX && m.separate.get(p).copied().unwrap_or(false) { c.map(|v| v + (255 - v) / 2) } else { c })
     }
 
     fn face_color(&self, m: &Model, face: usize, hover_comp: Option<u32>) -> [u8; 3] {
@@ -1152,50 +1189,23 @@ impl Overlay {
     }
 }
 
-/// Grid positions of the components in the thin slab around a clicked face: cells of the
-/// same body reachable through cells no more than 4 voxels thick along the face normal.
-fn slab(m: &Model, f: &Face) -> Vec<[i32; 3]> {
+/// Grid positions of the components in the wing slab around a clicked face (see
+/// `voxel::slab_cells`). Adding (`marked` None): thin, air-bounded columns of the clicked body.
+/// Removing: the marked blocks of that body in the clicked plane, however thick.
+fn slab(m: &Model, f: &Face, marked: Option<&std::collections::HashSet<[i32; 3]>>) -> Vec<[i32; 3]> {
     let g = &m.grid;
     let n = f.normal;
     // Body-frame normal -> its dominant grid axis.
     let gnf = [n.y, -n.z, n.x];
-    let a = (0..3).max_by(|&i, &j| gnf[i].abs().total_cmp(&gnf[j].abs())).unwrap_or(1);
-    let mut gn = [0; 3];
-    gn[a] = 1;
+    let axis = (0..3).max_by(|&i, &j| gnf[i].abs().total_cmp(&gnf[j].abs())).unwrap_or(1);
     let owner_ok = |i: usize| g.owner[i] != EMPTY && g.owner[i] != INTERIOR;
     if !owner_ok(f.cell) {
         return Vec::new();
     }
     let body = m.comps[f.comp as usize].body;
-    let thickness = |c: [i32; 3]| {
-        let mut t = 1;
-        for s in [1, -1] {
-            let mut k = 1;
-            while g.index([c[0] + gn[0] * k * s, c[1] + gn[1] * k * s, c[2] + gn[2] * k * s]).is_some_and(|j| g.owner[j] != EMPTY) {
-                t += 1;
-                k += 1;
-                if t > 8 {
-                    return t;
-                }
-            }
-        }
-        t
-    };
-    let mut seen = vec![false; g.owner.len()];
-    let mut stack = vec![f.cell];
-    seen[f.cell] = true;
-    let mut out = std::collections::HashSet::new();
-    while let Some(i) = stack.pop() {
-        let c = g.cell(i);
-        out.insert(m.comps[g.owner[i] as usize].pos);
-        for d in crate::voxel::DIRS {
-            let Some(j) = g.index([c[0] + d[0], c[1] + d[1], c[2] + d[2]]) else { continue };
-            if !seen[j] && owner_ok(j) && m.comps[g.owner[j] as usize].body == body && thickness(g.cell(j)) <= 4 {
-                seen[j] = true;
-                stack.push(j);
-            }
-        }
-    }
+    let member = |i: usize| owner_ok(i) && m.comps[g.owner[i] as usize].body == body && marked.is_none_or(|s| s.contains(&m.comps[g.owner[i] as usize].pos));
+    let cells = crate::voxel::slab_cells(g, f.cell, axis, &member, marked.is_none());
+    let out: std::collections::HashSet<[i32; 3]> = cells.iter().map(|&i| m.comps[g.owner[i] as usize].pos).collect();
     out.into_iter().collect()
 }
 

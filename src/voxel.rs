@@ -248,6 +248,96 @@ mod tests {
     }
 }
 
+/// A wing slab around `start`: spread only within the plane across `axis` (the clicked face's
+/// normal), taking each column of `member` cells along `axis` whole. With `thin_only`, a column
+/// counts only if it is at most 4 cells thick with open air (EMPTY or outside the grid) at both ends,
+/// so the spread stops where a wing meets a fuselage (whose skin has the inside behind it).
+pub fn slab_cells(g: &Grid, start: usize, axis: usize, member: &dyn Fn(usize) -> bool, thin_only: bool) -> Vec<usize> {
+    let step = |i: usize, s: i32| {
+        let mut c = g.cell(i);
+        c[axis] += s;
+        g.index(c)
+    };
+    let air = |j: Option<usize>| j.is_none_or(|j| g.owner[j] == EMPTY);
+    let mut seen = vec![false; g.owner.len()];
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(i) = queue.pop_front() {
+        if seen[i] || !member(i) {
+            continue;
+        }
+        // The whole column through i along the axis.
+        let mut col = vec![i];
+        let mut ends = [None; 2];
+        for (k, s) in [1, -1].into_iter().enumerate() {
+            let mut j = step(i, s);
+            while let Some(x) = j.filter(|&x| member(x)) {
+                col.push(x);
+                j = step(x, s);
+            }
+            ends[k] = j;
+        }
+        for &c in &col {
+            seen[c] = true;
+        }
+        if thin_only && (col.len() > 4 || !air(ends[0]) || !air(ends[1])) {
+            continue;
+        }
+        for &c in &col {
+            out.push(c);
+            let at = g.cell(c);
+            for d in DIRS.iter().filter(|d| d[axis] == 0) {
+                if let Some(j) = g.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]) {
+                    if !seen[j] {
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    #[test]
+    fn wing_slab_stops_at_the_fuselage() {
+        // 12 x 7 x 3 grid (x span, y up, z chord): a hollow box "fuselage" at x 0..4 (walls of
+        // owner 1, inside INTERIOR) and a 1-thick wing plate (owner 2) at y 3 from x 5 to 11 that
+        // touches the box wall; the box's top skin is 1 thick too.
+        let dims = [12usize, 7, 3];
+        let n = dims[0] * dims[1] * dims[2];
+        let mut g = Grid { min: [0, 0, 0], dims, fill: vec![0.0; n], owner: vec![EMPTY; n], solids: Vec::new(), missing: Vec::new() };
+        for z in 0..3 {
+            for y in 0..7 {
+                for x in 0..5 {
+                    let i = g.index([x, y, z]).unwrap();
+                    let wall = x == 0 || x == 4 || y == 0 || y == 6;
+                    g.owner[i] = if wall { 1 } else { INTERIOR };
+                }
+            }
+            for x in 5..12 {
+                let i = g.index([x, 3, z]).unwrap();
+                g.owner[i] = 2;
+            }
+        }
+        let solid = |i: usize| g.owner[i] != EMPTY && g.owner[i] != INTERIOR;
+        // Click the wing's top (normal along y): the whole plate, none of the box.
+        let start = g.index([8, 3, 1]).unwrap();
+        let cells = slab_cells(&g, start, 1, &solid, true);
+        assert_eq!(cells.len(), 7 * 3);
+        assert!(cells.iter().all(|&c| g.owner[c] == 2));
+        // Click the box's top skin: inside behind it, so nothing is a wing slab.
+        let top = g.index([2, 6, 1]).unwrap();
+        assert!(slab_cells(&g, top, 1, &solid, true).is_empty());
+        // Removal (any thickness, marked cells only) clears the whole top skin plane.
+        let marked = |i: usize| g.owner[i] == 1 && g.cell(i)[1] == 6;
+        assert_eq!(slab_cells(&g, top, 1, &marked, false).len(), 5 * 3);
+    }
+}
+
 // Chunk-mesh triangles -> voxels, for painting stalled voxels in the game render (paint.rs).
 
 /// Voxel of each triangle: its centroid moved 1/16 m into the block along the face normal, then

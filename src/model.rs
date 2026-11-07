@@ -25,6 +25,9 @@ pub struct Designations {
     pub foils: HashMap<[i32; 3], usize>,
     /// Aerofoil of every other panel.
     pub default_foil: usize,
+    /// Wing blocks marked as a separate wing: they form their own panels and wing (for another
+    /// aerofoil on part of a wing).
+    pub splits: HashSet<[i32; 3]>,
 }
 
 impl Designations {
@@ -49,6 +52,9 @@ impl Designations {
                         d.foils.insert(p, a);
                     }
                 }
+                Some(&"split") => {
+                    d.splits.extend(pos(1));
+                }
                 Some(&"foil_default") => {
                     d.default_foil = f.get(1).and_then(|s| crate::wing::aerofoil_index(s)).unwrap_or(0);
                 }
@@ -62,7 +68,7 @@ impl Designations {
     /// Marks go stale when blocks are removed or moved after designating.
     pub fn match_score(&self, comps: &[Comp]) -> Option<(f64, usize)> {
         let have: HashSet<[i32; 3]> = comps.iter().map(|c| c.pos).collect();
-        let marks: Vec<&[i32; 3]> = self.wings.iter().chain(self.roles.keys()).chain(self.foils.keys()).collect();
+        let marks: Vec<&[i32; 3]> = self.wings.iter().chain(self.roles.keys()).chain(self.foils.keys()).chain(self.splits.iter()).collect();
         if marks.len() < 3 {
             return None;
         }
@@ -73,11 +79,12 @@ impl Designations {
     /// Drop marks on positions with no component (deleted blocks). Returns how many went.
     pub fn retain_present(&mut self, comps: &[Comp]) -> usize {
         let have: HashSet<[i32; 3]> = comps.iter().map(|c| c.pos).collect();
-        let n = self.wings.len() + self.roles.len() + self.foils.len();
+        let n = self.wings.len() + self.roles.len() + self.foils.len() + self.splits.len();
         self.wings.retain(|p| have.contains(p));
         self.roles.retain(|p, _| have.contains(p));
         self.foils.retain(|p, _| have.contains(p));
-        n - self.wings.len() - self.roles.len() - self.foils.len()
+        self.splits.retain(|p| have.contains(p));
+        n - self.wings.len() - self.roles.len() - self.foils.len() - self.splits.len()
     }
 
     /// The `.aero` file in `dir` whose marks best match `comps` (at least `min` of them present):
@@ -108,6 +115,9 @@ impl Designations {
         r.sort_by_key(|(p, _)| **p);
         lines.extend(r.iter().map(|(p, r)| format!("role {} {} {} {}", r.name(), p[0], p[1], p[2])));
         let id = |i: usize| crate::wing::AEROFOILS[i.min(crate::wing::AEROFOILS.len() - 1)].id;
+        let mut sp: Vec<_> = self.splits.iter().collect();
+        sp.sort();
+        lines.extend(sp.iter().map(|p| format!("split {} {} {}", p[0], p[1], p[2])));
         if self.default_foil != 0 {
             lines.push(format!("foil_default {}", id(self.default_foil)));
         }
@@ -119,7 +129,9 @@ impl Designations {
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
-fn wing_groups(grid: &Grid, panel_of: &[usize], n: usize) -> Vec<usize> {
+/// Panels on different bodies join only through a control surface, so a static sub-grid (a wingtip
+/// built as its own grid) is a wing of its own, while ailerons and flaps stay with their wing.
+fn wing_groups(grid: &Grid, panel_of: &[usize], n: usize, joins: &dyn Fn(usize, usize) -> bool) -> Vec<usize> {
     let mut parent: Vec<usize> = (0..n).collect();
     fn root(p: &mut [usize], mut i: usize) -> usize {
         while p[i] != i {
@@ -135,7 +147,7 @@ fn wing_groups(grid: &Grid, panel_of: &[usize], n: usize) -> Vec<usize> {
         let at = grid.cell(c);
         for d in [[1, 0, 0], [0, 1, 0], [0, 0, 1]] {
             let Some(b) = grid.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]).map(|j| panel_of[j]) else { continue };
-            if b != usize::MAX {
+            if b != usize::MAX && joins(a, b) {
                 let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
                 parent[ra] = rb;
             }
@@ -300,6 +312,8 @@ pub struct Model {
     pub panel_of: Vec<usize>,
     /// Whole-wing id per panel: panels whose cells touch belong to one wing (wing + its ailerons/flaps).
     pub wing_of: Vec<usize>,
+    /// Panel marked as a separate wing (`Designations::splits`).
+    pub separate: Vec<bool>,
     pub mass: f64,
     pub com: V3,
     /// Ixx, Iyy, Izz, Ixy, Iyz, Ixz about the CoM, body frame, kg·m².
@@ -343,7 +357,10 @@ impl Model {
             if let Some(r) = body_role.get(&c.body) {
                 return Some((Key::Body(c.body), *r));
             }
-            is_wing[o as usize].then_some((Key::Wing(c.body), Role::None))
+            if !is_wing[o as usize] {
+                return None;
+            }
+            Some((if des.splits.contains(&c.pos) { Key::Split(c.body) } else { Key::Wing(c.body) }, Role::None))
         };
         let mut panels = build_panels(&grid, &key_of, com);
         // Section per panel: the aerofoil set on any of its components, else the default.
@@ -376,8 +393,18 @@ impl Model {
         } else {
             (body.max_area.max(0.0625), body.length.max(0.25), 1.0)
         };
-        let wing_of = wing_groups(&grid, &panel_of, panels.len());
-        Model { comps, grid, body, panels, panel_of, wing_of, mass, com, inertia, s_ref, mac_ref, b_ref }
+        let body_of: Vec<usize> = panels
+            .iter()
+            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).find(|&o| (o as usize) < comps.len()).map_or(0, |o| comps[o as usize].body as usize))
+            .collect();
+        // Separate-wing marks: a marked panel joins only marked panels (its own wing).
+        let separate: Vec<bool> = panels
+            .iter()
+            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).any(|o| (o as usize) < comps.len() && des.splits.contains(&comps[o as usize].pos)))
+            .collect();
+        let joins = |a: usize, b: usize| separate[a] == separate[b] && (body_of[a] == body_of[b] || panels[a].role != Role::None || panels[b].role != Role::None);
+        let wing_of = wing_groups(&grid, &panel_of, panels.len(), &joins);
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, mass, com, inertia, s_ref, mac_ref, b_ref }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -804,11 +831,25 @@ mod tests {
     }
 
     #[test]
+    fn separate_wing_marks_round_trip() {
+        let d = Designations::parse("wing 1 2 3\nsplit 1 2 3\nsplit -4 0 7\n");
+        assert_eq!(d.splits.len(), 2);
+        assert!(Designations::parse(&d.to_text()) == d);
+    }
+
+    #[test]
     fn touching_panels_form_one_wing() {
         let grid = Grid { min: [0, 0, 0], dims: [5, 1, 1], fill: vec![1.0; 5], owner: vec![0; 5], solids: Vec::new(), missing: Vec::new() };
-        let w = wing_groups(&grid, &[0, 1, usize::MAX, 2, 2], 3);
+        let w = wing_groups(&grid, &[0, 1, usize::MAX, 2, 2], 3, &|_, _| true);
         assert_eq!(w[0], w[1]);
         assert_ne!(w[0], w[2]);
+        // Panel 1 on another body (a static wingtip grid): its own wing, unless it is a control surface.
+        let body = [0, 1, 0];
+        let w = wing_groups(&grid, &[0, 1, usize::MAX, 2, 2], 3, &|a, b| body[a] == body[b]);
+        assert_ne!(w[0], w[1]);
+        let cs = [false, true, false];
+        let w = wing_groups(&grid, &[0, 1, usize::MAX, 2, 2], 3, &|a, b| body[a] == body[b] || cs[a] || cs[b]);
+        assert_eq!(w[0], w[1]);
     }
 
     #[test]

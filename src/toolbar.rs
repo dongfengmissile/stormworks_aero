@@ -106,7 +106,7 @@ fn fns() -> Option<&'static Fns> {
 pub(crate) static TOOL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ROLE: AtomicUsize = AtomicUsize::new(1);
 pub(crate) static FOIL: AtomicUsize = AtomicUsize::new(0);
-/// Wing blocks tool: 0 toggle one block, 1 add the thin slab, 2 remove the slab.
+/// Wing blocks tool: 0 toggle one block, 1 add the thin slab, 2 remove the slab, 3 new wing.
 pub(crate) static WING_MODE: AtomicUsize = AtomicUsize::new(0);
 const ID_WING: i32 = 231;
 const ID_UNDO: i32 = 241;
@@ -183,7 +183,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
 /// icon atlas (1024², DXT5, 11 mips) on a 64-aligned grid so every mip stays block aligned.
-const ICONS: [(&str, &[u8]); 10] = [
+const ICONS: [(&str, &[u8]); 17] = [
     ("aero_foil", include_bytes!("../assets/icons/aero_foil.bc3")),
     ("aero_x1", include_bytes!("../assets/icons/aero_x1.bc3")),
     ("aero_twinotter", include_bytes!("../assets/icons/aero_twinotter.bc3")),
@@ -194,6 +194,13 @@ const ICONS: [(&str, &[u8]); 10] = [
     ("aero_a320", include_bytes!("../assets/icons/aero_a320.bc3")),
     ("aero_f4", include_bytes!("../assets/icons/aero_f4.bc3")),
     ("aero_f104", include_bytes!("../assets/icons/aero_f104.bc3")),
+    ("aero_role_none", include_bytes!("../assets/icons/aero_role_none.bc3")),
+    ("aero_pitch", include_bytes!("../assets/icons/aero_pitch.bc3")),
+    ("aero_roll", include_bytes!("../assets/icons/aero_roll.bc3")),
+    ("aero_yaw", include_bytes!("../assets/icons/aero_yaw.bc3")),
+    ("aero_flap", include_bytes!("../assets/icons/aero_flap.bc3")),
+    ("aero_wingblocks", include_bytes!("../assets/icons/aero_wingblocks.bc3")),
+    ("aero_split", include_bytes!("../assets/icons/aero_split.bc3")),
 ];
 /// Aircraft icon per aerofoil, in `AEROFOILS` order.
 const FOIL_ICONS: [&str; 9] = ["aero_x1", "aero_twinotter", "aero_cessna", "aero_spitfire", "aero_extra", "aero_f86", "aero_a320", "aero_f4", "aero_f104"];
@@ -361,7 +368,7 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 4] {
     use crate::wing::{Role, AEROFOILS};
     let own = register_icons(f, ctx);
     let tools = [
-        ("blocks", "Wing blocks", "Mark the blocks that form wings; pick how a click works on the next shelf."),
+        (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings; pick how a click works on the next shelf."),
         ("vehicle_control", "Control role", "Click a control surface or a hinged sub-grid to give it the role picked on the next shelf."),
         (if own { "aero_foil" } else { "mechanics" }, "Aerofoil", "Click a wing to give it the aerofoil picked on the next shelf. Shift+click: one panel only."),
     ];
@@ -369,8 +376,9 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 4] {
         ("paint_mode", "Toggle a block", "Click a block to make it a wing block, or click it again to unmark it."),
         ("paint_add", "Add a slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
         ("erase", "Remove a slab", "Click a block to unmark the whole thin slab around it."),
+        (if own { "aero_split" } else { "new" }, "New wing", "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back. Shift+click: one block."),
     ];
-    let icons = ["action_cross", "arrows", "rotate", "orbit", "resize"];
+    let icons = if own { ["aero_role_none", "aero_pitch", "aero_roll", "aero_yaw", "aero_flap"] } else { ["action_cross", "arrows", "rotate", "orbit", "resize"] };
     let roles: Vec<(String, String)> = Role::ALL.iter().map(|r| (format!("Role: {}", r.name()), match r {
         Role::None => "Plain wing: not a control surface.".to_string(),
         Role::Pitch => "Elevator / stabilator: pitch.".to_string(),
@@ -420,7 +428,7 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
         UNDO_REQ.fetch_add(1, Ordering::Relaxed);
     } else if i == ID_REDO {
         REDO_REQ.fetch_add(1, Ordering::Relaxed);
-    } else if (ID_WING..ID_WING + 3).contains(&i) {
+    } else if (ID_WING..ID_WING + 4).contains(&i) {
         WING_MODE.store((i - ID_WING) as usize, Ordering::Relaxed);
     } else if (ID_FOIL..ID_FOIL + crate::wing::AEROFOILS.len() as i32).contains(&i) {
         FOIL.store((i - ID_FOIL) as usize, Ordering::Relaxed);

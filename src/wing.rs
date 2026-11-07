@@ -133,6 +133,8 @@ pub enum Key {
     Comp(u32),
     /// A sub-grid body with a control role.
     Body(u32),
+    /// Wing blocks of this body marked as a separate wing (their own panels and wing).
+    Split(u32),
 }
 
 /// Build panels. `key_of(component index)` says whether a component's cells are wing cells.
@@ -180,7 +182,7 @@ pub fn build_panels(
         let ys: Vec<f64> = cells.iter().map(|&i| aero_pos(grid.cell(i)).y - mid_y).collect();
         let left = ys.iter().filter(|y| **y < -0.01).count();
         let right = ys.iter().filter(|y| **y > 0.01).count();
-        if matches!(k, Key::Wing(_)) && left > 4 && right > 4 {
+        if matches!(k, Key::Wing(_) | Key::Split(_)) && left > 4 && right > 4 {
             let (l, r) = cells.iter().zip(&ys).fold((vec![], vec![]), |(mut l, mut r), (&c, &y)| {
                 if y < 0.0 { l.push(c) } else { r.push(c) }
                 (l, r)
@@ -593,6 +595,54 @@ pub fn panel_forces(
             stall: stall[i],
         };
     }
+    // Flap camber (FAR's thin-airfoil flap term, computed on the trailing panel from its upstream
+    // wing): the share over the wing's chord acts on the wing ahead, not on the flap. Kept on the
+    // flap, the whole section's extra lift sat at the trailing edge: a big nose-down moment the
+    // tail had to fight (flaps felt useless) and induced drag on a small, overloaded panel.
+    let mach_coeff = (1.0 - flow.mach * flow.mach).clamp(0.0, 1.0);
+    let mut flap_own = vec![0.0; panels.len()];
+    let mut wing_add = vec![0.0; panels.len()]; // Cl·area handed to a wing by the flaps behind it
+    for (i, p) in panels.iter().enumerate() {
+        let v = vel(i, p.centroid);
+        let pl = v.reject(normals[i]).norm();
+        if pl == V3::ZERO || mach_coeff <= 0.0 {
+            continue;
+        }
+        let fwd_w = pl.dot(p.u);
+        let list = if fwd_w > 0.0 { &p.fwd } else { &p.aft };
+        let wdir = fwd_w * fwd_w;
+        let (mut up_mac, mut up_b, mut up_area, mut up_ls, mut up_infl, mut up_aoa) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(j, infl) in list {
+            let f = infl * wdir;
+            let o = &panels[j];
+            up_mac += o.mac * f;
+            up_b += o.b * f;
+            up_area += o.area * f;
+            up_ls += raw[j].lift_slope * f;
+            up_infl += f;
+            up_aoa += (raw[i].aoa - raw[j].aoa * o.n.dot(p.n).signum()) * f;
+        }
+        if up_infl <= 0.0 || up_b <= 0.0 {
+            continue;
+        }
+        let flap_ratio = (p.mac / (p.mac + up_mac)).clamp(0.0, 1.0);
+        let th = (2.0 * flap_ratio - 1.0).clamp(-1.0, 1.0).acos();
+        let flap_factor = 1.0 - (th - th.sin()) / PI;
+        let wing_frac = (p.b / up_b).clamp(0.0, 1.0);
+        let flap_frac = (up_b / p.b).clamp(0.0, 1.0);
+        // Past ~45° a flap stops adding lift (separation off its upper surface).
+        let defl = up_aoa.clamp(-up_infl * PI / 4.0, up_infl * PI / 4.0);
+        // shortcut: added to Cl directly; FAR multiplies it by |sin α| again, which makes small
+        // flap deflections do almost nothing.
+        let on_flap = flap_factor * up_ls * defl * p.area * flap_frac - flap_frac * up_ls * defl * p.area;
+        let on_wing = flap_factor * up_ls * defl * up_area * wing_frac;
+        flap_own[i] = on_flap / p.area * mach_coeff;
+        for &(j, infl) in list {
+            // In the wing's own AoA sense (normals may point opposite ways).
+            wing_add[j] += on_wing * mach_coeff * (infl * wdir / up_infl) * panels[j].n.dot(p.n).signum();
+        }
+    }
+
     let mut out = Vec::with_capacity(panels.len());
     for (i, p) in panels.iter().enumerate() {
         let n = normals[i];
@@ -619,15 +669,11 @@ pub fn panel_forces(
         let fwd_w = pl.dot(p.u);
         let list = if fwd_w > 0.0 { &p.fwd } else { &p.aft };
         let wdir = fwd_w * fwd_w;
-        let (mut up_mac, mut up_b, mut up_area, mut up_ls, mut up_stall, mut up_cos, mut up_amax, mut up_cd0, mut up_infl, mut up_aoa) =
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut up_ls, mut up_stall, mut up_cos, mut up_amax, mut up_cd0, mut up_infl, mut up_aoa) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         for &(j, infl) in list {
             let f = infl * wdir;
             let o = &panels[j];
             let rj = raw[j];
-            up_mac += o.mac * f;
-            up_b += o.b * f;
-            up_area += o.area * f;
             up_ls += rj.lift_slope * f;
             up_stall += rj.stall * f;
             up_cos += rj.cos_sweep * f;
@@ -639,27 +685,12 @@ pub fn panel_forces(
         let mut lift_slope = r.lift_slope;
         let mut cos_sweep = r.cos_sweep;
         let mut aoa_max = r.aoa_max;
-        let mut cl_inc = 0.0;
+        // Flap camber: this panel's own share as a flap, plus what flaps behind it hand it.
+        let cl_inc = flap_own[i] + wing_add[i] / p.area.max(1e-9);
         if up_infl > 0.0 {
             aoa_max += up_amax;
             lift_slope = lift_slope * (1.0 - up_infl) + up_ls;
             cos_sweep = (cos_sweep * (1.0 - up_infl) + up_cos).clamp(0.0, 1.0);
-            let mach_coeff = (1.0 - mach * mach).clamp(0.0, 1.0);
-            if mach_coeff > 0.0 && up_b > 0.0 {
-                // Thin-airfoil flap effect of a deflected trailing panel (FAR camber term).
-                // shortcut: added to Cl directly; FAR multiplies it by |sin α| again, which
-                // makes small flap deflections do almost nothing.
-                let flap_ratio = (p.mac / (p.mac + up_mac)).clamp(0.0, 1.0);
-                let th = (2.0 * flap_ratio - 1.0).clamp(-1.0, 1.0).acos();
-                let flap_factor = 1.0 - (th - th.sin()) / PI;
-                let wing_frac = (p.b / up_b).clamp(0.0, 1.0);
-                let flap_frac = (up_b / p.b).clamp(0.0, 1.0);
-                // Past ~45° a flap stops adding lift (separation off its upper surface).
-                let defl = up_aoa.clamp(-up_infl * PI / 4.0, up_infl * PI / 4.0);
-                let mut inc = flap_factor * up_ls * defl * (p.area * flap_frac + up_area * wing_frac) / p.area;
-                inc -= flap_frac * up_ls * defl;
-                cl_inc = inc * mach_coeff;
-            }
         }
 
         // Stall with hysteresis. A trailing surface (flap) works in its upstream wing's flow: its stall
@@ -956,6 +987,16 @@ mod tests {
         };
         let (clean, flaps) = (lift(0.0), lift(35.0));
         assert!(flaps > clean * 1.15 && flaps >= lift(20.0) * 0.95, "35° flaps add lift at takeoff AoA: {flaps} vs {clean}");
+        // The camber lift over the wing's chord acts on the wing ahead of the flap, not all on the flap.
+        let wing_cl = |flap_deg: f64| {
+            let a = 8f64.to_radians();
+            let v = v3(a.cos(), 0.0, a.sin()) * 68.0;
+            let defl: Vec<f64> = panels.iter().map(|p| if p.role == Role::Flap { p.ctrl_sign * flap_deg.to_radians() } else { 0.0 }).collect();
+            let mut stall = vec![0.0; panels.len()];
+            let f = panel_forces(&panels, &flow, &|_, _| v, &defl, &mut stall);
+            panels.iter().zip(&f).filter(|(p, _)| p.role == Role::None).map(|(_, f)| f.cl).sum::<f64>()
+        };
+        assert!(wing_cl(35.0) > wing_cl(0.0) + 0.1, "wing gains lift from its flap: {} vs {}", wing_cl(35.0), wing_cl(0.0));
     }
 
     #[test]
