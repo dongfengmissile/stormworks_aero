@@ -106,13 +106,19 @@ fn fns() -> Option<&'static Fns> {
 pub(crate) static TOOL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ROLE: AtomicUsize = AtomicUsize::new(1);
 pub(crate) static FOIL: AtomicUsize = AtomicUsize::new(0);
-/// Wing blocks tool: 0 toggle one block, 1 add the thin slab, 2 remove the slab, 3 new wing.
+/// Wing blocks tool: 0 toggle one block, 1 fill slab, 2 fill body, 3 remove slab, 4 new wing.
 pub(crate) static WING_MODE: AtomicUsize = AtomicUsize::new(0);
 const ID_WING: i32 = 231;
 const ID_UNDO: i32 = 241;
 const ID_REDO: i32 = 242;
 /// Undo / redo clicks not yet applied by the overlay.
 pub(crate) static UNDO_REQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The Undo / Redo buttons of the first shelf, so their enabled state can follow the history.
+static UNDO_BTN: AtomicUsize = AtomicUsize::new(0);
+static REDO_BTN: AtomicUsize = AtomicUsize::new(0);
+/// Whether the overlay has anything to undo / redo; a click with nothing to do is ignored.
+pub(crate) static CAN_UNDO: AtomicBool = AtomicBool::new(false);
+pub(crate) static CAN_REDO: AtomicBool = AtomicBool::new(false);
 pub(crate) static REDO_REQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const ID_TOOL: i32 = 201;
 const ID_ROLE: i32 = 211;
@@ -183,7 +189,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
 /// icon atlas (1024², DXT5, 11 mips) on a 64-aligned grid so every mip stays block aligned.
-const ICONS: [(&str, &[u8]); 17] = [
+const ICONS: [(&str, &[u8]); 18] = [
     ("aero_foil", include_bytes!("../assets/icons/aero_foil.bc3")),
     ("aero_x1", include_bytes!("../assets/icons/aero_x1.bc3")),
     ("aero_twinotter", include_bytes!("../assets/icons/aero_twinotter.bc3")),
@@ -201,6 +207,7 @@ const ICONS: [(&str, &[u8]); 17] = [
     ("aero_flap", include_bytes!("../assets/icons/aero_flap.bc3")),
     ("aero_wingblocks", include_bytes!("../assets/icons/aero_wingblocks.bc3")),
     ("aero_split", include_bytes!("../assets/icons/aero_split.bc3")),
+    ("aero_fill_body", include_bytes!("../assets/icons/aero_fill_body.bc3")),
 ];
 /// Aircraft icon per aerofoil, in `AEROFOILS` order.
 const FOIL_ICONS: [&str; 9] = ["aero_x1", "aero_twinotter", "aero_cessna", "aero_spitfire", "aero_extra", "aero_f86", "aero_a320", "aero_f4", "aero_f104"];
@@ -351,6 +358,11 @@ unsafe fn build_shelf(f: &Fns, iface: usize, ctx: usize, x: f32, items: &[(&str,
         if btn >= PTR_MIN {
             (f.add_child)(s, ctx, btn);
             tooltip(f, btn, ctx, title, desc, true);
+            match *id {
+                ID_UNDO => UNDO_BTN.store(btn, Ordering::SeqCst),
+                ID_REDO => REDO_BTN.store(btn, Ordering::SeqCst),
+                _ => {}
+            };
         }
     }
     ((s + 0x14) as *mut f32).write_unaligned(h);
@@ -370,13 +382,14 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 4] {
     let tools = [
         (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings; pick how a click works on the next shelf."),
         ("vehicle_control", "Control role", "Click a control surface or a hinged sub-grid to give it the role picked on the next shelf."),
-        (if own { "aero_foil" } else { "mechanics" }, "Aerofoil", "Click a wing to give it the aerofoil picked on the next shelf. Shift+click: one panel only."),
+        (if own { "aero_foil" } else { "mechanics" }, "Aerofoil", "Click a wing to give it the aerofoil picked on the next shelf. One click sets the whole wing; use New wing to split it first."),
     ];
     let wing_items = [
         ("paint_mode", "Toggle a block", "Click a block to make it a wing block, or click it again to unmark it."),
-        ("paint_add", "Add a slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
+        ("paint_add", "Fill slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
+        (if own { "aero_fill_body" } else { "paint_add" }, "Fill body", "Click a block to mark every block of its body as wing, however thick (a flying wing)."),
         ("erase", "Remove a slab", "Click a block to unmark the whole thin slab around it."),
-        (if own { "aero_split" } else { "new" }, "New wing", "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back. Shift+click: one block."),
+        (if own { "aero_split" } else { "new" }, "New wing", "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back."),
     ];
     let icons = if own { ["aero_role_none", "aero_pitch", "aero_roll", "aero_yaw", "aero_flap"] } else { ["action_cross", "arrows", "rotate", "orbit", "resize"] };
     let roles: Vec<(String, String)> = Role::ALL.iter().map(|r| (format!("Role: {}", r.name()), match r {
@@ -425,10 +438,14 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
     } else if (ID_ROLE..ID_ROLE + 5).contains(&i) {
         ROLE.store((i - ID_ROLE) as usize, Ordering::Relaxed);
     } else if i == ID_UNDO {
-        UNDO_REQ.fetch_add(1, Ordering::Relaxed);
+        if CAN_UNDO.load(Ordering::Relaxed) {
+            UNDO_REQ.fetch_add(1, Ordering::Relaxed);
+        }
     } else if i == ID_REDO {
-        REDO_REQ.fetch_add(1, Ordering::Relaxed);
-    } else if (ID_WING..ID_WING + 4).contains(&i) {
+        if CAN_REDO.load(Ordering::Relaxed) {
+            REDO_REQ.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if (ID_WING..ID_WING + 5).contains(&i) {
         WING_MODE.store((i - ID_WING) as usize, Ordering::Relaxed);
     } else if (ID_FOIL..ID_FOIL + crate::wing::AEROFOILS.len() as i32).contains(&i) {
         FOIL.store((i - ID_FOIL) as usize, Ordering::Relaxed);
@@ -474,6 +491,19 @@ pub(crate) unsafe extern "system" fn mouse_button_detour(editor: usize, a2: usiz
     r
 }
 
+/// Grey a button out the way the game does (vtable +0x128: enabled flag + dimmed children).
+unsafe fn set_enabled(btn: usize, ctx: usize, enabled: bool) {
+    if btn < PTR_MIN || ctx < PTR_MIN || !readable(btn, 0xA4) {
+        return;
+    }
+    let vt = read_usize_at(btn);
+    if vt < PTR_MIN || !readable(vt + 0x128, 8) {
+        return;
+    }
+    let f: unsafe extern "system" fn(usize, usize, u8) = std::mem::transmute(read_usize_at(vt + 0x128));
+    f(btn, ctx, enabled as u8);
+}
+
 /// Editor tick (game thread): append to a toolbar built before the plugin loaded, track the mode.
 pub(crate) unsafe fn on_tick(editor: usize) {
     if fns().is_none() || !readable(editor + OFF_INTERFACE, 8) {
@@ -510,6 +540,8 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         }
     }
     drop(sh);
+    set_enabled(UNDO_BTN.load(Ordering::SeqCst), editor + OFF_UI_CTX, CAN_UNDO.load(Ordering::Relaxed));
+    set_enabled(REDO_BTN.load(Ordering::SeqCst), editor + OFF_UI_CTX, CAN_REDO.load(Ordering::Relaxed));
     if ACTIVE.swap(on, Ordering::Relaxed) != on {
         log_line(&format!("toolbar: Aero wings mode {}", if on { "on" } else { "off" }));
     }

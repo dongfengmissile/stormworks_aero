@@ -258,7 +258,9 @@ pub fn slab_cells(g: &Grid, start: usize, axis: usize, member: &dyn Fn(usize) ->
         c[axis] += s;
         g.index(c)
     };
-    let air = |j: Option<usize>| j.is_none_or(|j| g.owner[j] == EMPTY);
+    // Another body's blocks count as open, so wings flush against a hull still mark; the inside
+    // of a solid body does not, so clicking a buried skin marks nothing.
+    let air = |j: Option<usize>| j.is_none_or(|j| g.owner[j] != INTERIOR);
     let mut seen = vec![false; g.owner.len()];
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([start]);
@@ -335,6 +337,27 @@ mod slab_tests {
         // Removal (any thickness, marked cells only) clears the whole top skin plane.
         let marked = |i: usize| g.owner[i] == 1 && g.cell(i)[1] == 6;
         assert_eq!(slab_cells(&g, top, 1, &marked, false).len(), 5 * 3);
+    }
+
+    #[test]
+    fn fin_glued_to_the_hull_still_marks() {
+        // Hull (owner 1) at x 0..3, a vertical fin plate (owner 3) at x = 4 glued to it.
+        let dims = [6usize, 8, 3];
+        let mut g = Grid { min: [0, 0, 0], dims, fill: vec![0.0; dims[0] * dims[1] * dims[2]], owner: vec![EMPTY; dims[0] * dims[1] * dims[2]], solids: Vec::new(), missing: Vec::new() };
+        for z in 0..3 {
+            for y in 0..8 {
+                for x in 0..4 {
+                    let i = g.index([x, y, z]).unwrap();
+                    g.owner[i] = 1;
+                }
+                let i = g.index([4, y, z]).unwrap();
+                g.owner[i] = 3;
+            }
+        }
+        // Clicking the fin's flat side: the hull, not air, is behind one end of the column.
+        let fin = g.index([4, 3, 1]).unwrap();
+        let cells = slab_cells(&g, fin, 0, &|i| g.owner[i] == 3, true);
+        assert_eq!(cells.len(), 8 * 3);
     }
 }
 

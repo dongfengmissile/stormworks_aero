@@ -45,7 +45,7 @@ Wings in Stormworks are usually built from blocks, so the plugin has to be told 
 
 | tool | what a click on the vehicle does |
 |---|---|
-| Wing blocks | mark or unmark a block, or a whole thin slab, as wing |
+| Wing blocks | click modes picked on the next shelf: toggle a block, fill a slab (one thin wing panel), fill body (every block of the body, for thick flying wings), remove a slab |
 | Control role | give a control surface or hinged sub-grid a role: pitch, roll, yaw, flap |
 | Aerofoil | give a wing an aerofoil (hover the aircraft icons for their names) |
 

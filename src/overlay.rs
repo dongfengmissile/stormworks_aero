@@ -267,7 +267,7 @@ impl Overlay {
         }
         // Tool, role and aerofoil come from the game-style side shelves.
         let mut tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
-        if tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 3 {
+        if tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 4 {
             tool = Tool::Split; // the wing shelf's "New wing" button
         }
         if tool != self.tool {
@@ -276,6 +276,8 @@ impl Overlay {
         }
         self.role_pick = crate::toolbar::ROLE.load(Ordering::Relaxed).min(4);
         self.foil_pick = crate::toolbar::FOIL.load(Ordering::Relaxed).min(AEROFOILS.len() - 1);
+        crate::toolbar::CAN_UNDO.store(!self.undo.is_empty(), Ordering::Relaxed);
+        crate::toolbar::CAN_REDO.store(!self.redo.is_empty(), Ordering::Relaxed);
         for _ in 0..crate::toolbar::UNDO_REQ.swap(0, Ordering::Relaxed) {
             self.undo_designation();
         }
@@ -290,9 +292,7 @@ impl Overlay {
             log_line(&format!("bench pick at {at:?}: camera {} face {pick:?} cell {cell} comp {comp} tool {:?}", if clip { "ok" } else { "MISSING" }, self.tool));
             match pick {
                 Some(face) => {
-                    // The wing shelf's mode stands in for Shift / Ctrl (which still work).
-                    let wm = if self.tool == Tool::Wing { crate::toolbar::WING_MODE.load(Ordering::Relaxed) } else { 0 };
-                    self.apply_tool(&m, face, io.key_shift || wm == 1, io.key_ctrl || wm == 2)
+                    self.apply_tool(&m, face)
                 }
                 None => self.status = "no block under the cursor".into(),
             }
@@ -907,10 +907,10 @@ impl Overlay {
         }
         ui.text_disabled(match self.tool {
             Tool::Inspect => "Left-drag rotate, right-drag pan, wheel zoom. Hover a block for details.",
-            Tool::Wing => "Click: toggle a wing block. Shift+click: add the whole thin slab. Ctrl+click: remove the slab. Ctrl+Z: undo.",
+            Tool::Wing => "Click a block: what the wing shelf picked (toggle, fill slab, fill body, remove slab). Ctrl+Z: undo.",
             Tool::Role => "Click a vanilla control surface, or any block of a hinged sub-grid, to give it the selected role. Ctrl+Z: undo.",
-            Tool::Foil => "Click a wing to give the whole wing (and the surfaces on it) the selected aerofoil. Shift+click: one panel only. Ctrl+Z: undo.",
-            Tool::Split => "Click a wing panel to make it a separate wing (lighter colour), or back. Shift+click: one block. Ctrl+Z: undo.",
+            Tool::Foil => "Click a wing to give the whole wing (and the surfaces on it) the selected aerofoil. Ctrl+Z: undo.",
+            Tool::Split => "Click a wing panel to make it a separate wing (lighter colour), or back. Ctrl+Z: undo.",
         });
 
         let avail = ui.content_region_avail();
@@ -957,7 +957,7 @@ impl Overlay {
             if ui.is_mouse_released(MouseButton::Left) {
                 if !self.dragged {
                     if let Some(f) = self.hover_face {
-                        self.apply_tool(m, f, io.key_shift, io.key_ctrl);
+                        self.apply_tool(m, f);
                     }
                 }
                 self.dragged = false;
@@ -1020,36 +1020,42 @@ impl Overlay {
         }
     }
 
-    fn apply_tool(&mut self, m: &Arc<Model>, face: usize, shift: bool, ctrl: bool) {
+    fn apply_tool(&mut self, m: &Arc<Model>, face: usize) {
         let Some(f) = self.faces.get(face) else { return };
         let comp = &m.comps[f.comp as usize];
         let before = self.des.clone();
         match self.tool {
             Tool::Inspect => return,
-            Tool::Wing => {
-                if ctrl {
+            Tool::Wing => match crate::toolbar::WING_MODE.load(Ordering::Relaxed) {
+                // Fill body: every block of the clicked body, however thick (a flying wing).
+                2 => self.des.wings.extend(m.comps.iter().filter(|c| c.body == comp.body).map(|c| c.pos)),
+                3 => {
                     let marked = self.des.wings.clone();
                     for pos in slab(m, f, Some(&marked)) {
                         self.des.wings.remove(&pos);
                     }
-                } else if shift {
+                }
+                1 => {
                     let add = slab(m, f, None);
                     if add.is_empty() {
-                        self.status = "not a wing slab there (too thick, or the inside of the hull is behind it)".into();
+                        self.status = "nothing to fill there (too thick, or inside a solid body): use Fill body".into();
                     }
                     self.des.wings.extend(add);
-                } else if !self.des.wings.remove(&comp.pos) {
-                    self.des.wings.insert(comp.pos);
                 }
-            }
+                _ => {
+                    if !self.des.wings.remove(&comp.pos) {
+                        self.des.wings.insert(comp.pos);
+                    }
+                }
+            },
             Tool::Foil => {
                 let Some(p) = m.panel_of.get(f.cell).and_then(|&p| m.panels.get(p)) else {
                     self.status = "that block is not part of a lifting panel".into();
                     return;
                 };
-                // Click: the whole wing (its panels and the surfaces on it). Shift+click: this panel only.
+                // The whole wing: its panels and the surfaces on it.
                 let pi = m.panel_of[f.cell];
-                let targets: Vec<usize> = if shift { vec![pi] } else { (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).collect() };
+                let targets: Vec<usize> = (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).collect();
                 let _ = p;
                 for j in targets {
                     // One mark per panel: drop the old ones, then mark one of its blocks.
@@ -1068,20 +1074,14 @@ impl Overlay {
                     self.status = "that block is not part of a wing panel".into();
                     return;
                 };
-                if shift {
-                    if !self.des.splits.remove(&comp.pos) {
-                        self.des.splits.insert(comp.pos);
+                // The whole panel: unmark it if it is marked, else mark all its blocks.
+                let owners: Vec<[i32; 3]> = m.panels[pi].cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect();
+                if m.separate.get(pi).copied().unwrap_or(false) {
+                    for p in &owners {
+                        self.des.splits.remove(p);
                     }
                 } else {
-                    // The whole panel: unmark it if it is marked, else mark all its blocks.
-                    let owners: Vec<[i32; 3]> = m.panels[pi].cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect();
-                    if m.separate.get(pi).copied().unwrap_or(false) {
-                        for p in &owners {
-                            self.des.splits.remove(p);
-                        }
-                    } else {
-                        self.des.splits.extend(owners);
-                    }
+                    self.des.splits.extend(owners);
                 }
             }
             Tool::Role => {
@@ -1190,7 +1190,8 @@ impl Overlay {
 }
 
 /// Grid positions of the components in the wing slab around a clicked face (see
-/// `voxel::slab_cells`). Adding (`marked` None): thin, air-bounded columns of the clicked body.
+/// `voxel::slab_cells`). Adding (`marked` None): thin columns of the clicked body, not buried
+/// inside a solid one.
 /// Removing: the marked blocks of that body in the clicked plane, however thick.
 fn slab(m: &Model, f: &Face, marked: Option<&std::collections::HashSet<[i32; 3]>>) -> Vec<[i32; 3]> {
     let g = &m.grid;

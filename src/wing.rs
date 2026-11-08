@@ -75,15 +75,15 @@ impl Aerofoil {
 /// Selectable sections. The first is FAR's: its drag rise at Mach 0.8 and supersonic wave drag
 /// 0.009216/β are those of a ~4 % symmetric section.
 pub const AEROFOILS: [Aerofoil; 9] = [
-    Aerofoil { id: "far", name: "FAR default (thin symmetric)", note: "FAR's built-in section: thin, symmetric, Clmax 1.6.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0 },
-    Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, GA / STOL)", note: "Thick, strongly cambered: lots of lift at low speed, early stall break and drag rise, very draggy past Mach 0.7.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca2412", name: "NACA 2412 (general aviation)", note: "Classic light-aircraft section: moderate camber and thickness.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca23015", name: "NACA 23015 (warbird)", note: "1930s-40s fighters and bombers: thick, little camber, good Clmax.", t_c: 0.15, cl0: 0.12, cl_max: 1.65, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca0012", name: "NACA 0012 (symmetric, tails)", note: "Symmetric: no lift at zero AoA. Tails, fins, aerobatic wings.", t_c: 0.12, cl0: 0.0, cl_max: 1.5, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca64a010", name: "NACA 64A010 (transonic jet)", note: "Thin laminar-flow section of 1950s-60s jets: later drag rise, lower Clmax.", t_c: 0.10, cl0: 0.0, cl_max: 1.3, kappa: 0.9, k_wave: 6.0 },
-    Aerofoil { id: "supercritical", name: "Supercritical SC(2)-0712 (airliner)", note: "Flat-topped section that cruises near Mach 0.8 with a thick wing; poor supersonic.", t_c: 0.12, cl0: 0.5, cl_max: 1.7, kappa: 0.95, k_wave: 8.0 },
-    Aerofoil { id: "slotted0012", name: "Slotted symmetric (high AoA: all-moving tails, flaps)", note: "Symmetric section with a leading-edge slot, like the F-4's stabilator: keeps lifting to roughly twice the angle of a plain section, at the cost of extra drag.", t_c: 0.14, cl0: 0.0, cl_max: 2.6, kappa: 0.86, k_wave: 9.0 },
-    Aerofoil { id: "biconvex4", name: "Biconvex 4% (supersonic)", note: "Sharp-edged supersonic section: least wave drag, low Clmax and an early stall at low speed.", t_c: 0.04, cl0: 0.0, cl_max: 0.9, kappa: 0.87, k_wave: 16.0 / 3.0 },
+    Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. A safe all-round choice.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0 },
+    Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, slow flight)", note: "Thick and strongly curved: lots of lift at low speed, but it stalls early and drags a lot when fast.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0 },
+    Aerofoil { id: "naca2412", name: "NACA 2412 (light aircraft)", note: "Moderate curve and thickness: the usual light-aircraft wing, easy to fly.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0 },
+    Aerofoil { id: "naca23015", name: "NACA 23015 (warbird)", note: "Old warbird wing: thick with little curve, so a high maximum lift without much lift at zero angle.", t_c: 0.15, cl0: 0.12, cl_max: 1.65, kappa: 0.87, k_wave: 8.0 },
+    Aerofoil { id: "naca0012", name: "NACA 0012 (symmetric, tails)", note: "No lift at zero angle and works the same upside down: tails, fins and aerobatic wings.", t_c: 0.12, cl0: 0.0, cl_max: 1.5, kappa: 0.87, k_wave: 8.0 },
+    Aerofoil { id: "naca64a010", name: "NACA 64A010 (fast jets)", note: "Thin and flat: keeps its drag rise later near the speed of sound, in exchange for less maximum lift.", t_c: 0.10, cl0: 0.0, cl_max: 1.3, kappa: 0.9, k_wave: 6.0 },
+    Aerofoil { id: "supercritical", name: "Supercritical SC(2)-0712 (airliner)", note: "Flat on top, so a thick wing stays efficient near the speed of sound; poor above it.", t_c: 0.12, cl0: 0.5, cl_max: 1.7, kappa: 0.95, k_wave: 8.0 },
+    Aerofoil { id: "slotted0012", name: "Slotted symmetric (very high angle)", note: "Symmetric, with a slot at the front edge that keeps it lifting to about twice the angle of a plain wing, at the cost of drag. For all-moving tails and flaps that swing far.", t_c: 0.14, cl0: 0.0, cl_max: 2.6, kappa: 0.86, k_wave: 9.0 },
+    Aerofoil { id: "biconvex4", name: "Biconvex 4% (supersonic)", note: "Knife-edge shape: least drag above the speed of sound, but little lift and an early stall when slow.", t_c: 0.04, cl0: 0.0, cl_max: 0.9, kappa: 0.87, k_wave: 16.0 / 3.0 },
 ];
 
 pub fn aerofoil_index(id: &str) -> Option<usize> {
@@ -193,10 +193,25 @@ pub fn build_panels(
             split.push((k, role, cells));
         }
     }
-    let mut out: Vec<Panel> = split
-        .into_iter()
-        .filter_map(|(_, role, cells)| panel_geometry(grid, cells, role, com))
-        .collect();
+    let mut out: Vec<Panel> = Vec::new();
+    let mut drops: Vec<(&'static str, usize)> = Vec::new();
+    for (_, role, cells) in split {
+        match panel_geometry(grid, cells, role, com) {
+            Ok(p) => out.push(p),
+            Err(why) => match drops.iter_mut().find(|d| d.0 == why) {
+                Some(d) => d.1 += 1,
+                None => drops.push((why, 1)),
+            },
+        }
+    }
+    #[cfg(windows)]
+    if !drops.is_empty() {
+        crate::logging::log_line(&format!(
+            "panels: {} built, dropped {}",
+            out.len(),
+            drops.iter().map(|(w, n)| format!("{n} x {w}")).collect::<Vec<_>>().join(", ")
+        ));
+    }
     let mut owner = vec![usize::MAX; n];
     for (pi, p) in out.iter().enumerate() {
         for &c in &p.cells {
@@ -296,9 +311,9 @@ fn eigen3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [V3; 3]) {
     ([a[0][0], a[1][1], a[2][2]], [col(0), col(1), col(2)])
 }
 
-fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Option<Panel> {
+fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result<Panel, &'static str> {
     if cells.len() < 2 {
-        return None;
+        return Err("single-cell group");
     }
     let pts: Vec<V3> = cells.iter().map(|&i| aero_pos(grid.cell(i))).collect();
     let w: Vec<f64> = cells.iter().map(|&i| grid.fill[i] as f64).collect();
@@ -323,11 +338,9 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Option
         n = vecs[order[1]];
     }
     let fwd = v3(1.0, 0.0, 0.0);
-    // Edge-on to the flow (a disc facing forward) is not a wing.
-    if n.x.abs() > 0.9 {
-        return None;
-    }
-    let u = fwd.reject(n).norm();
+    // A plate facing the flow (Starship-style drag flaps) has no chord from the airflow: use the
+    // plate's own long axis instead.
+    let u = if n.x.abs() > 0.9 { vecs[order[1]].reject(n).norm() } else { fwd.reject(n).norm() };
     let mut s = n.cross(u).norm();
     // Span points away from the root: the end nearer the CoM line is the root.
     let off = |p: V3| (p - com).reject(fwd).len();
@@ -383,7 +396,7 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Option
     let mean_c = sc / cnt;
     let root_c = (mean_c - chord_slope * mean_x).max(VOXEL_M * 0.5);
     let tip_c = (mean_c + chord_slope * (b - VOXEL_M - mean_x)).max(VOXEL_M * 0.5);
-    Some(Panel {
+    Ok(Panel {
         cells,
         role,
         n,
@@ -1089,6 +1102,36 @@ mod tests {
         let foil = |id| &AEROFOILS[aerofoil_index(id).unwrap()];
         let (sc, n0012) = (cd_compressibility(0.8, 1.0, foil("supercritical")), cd_compressibility(0.8, 1.0, foil("naca0012")));
         assert!(sc < 1e-9 && n0012 > 1e-3, "M 0.8: supercritical {sc} vs 0012 {n0012}");
+    }
+
+    #[test]
+    fn thick_body_marked_whole_makes_a_panel() {
+        // A flying wing: the body is the wing, 3 voxels thick (grid z = aero x), 8 chord, 8 span.
+        let cells: Vec<([i32; 3], f32, u32)> =
+            (0..8).flat_map(|y| (0..8).flat_map(move |x| (0..3).map(move |z| ([y + 3, z, x], 1.0, 0u32)))).collect();
+        let g = Grid::from_cells(&cells);
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
+        assert_eq!(panels.len(), 1);
+        let p = &panels[0];
+        // Planform is chord x span of whole voxels, whatever the thickness.
+        assert!((p.area / (VOXEL_M * VOXEL_M) - 64.0).abs() < 1e-6, "area {} voxels", p.area / (VOXEL_M * VOXEL_M));
+    }
+
+    #[test]
+    fn flap_facing_the_flow_still_makes_a_panel() {
+        // A plate across the flow (thin along x) like a Starship drag flap: 12 wide, 6 tall, one
+        // side of the symmetry plane so it is not split into two.
+        // Cells are [grid x, grid y, grid z] = [aero y, -aero z, aero x].
+        let cells: Vec<([i32; 3], f32, u32)> =
+            (3..15).flat_map(|y| (0..6).map(move |z| ([y, z, 0], 1.0, 0u32))).collect();
+        let g = Grid::from_cells(&cells);
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
+        assert_eq!(panels.len(), 1, "a plate facing the flow is still a wing");
+        let p = &panels[0];
+        let v = VOXEL_M * VOXEL_M;
+        assert!((p.area / v - 72.0).abs() < 1e-6, "area {} voxels", p.area / v);
+        assert!((p.b / VOXEL_M - 12.0).abs() < 1e-6, "span {}", p.b / VOXEL_M);
+        assert!(p.n.x.abs() > 0.9, "normal {:?} should face the flow", p.n);
     }
 
     #[test]
