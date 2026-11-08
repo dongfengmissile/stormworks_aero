@@ -189,7 +189,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
 /// icon atlas (1024², DXT5, 11 mips) on a 64-aligned grid so every mip stays block aligned.
-const ICONS: [(&str, &[u8]); 18] = [
+const ICONS: [(&str, &[u8]); 17] = [
     ("aero_foil", include_bytes!("../assets/icons/aero_foil.bc3")),
     ("aero_x1", include_bytes!("../assets/icons/aero_x1.bc3")),
     ("aero_twinotter", include_bytes!("../assets/icons/aero_twinotter.bc3")),
@@ -207,7 +207,6 @@ const ICONS: [(&str, &[u8]); 18] = [
     ("aero_flap", include_bytes!("../assets/icons/aero_flap.bc3")),
     ("aero_wingblocks", include_bytes!("../assets/icons/aero_wingblocks.bc3")),
     ("aero_split", include_bytes!("../assets/icons/aero_split.bc3")),
-    ("aero_fill_body", include_bytes!("../assets/icons/aero_fill_body.bc3")),
 ];
 /// Aircraft icon per aerofoil, in `AEROFOILS` order.
 const FOIL_ICONS: [&str; 9] = ["aero_x1", "aero_twinotter", "aero_cessna", "aero_spitfire", "aero_extra", "aero_f86", "aero_a320", "aero_f4", "aero_f104"];
@@ -387,7 +386,7 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 4] {
     let wing_items = [
         ("paint_mode", "Toggle a block", "Click a block to make it a wing block, or click it again to unmark it."),
         ("paint_add", "Fill slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
-        (if own { "aero_fill_body" } else { "paint_add" }, "Fill body", "Click a block to mark every block of its body as wing, however thick (a flying wing)."),
+        ("paint_fill", "Fill body", "Click a block to mark every block of its body as wing, however thick (a flying wing)."),
         ("erase", "Remove a slab", "Click a block to unmark the whole thin slab around it."),
         (if own { "aero_split" } else { "new" }, "New wing", "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back."),
     ];
