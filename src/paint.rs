@@ -1,5 +1,5 @@
 //! Paints chosen voxels in the game's own render: stalled wing voxels red in flight (F9 open,
-//! plugin flight on), and wing voxels by role / aerofoil on the workbench vehicle (F8).
+//! plugin flight on), and wing voxels by role / aerofoil on the workbench vehicle (Aero wings mode).
 //!
 //! The game draws every vehicle chunk mesh through `opaque_chunk_draw_item` (0x680C00) with the
 //! opaque program current. After the game's own draw we call it again for the index runs of the
@@ -25,27 +25,27 @@ use crate::memory::{read_u32_at, read_usize_at, readable, PTR_MIN};
 use crate::voxel::{colour_runs, triangle_voxels};
 
 pub(crate) type ChunkDraw = unsafe extern "system" fn(
-    usize,        // bindset (renderer+0x920)
-    usize,        // mesh
-    u32,          // first index
-    u32,          // index count (0 = whole mesh)
-    *const f32,   // mat_world (interpolated)
-    *const f32,   // mat_world_prev
-    *const f32,   // mat_world_next
-    f32,          // light_factor
-    u32,          // override_color_1 (RGBA8, R in the low byte)
-    u32,          // override_color_2
-    u32,          // override_color_3
-    u8,           // is_preview
-    u8,           // is_force_color
-    u8,           // is_disable_color_replace
-    usize,        // unused
-    u8,           // wireframe pass
+    usize,      // bindset (renderer+0x920)
+    usize,      // mesh
+    u32,        // first index
+    u32,        // index count (0 = whole mesh)
+    *const f32, // mat_world (interpolated)
+    *const f32, // mat_world_prev
+    *const f32, // mat_world_next
+    f32,        // light_factor
+    u32,        // override_color_1 (RGBA8, R in the low byte)
+    u32,        // override_color_2
+    u32,        // override_color_3
+    u8,         // is_preview
+    u8,         // is_force_color
+    u8,         // is_disable_color_replace
+    usize,      // unused
+    u8,         // wireframe pass
 );
 pub(crate) static ORIGINAL: OnceLock<ChunkDraw> = OnceLock::new();
 
 /// Stall red as [r, g, b] (the shader linearises colours like vertex colours).
-const RED: [u8; 3] = [230, 32, 32];
+pub(crate) const RED: [u8; 3] = [230, 32, 32];
 
 /// Voxel -> colour (RGBA8, R in the low byte) of one body.
 pub(crate) type VoxelColours = HashMap<[i32; 3], u32>;
@@ -76,6 +76,85 @@ static WORKBENCH: Mutex<Source> = Mutex::new(Source { version: 0, map: None, las
 static FLIGHT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WORKBENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Moving component meshes (missile fins, control surfaces) to tint: component pointer -> RGB
+/// colour, for the workbench vehicle and for flight (stalled, F9 open). Their class draw passes
+/// the colour with `TINT_MARK` as alpha; `chunk_draw_detour` then draws it forced, like voxels.
+static BENCH_TINT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static FLIGHT_TINT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+const TINT_MARK: u32 = 0x5A00_0000;
+
+pub(crate) fn publish_bench_tint(t: HashMap<usize, u32>) {
+    *BENCH_TINT.lock().unwrap_or_else(|p| p.into_inner()) = (!t.is_empty()).then_some(t);
+}
+pub(crate) fn publish_flight_tint(t: HashMap<usize, u32>) {
+    *FLIGHT_TINT.lock().unwrap_or_else(|p| p.into_inner()) = (!t.is_empty()).then_some(t);
+}
+
+pub(crate) type ClassDraw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub(crate) static ORIGINAL_ROCKET_DRAW: OnceLock<ClassDraw> = OnceLock::new();
+pub(crate) static ORIGINAL_RUDDER_DRAW: OnceLock<ClassDraw> = OnceLock::new();
+
+/// Tint for this component's draw now (game thread), if any.
+fn tint_of(comp: usize) -> Option<u32> {
+    let look = |m: &Mutex<Option<HashMap<usize, u32>>>| m.lock().ok().and_then(|g| g.as_ref()?.get(&comp).copied());
+    let bench = || crate::editor::editor_active().then(|| look(&BENCH_TINT)).flatten();
+    let flight =
+        || (crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) && crate::flight::ENABLED.load(Ordering::Relaxed)).then(|| look(&FLIGHT_TINT)).flatten();
+    bench().or_else(flight).map(|c| (c & 0x00FF_FFFF) | TINT_MARK)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn class_draw(
+    orig: Option<&ClassDraw>,
+    c: usize,
+    q: usize,
+    ma: usize,
+    mb: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+    a9: usize,
+    a10: usize,
+) -> usize {
+    let Some(orig) = orig else { return 0 };
+    match tint_of(c) {
+        Some(col) => orig(c, q, ma, mb, a5, a6, a7, 1, a9, col as usize),
+        None => orig(c, q, ma, mb, a5, a6, a7, a8, a9, a10),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "system" fn rocket_draw_detour(
+    c: usize,
+    q: usize,
+    ma: usize,
+    mb: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+    a9: usize,
+    a10: usize,
+) -> usize {
+    class_draw(ORIGINAL_ROCKET_DRAW.get(), c, q, ma, mb, a5, a6, a7, a8, a9, a10)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "system" fn rudder_draw_detour(
+    c: usize,
+    q: usize,
+    ma: usize,
+    mb: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+    a9: usize,
+    a10: usize,
+) -> usize {
+    class_draw(ORIGINAL_RUDDER_DRAW.get(), c, q, ma, mb, a5, a6, a7, a8, a9, a10)
+}
 
 thread_local! {
     /// Inside the main-view draw (sim render slot 7).
@@ -177,7 +256,8 @@ fn publish_into(src: &Mutex<Source>, active: &AtomicBool, key: u64, colours: &Ha
     }
     static PUBLISH_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if !colours.is_empty() && PUBLISH_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
-        let per: Vec<String> = colours.iter().map(|(&b, v)| format!("{b:#x}: {} voxels, {} meshes", v.len(), ibo_body.values().filter(|&&x| x == b).count())).collect();
+        let per: Vec<String> =
+            colours.iter().map(|(&b, v)| format!("{b:#x}: {} voxels, {} meshes", v.len(), ibo_body.values().filter(|&&x| x == b).count())).collect();
         log_line(&format!("paint: publish {} bodies [{}]", colours.len(), per.join("; ")));
     }
     let map: HashMap<u32, Arc<VoxelColours>> = ibo_body.iter().filter_map(|(&ibo, b)| Some((ibo, colours.get(b)?.clone()))).collect();
@@ -290,7 +370,9 @@ unsafe fn mesh_tris(gl: Option<&Gl>, mesh: usize, ibo: u32) -> Option<Arc<Vec<[i
         std::ptr::copy_nonoverlapping(cpu_v as *const u8, verts.as_mut_ptr(), verts.len());
         std::ptr::copy_nonoverlapping(cpu_i as *const u16, idx.as_mut_ptr(), idx.len());
     } else {
-        let Some(gl) = gl else { return readback_fail(mesh, "GL entry points missing (glBindBuffer/glGetBufferSubData)") };
+        let Some(gl) = gl else {
+            return readback_fail(mesh, "GL entry points missing (glBindBuffer/glGetBufferSubData)");
+        };
         let vbo = u(MESH_VBO);
         if vbo == 0 {
             return readback_fail(mesh, "no VBO id");
@@ -308,10 +390,31 @@ unsafe fn mesh_tris(gl: Option<&Gl>, mesh: usize, ibo: u32) -> Option<Arc<Vec<[i
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "system" fn chunk_draw_detour(
-    a1: usize, mesh: usize, first: u32, count: u32, m: *const f32, mp: *const f32, mn: *const f32, light: f32,
-    c1: u32, c2: u32, c3: u32, preview: u8, force: u8, no_replace: u8, a15: usize, wire: u8,
+    a1: usize,
+    mesh: usize,
+    first: u32,
+    count: u32,
+    m: *const f32,
+    mp: *const f32,
+    mn: *const f32,
+    light: f32,
+    c1: u32,
+    c2: u32,
+    c3: u32,
+    preview: u8,
+    force: u8,
+    no_replace: u8,
+    a15: usize,
+    wire: u8,
 ) {
     let Some(&orig) = ORIGINAL.get() else { return };
+    // A tinted moving mesh (`class_draw`): its colour, forced over the texture.
+    if c1 == c2 && c2 == c3 && c1 & 0xFF00_0000 == TINT_MARK {
+        let c = c1 | 0xFF00_0000;
+        return orig(a1, mesh, first, count, m, mp, mn, light, c, c, c, preview, 1, no_replace, a15, wire);
+    }
+    // `wire` != 0 (the workbench block grid on): this call draws the triangles, then the same
+    // triangles again as black lines. The paint below passes it on, so the lines stay on top.
     orig(a1, mesh, first, count, m, mp, mn, light, c1, c2, c3, preview, force, no_replace, a15, wire);
     // Workbench: any view of the editor vehicle's meshes. Flight: main view only, F9 open.
     // The editor must still be ticking: its meshes' GL ids are recycled once it closes.
@@ -332,7 +435,7 @@ pub(crate) unsafe extern "system" fn chunk_draw_detour(
     if !bench && !flight {
         return;
     }
-    let _ = std::panic::catch_unwind(|| paint(orig, bench, flight, a1, mesh, first, count, m, mp, mn, light, c2, c3, preview, no_replace, a15));
+    let _ = std::panic::catch_unwind(|| paint(orig, bench, flight, a1, mesh, first, count, m, mp, mn, light, c2, c3, preview, no_replace, a15, wire));
 }
 
 fn log_once_gl() {
@@ -365,7 +468,25 @@ fn diag() {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn paint(orig: ChunkDraw, bench: bool, flight: bool, a1: usize, mesh: usize, first: u32, count: u32, m: *const f32, mp: *const f32, mn: *const f32, light: f32, c2: u32, c3: u32, preview: u8, no_replace: u8, a15: usize) {
+unsafe fn paint(
+    orig: ChunkDraw,
+    bench: bool,
+    flight: bool,
+    a1: usize,
+    mesh: usize,
+    first: u32,
+    count: u32,
+    m: *const f32,
+    mp: *const f32,
+    mn: *const f32,
+    light: f32,
+    c2: u32,
+    c3: u32,
+    preview: u8,
+    no_replace: u8,
+    a15: usize,
+    wire: u8,
+) {
     if !readable(mesh + MESH_IBO, 4) {
         return;
     }
@@ -377,7 +498,9 @@ unsafe fn paint(orig: ChunkDraw, bench: bool, flight: bool, a1: usize, mesh: usi
         }
     });
     let look = |src: &Mutex<Source>| src.lock().ok().and_then(|s| Some((s.version, s.map.as_ref()?.get(&ibo)?.clone())));
-    let Some((version, set)) = bench.then(|| look(&WORKBENCH)).flatten().or_else(|| flight.then(|| look(&FLIGHT)).flatten()) else { return };
+    let Some((version, set)) = bench.then(|| look(&WORKBENCH)).flatten().or_else(|| flight.then(|| look(&FLIGHT)).flatten()) else {
+        return;
+    };
     N_HIT.fetch_add(1, Ordering::Relaxed);
     let gl = gl();
     if gl.is_none() {
@@ -405,12 +528,19 @@ unsafe fn paint(orig: ChunkDraw, bench: bool, flight: bool, a1: usize, mesh: usi
                 if c.logged.insert(ibo) && c.logged.len() <= 16 {
                     // Frame check: the stalled voxels should fall inside this mesh's voxel box.
                     let ok = tris.iter().filter(|v| v[0] != i32::MIN);
-                    let (lo, hi) = ok.fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k]))));
-                    let (slo, shi) = set.keys().fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k]))));
+                    let (lo, hi) = ok.fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| {
+                        (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k])))
+                    });
+                    let (slo, shi) = set.keys().fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| {
+                        (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k])))
+                    });
                     let hit: HashSet<[i32; 3]> = tris.iter().filter(|v| set.contains_key(*v)).copied().collect();
                     log_line(&format!(
                         "paint: ibo {ibo}: {} tris, voxels {lo:?}..{hi:?}; body painted {} voxels {slo:?}..{shi:?}; {} found in this mesh, {} runs",
-                        tris.len(), set.len(), hit.len(), r.len()
+                        tris.len(),
+                        set.len(),
+                        hit.len(),
+                        r.len()
                     ));
                 }
             });
@@ -431,7 +561,7 @@ unsafe fn paint(orig: ChunkDraw, bench: bool, flight: bool, a1: usize, mesh: usi
     (gl.depth_func)(GL_LEQUAL);
     N_PAINTED.fetch_add(1, Ordering::Relaxed);
     for &(f, n, col) in runs.iter().take(budget) {
-        orig(a1, mesh, f, n, m, mp, mn, light, col, c2, c3, preview, 1, no_replace, a15, 0);
+        orig(a1, mesh, f, n, m, mp, mn, light, col, c2, c3, preview, 1, no_replace, a15, wire);
     }
     (gl.depth_func)(prev as u32);
 }

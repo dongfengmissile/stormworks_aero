@@ -26,8 +26,38 @@ pub struct Grid {
     pub owner: Vec<u32>,
     /// Every part voxel's true solid in grid units (cell c spans c ± 0.5), with its component.
     pub solids: Vec<(u32, Solid)>,
+    /// Indices into `solids` that bound a moving piece (a missile fin), not the part's body.
+    pub moving: std::collections::HashSet<usize>,
     /// Definitions that could not be found (drawn as one full voxel).
     pub missing: Vec<String>,
+    /// Indices into `solids` that are propeller / rotor blades: drawn, not part of the air's
+    /// body (their forces are the blade-element model's, `prop.rs`).
+    pub blades: std::collections::HashSet<usize>,
+}
+
+/// One part's propeller / rotor blades at its settings, grid units (`force_emitter_draw`:
+/// `v·S·P·RotY(2π·i/n)`, S the blade-length scale, P the pitch turn about the blade and the lift
+/// to `blade_height`; hub at rest).
+pub fn blade_solids(c: &Comp, p: &crate::defs::PropDef) -> Vec<Solid> {
+    let set = c.prop.unwrap_or_default();
+    let n = set.blades.unwrap_or(4).clamp(2, 8);
+    let s = crate::defs::PropDef::scale(set.length.unwrap_or(0.5));
+    let phi = -0.75 * set.pitch.unwrap_or(p.default_pitch as f64).clamp(-1.0, 1.0);
+    let (sp, cp) = phi.sin_cos();
+    let pose = |v: V3, i: u32, point: bool| {
+        let v = v * if point { s } else { 1.0 };
+        let v = v3(v.x, v.y * cp - v.z * sp, v.y * sp + v.z * cp);
+        let v = if point { v + v3(0.0, p.blade_height, 0.0) } else { v };
+        let (st, ct) = (2.0 * std::f64::consts::PI * i as f64 / n as f64).sin_cos();
+        v3(v.x * ct + v.z * st, v.y, -v.x * st + v.z * ct)
+    };
+    (0..n)
+        .map(|i| {
+            let pts: Vec<V3> = p.blade.iter().map(|&q| pose(q, i, true) * (1.0 / VOXEL_M)).collect();
+            let dirs: Vec<V3> = [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)].into_iter().map(|d| pose(d, i, false)).collect();
+            place(&crate::defs::hull_solid(&pts, &dirs), c)
+        })
+        .collect()
 }
 
 /// `p·R + pos`: the component transform, stretched or not.
@@ -46,6 +76,7 @@ fn place(s: &Solid, c: &Comp) -> Solid {
 impl Grid {
     pub fn build(comps: &[Comp], lib: &mut Library) -> Grid {
         let mut solids: Vec<(u32, Solid)> = Vec::new();
+        let mut moving = std::collections::HashSet::new();
         let mut missing = Vec::new();
         for (i, c) in comps.iter().enumerate() {
             match lib.get(&c.def) {
@@ -61,6 +92,9 @@ impl Grid {
                         let placed = place(&local, c);
                         // XML-flattened parts (a zero row in the transform) take no space.
                         if solid_volume(&placed) > 1e-9 {
+                            if v.moving {
+                                moving.insert(solids.len());
+                            }
                             solids.push((i as u32, placed));
                         }
                     }
@@ -121,7 +155,17 @@ impl Grid {
         let cells: Vec<([i32; 3], f32, u32)> = acc.into_iter().map(|(c, (f, o, _))| (c, f.min(1.0), o)).collect();
         let mut grid = Grid::from_cells(&cells);
         grid.solids = solids;
+        grid.moving = moving;
         grid.missing = missing;
+        for (i, c) in comps.iter().enumerate() {
+            let Some(p) = lib.get(&c.def).and_then(|d| d.prop.clone()) else {
+                continue;
+            };
+            for s in blade_solids(c, &p) {
+                grid.blades.insert(grid.solids.len());
+                grid.solids.push((i as u32, s));
+            }
+        }
         grid.solidify();
         grid
     }
@@ -143,14 +187,23 @@ impl Grid {
         let min = [lo[0] - 1, lo[1] - 1, lo[2] - 1];
         let dims = [0, 1, 2].map(|a| (hi[a] - lo[a] + 3) as usize);
         let n = dims[0] * dims[1] * dims[2];
-        let mut g = Grid { min, dims, fill: vec![0.0; n], owner: vec![EMPTY; n], solids: Vec::new(), missing: Vec::new() };
+        let mut g = Grid {
+            min,
+            dims,
+            fill: vec![0.0; n],
+            owner: vec![EMPTY; n],
+            solids: Vec::new(),
+            moving: Default::default(),
+            missing: Vec::new(),
+            blades: Default::default(),
+        };
         for &(p, f, o) in cells {
             let i = g.index(p).unwrap();
             if f > g.fill[i] {
                 g.fill[i] = f;
                 g.owner[i] = o;
             }
-            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0 };
+            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0, mirror: 0, prop: None };
             g.solids.push((o, place(&voxel_solid(None), &c)));
         }
         g
@@ -311,7 +364,16 @@ mod slab_tests {
         // touches the box wall; the box's top skin is 1 thick too.
         let dims = [12usize, 7, 3];
         let n = dims[0] * dims[1] * dims[2];
-        let mut g = Grid { min: [0, 0, 0], dims, fill: vec![0.0; n], owner: vec![EMPTY; n], solids: Vec::new(), missing: Vec::new() };
+        let mut g = Grid {
+            min: [0, 0, 0],
+            dims,
+            fill: vec![0.0; n],
+            owner: vec![EMPTY; n],
+            solids: Vec::new(),
+            moving: Default::default(),
+            missing: Vec::new(),
+            blades: Default::default(),
+        };
         for z in 0..3 {
             for y in 0..7 {
                 for x in 0..5 {
@@ -343,7 +405,16 @@ mod slab_tests {
     fn fin_glued_to_the_hull_still_marks() {
         // Hull (owner 1) at x 0..3, a vertical fin plate (owner 3) at x = 4 glued to it.
         let dims = [6usize, 8, 3];
-        let mut g = Grid { min: [0, 0, 0], dims, fill: vec![0.0; dims[0] * dims[1] * dims[2]], owner: vec![EMPTY; dims[0] * dims[1] * dims[2]], solids: Vec::new(), missing: Vec::new() };
+        let mut g = Grid {
+            min: [0, 0, 0],
+            dims,
+            fill: vec![0.0; dims[0] * dims[1] * dims[2]],
+            owner: vec![EMPTY; dims[0] * dims[1] * dims[2]],
+            solids: Vec::new(),
+            moving: Default::default(),
+            missing: Vec::new(),
+            blades: Default::default(),
+        };
         for z in 0..3 {
             for y in 0..8 {
                 for x in 0..4 {
@@ -394,7 +465,9 @@ pub fn colour_runs(tri: &[[i32; 3]], first: u32, count: u32, colours: &std::coll
     let (t0, t1) = ((first / 3) as usize, (((first + count) / 3) as usize).min(tri.len()));
     let mut runs: Vec<(u32, u32, u32)> = Vec::new();
     for t in t0..t1 {
-        let Some(&col) = colours.get(&tri[t]) else { continue };
+        let Some(&col) = colours.get(&tri[t]) else {
+            continue;
+        };
         match runs.last_mut() {
             Some(r) if r.0 + r.1 == t as u32 * 3 && r.2 == col => r.1 += 3,
             _ => runs.push((t as u32 * 3, 3, col)),

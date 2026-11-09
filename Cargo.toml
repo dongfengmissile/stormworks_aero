@@ -18,6 +18,8 @@ path = "src/bin/aero_inject.rs"
 [target.'cfg(windows)'.dependencies]
 minhook = "0.9"
 # Same overlay stack as video_get_2 and swQolSuite (hooks wglSwapBuffers + the window proc).
+# Same imgui as hudhook, with the tables API.
+imgui = { version = "0.12", features = ["tables-api"] }
 hudhook = { version = "0.7.1", default-features = false, features = ["opengl3"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

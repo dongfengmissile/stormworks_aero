@@ -33,9 +33,33 @@ unsafe fn install_toolbar_hooks() {
     use crate::toolbar::*;
     let base = MODULE_BASE.load(Ordering::SeqCst);
     let targets: [(&str, usize, &[u8], *mut c_void); 3] = [
-        ("toolbar init", RVA_TOOLBAR_INIT, &[0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x08, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0xc0, 0x02, 0x00, 0x00], toolbar_init_detour as *mut c_void),
-        ("editor event", RVA_EDITOR_EVENT, &[0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x78, 0xfc, 0xff, 0xff, 0x48, 0x81, 0xec, 0x48, 0x04, 0x00, 0x00, 0x0f, 0x29, 0x70], editor_event_detour as *mut c_void),
-        ("editor mouse button", RVA_EDITOR_MOUSE_BUTTON, &[0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0xb8, 0xfb, 0xff, 0xff, 0x48, 0x81, 0xec, 0x08, 0x05, 0x00, 0x00, 0x0f, 0x29, 0x70], mouse_button_detour as *mut c_void),
+        (
+            "toolbar init",
+            RVA_TOOLBAR_INIT,
+            &[
+                0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x08, 0xfe, 0xff,
+                0xff, 0x48, 0x81, 0xec, 0xc0, 0x02, 0x00, 0x00,
+            ],
+            toolbar_init_detour as *mut c_void,
+        ),
+        (
+            "editor event",
+            RVA_EDITOR_EVENT,
+            &[
+                0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x78, 0xfc, 0xff, 0xff, 0x48, 0x81,
+                0xec, 0x48, 0x04, 0x00, 0x00, 0x0f, 0x29, 0x70,
+            ],
+            editor_event_detour as *mut c_void,
+        ),
+        (
+            "editor mouse button",
+            RVA_EDITOR_MOUSE_BUTTON,
+            &[
+                0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0xb8, 0xfb, 0xff, 0xff, 0x48, 0x81,
+                0xec, 0x08, 0x05, 0x00, 0x00, 0x0f, 0x29, 0x70,
+            ],
+            mouse_button_detour as *mut c_void,
+        ),
     ];
     for (name, rva, pro, _) in &targets {
         if !bytes_match(base + rva, pro) {
@@ -80,11 +104,47 @@ static ORIGINAL_SET_DAMPING: OnceLock<SetDamping> = OnceLock::new();
 
 /// Bullet velocity damping is the game's other air loss: none while our forces fly.
 unsafe extern "system" fn set_damping_detour(scene: usize, obj: usize, linear: f32, angular: f32) {
-    let Some(original) = ORIGINAL_SET_DAMPING.get() else { return };
-    if crate::flight::ENABLED.load(Ordering::Relaxed) {
+    let Some(original) = ORIGINAL_SET_DAMPING.get() else {
+        return;
+    };
+    if crate::flight::flies_obj(obj) {
         original(scene, obj, 0.0, 0.0);
     } else {
         original(scene, obj, linear, angular);
+    }
+}
+
+type AirNodeForces = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize);
+static ORIGINAL_AIR_NODE: OnceLock<AirNodeForces> = OnceLock::new();
+
+/// The game's hull-face air forces, skipped for the bodies of vehicles the plugin flies (worker threads).
+unsafe extern "system" fn air_node_detour(ctx: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) {
+    let body = (ctx as *const usize).read().wrapping_sub(OFF_BODY_AIR_RECORDS);
+    let obj = ((body + OFF_BODY_PHYS_OBJ) as *const usize).read();
+    if obj != 0 && crate::flight::flies_obj(obj) {
+        return;
+    }
+    if let Some(original) = ORIGINAL_AIR_NODE.get() {
+        original(ctx, a2, a3, a4, a5, a6);
+    }
+}
+
+/// Per-body switch for the game's hull air forces; without it the air constants are zeroed for all.
+unsafe fn install_air_node_hook() {
+    let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_AIR_NODE_FORCES;
+    if !bytes_match(at, &AIR_NODE_FORCES_PROLOGUE) {
+        log_line(&format!("fluid_air_node_forces prologue mismatch at {at:#x}: vehicle settings cannot keep the game's hull air forces"));
+        return;
+    }
+    match MinHook::create_hook(at as *mut c_void, air_node_detour as *mut c_void) {
+        Ok(o) => {
+            let _ = ORIGINAL_AIR_NODE.set(std::mem::transmute::<*mut c_void, AirNodeForces>(o));
+            if MinHook::enable_hook(at as *mut c_void).is_ok() {
+                crate::flight::AIR_PER_BODY.store(true, Ordering::Relaxed);
+                log_line(&format!("hull air forces switched per vehicle at {at:#x}"));
+            }
+        }
+        Err(e) => log_line(&format!("create air node hook: {e:?}")),
     }
 }
 
@@ -137,6 +197,8 @@ pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
         log_line(&format!("matrix_interp_prev_cur prologue mismatch at {interp:#x}; arrows use a linear blend"));
     }
     install_paint_hook();
+    install_tint_hooks();
+    install_blur_hooks();
     log_line(&format!("camera hook installed ({at:#x})"));
     Ok(())
 }
@@ -164,6 +226,76 @@ unsafe fn install_paint_hook() {
     }
 }
 
+/// Rotor blur: the three pushes first (they route tagged items), the draw last, all or nothing,
+/// since tagged colours reaching an unhooked push would draw wrong.
+unsafe fn install_blur_hooks() {
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    let mut push = PUSH_PROLOGUE;
+    let mut ok = true;
+    for (rva, frame) in [(RVA_PUSH_232, 0xF9), (RVA_PUSH_SHADOW_A, 0xF1), (RVA_PUSH_SHADOW_B, 0xE9)] {
+        push[28] = frame;
+        ok &= bytes_match(base + rva, &push);
+    }
+    ok &= bytes_match(base + RVA_PUSH_DITHER, &PUSH_DITHER_PROLOGUE) && bytes_match(base + RVA_FORCE_EMITTER_DRAW, &FORCE_EMITTER_DRAW_PROLOGUE);
+    if !ok {
+        log_line("rotor blur: prologue mismatch, blades drawn sharp");
+        return;
+    }
+    let _ = crate::blur::PUSH_DITHER.set(std::mem::transmute::<usize, _>(base + RVA_PUSH_DITHER));
+    let hook = |rva: usize, detour: *mut c_void| -> Option<*mut c_void> {
+        let at = (base + rva) as *mut c_void;
+        let o = MinHook::create_hook(at, detour).map_err(|e| log_line(&format!("rotor blur: create hook {rva:#x}: {e:?}"))).ok()?;
+        MinHook::enable_hook(at).map_err(|e| log_line(&format!("rotor blur: enable hook {rva:#x}: {e:?}"))).ok()?;
+        Some(o)
+    };
+    let Some(o) = hook(RVA_PUSH_232, crate::blur::push232_detour as *mut c_void) else { return };
+    let _ = crate::blur::ORIGINAL_232.set(std::mem::transmute::<*mut c_void, crate::blur::Push232>(o));
+    for (rva, detour, slot) in [
+        (RVA_PUSH_SHADOW_A, crate::blur::shadow_a_detour as *mut c_void, &crate::blur::ORIGINAL_SHADOW_A),
+        (RVA_PUSH_SHADOW_B, crate::blur::shadow_b_detour as *mut c_void, &crate::blur::ORIGINAL_SHADOW_B),
+    ] {
+        let Some(o) = hook(rva, detour) else { return };
+        let _ = slot.set(std::mem::transmute::<*mut c_void, crate::blur::PushShadow>(o));
+    }
+    let Some(o) = hook(RVA_FORCE_EMITTER_DRAW, crate::blur::draw_detour as *mut c_void) else { return };
+    let _ = crate::blur::ORIGINAL_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::ClassDraw>(o));
+    log_line("rotor blur hooks installed");
+}
+
+/// Tint hooks on the rocket / rudder class draws (missile fins, control surfaces); failure only
+/// leaves those meshes unpainted.
+unsafe fn install_tint_hooks() {
+    if crate::plugin::paint_disabled() {
+        return;
+    }
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    for (name, rva, prologue, detour, orig) in [
+        (
+            "solid_rocket_draw",
+            RVA_SOLID_ROCKET_DRAW,
+            &SOLID_ROCKET_DRAW_PROLOGUE[..],
+            crate::paint::rocket_draw_detour as *mut c_void,
+            &crate::paint::ORIGINAL_ROCKET_DRAW,
+        ),
+        ("rudder_draw", RVA_RUDDER_DRAW, &RUDDER_DRAW_PROLOGUE[..], crate::paint::rudder_draw_detour as *mut c_void, &crate::paint::ORIGINAL_RUDDER_DRAW),
+    ] {
+        let at = base + rva;
+        if !bytes_match(at, prologue) {
+            log_line(&format!("{name} prologue mismatch at {at:#x}; its moving mesh is not painted"));
+            continue;
+        }
+        match MinHook::create_hook(at as *mut c_void, detour) {
+            Ok(o) => {
+                let _ = orig.set(std::mem::transmute::<*mut c_void, crate::paint::ClassDraw>(o));
+                if let Err(e) = MinHook::enable_hook(at as *mut c_void) {
+                    log_line(&format!("enable {name} hook: {e:?}"));
+                }
+            }
+            Err(e) => log_line(&format!("create {name} hook: {e:?}")),
+        }
+    }
+}
+
 type QueueForce = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize) -> usize;
 static ORIGINAL_THRESHOLD: OnceLock<QueueForce> = OnceLock::new();
 static ORIGINAL_CLAMPED: OnceLock<QueueForce> = OnceLock::new();
@@ -184,10 +316,12 @@ unsafe extern "system" fn clamped_shim() {
 /// Forces queued from a known thrust call site (jets, rockets, propellers/rotors, RCS, water jets) are thrust (world frame) on `phys_obj`'s rigid body.
 unsafe fn note_thrust(ret: usize, returns: &[(usize, u8)], phys_obj: usize, force: usize, rel: usize, max: usize, scale: usize) {
     let base = MODULE_BASE.load(Ordering::Relaxed);
-    if !crate::flight::ENABLED.load(Ordering::Relaxed) || force == 0 {
+    if force == 0 || !crate::flight::flies_obj(phys_obj) {
         return;
     }
-    let Some(&(_, source)) = returns.iter().find(|(r, _)| base + r == ret) else { return };
+    let Some(&(_, source)) = returns.iter().find(|(r, _)| base + r == ret) else {
+        return;
+    };
     if !crate::editor::ptr_ok(phys_obj + OFF_OBJ_RIGID_BODY, 8) {
         return;
     }
@@ -202,10 +336,14 @@ unsafe fn note_thrust(ret: usize, returns: &[(usize, u8)], phys_obj: usize, forc
 
 unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize) -> usize {
     let ret = RET_THRESHOLD.load(Ordering::Relaxed);
+    // A propeller the plugin flies: its blade-element forces replace the game's thrust.
+    if ret == MODULE_BASE.load(Ordering::Relaxed) + PROP_THRUST_RETURN && crate::flight::prop_modeled(a4.wrapping_sub(OFF_PROP_FORCE_ACC)) {
+        return 0;
+    }
     // A jet nozzle's thrust follows its spool: queue a reshaped copy of the force instead.
     let shaped: [f32; 3];
     let mut force = a3;
-    if crate::flight::ENABLED.load(Ordering::Relaxed) && a3 != 0 && ret == MODULE_BASE.load(Ordering::Relaxed) + JET_NOZZLE_RETURN {
+    if a3 != 0 && ret == MODULE_BASE.load(Ordering::Relaxed) + JET_NOZZLE_RETURN && crate::flight::flies_obj(a2) {
         let f = (a3 as *const [f32; 3]).read_unaligned();
         if let Some(g) = crate::flight::jet_sample(a4.wrapping_sub(JET_THIS_FROM_ARG4), a2, f, a5 as *const f32) {
             shaped = g;
@@ -217,11 +355,90 @@ unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: 
 }
 
 unsafe extern "system" fn clamped_detour(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize) -> usize {
-    note_thrust(RET_CLAMPED.load(Ordering::Relaxed), &CLAMPED_THRUST_RETURNS, a2, a3, a5, a6, a7);
+    let ret = RET_CLAMPED.load(Ordering::Relaxed);
+    // The game's fin / wing air force: ours replace it (callers ignore the return value).
+    if GAME_AIR_FORCE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::flies_obj(a2) {
+        return 0;
+    }
+    // Coaxial rotors' anti-torque couple: the plugin's two counter-rotating discs replace it.
+    if PROP_COUPLE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::any_prop_modeled() && crate::flight::flies_obj(a2) {
+        return 0;
+    }
+    note_thrust(ret, &CLAMPED_THRUST_RETURNS, a2, a3, a5, a6, a7);
     ORIGINAL_CLAMPED.get().map_or(0, |o| o(a1, a2, a3, a4, a5, a6, a7))
 }
 
 /// Engine thrust capture; failure leaves the applyForce sum / estimate in F9.
+type PropTick = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+static ORIGINAL_PROP_TICK: OnceLock<PropTick> = OnceLock::new();
+
+/// `force_emitter_tick_propeller_rotor`: note the speed it starts from, then let our blades'
+/// torque set the speed it leaves (`flight::prop_after_tick`).
+unsafe extern "system" fn prop_tick_detour(comp: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) -> usize {
+    let Some(original) = ORIGINAL_PROP_TICK.get() else {
+        return 0;
+    };
+    let w_in = if crate::editor::ptr_ok(comp, OFF_PROP_FORCE_ACC) {
+        let from = if read_usize(comp + OFF_PROP_LINK) != 0 { OFF_PROP_SHAFT } else { OFF_PROP_SPEED };
+        Some(f32::from_bits(crate::memory::read_u32_at(comp + from)))
+    } else {
+        None
+    };
+    let angle = w_in.map(|_| f32::from_bits(crate::memory::read_u32_at(comp + OFF_PROP_ANGLE)));
+    let r = original(comp, a2, a3, a4, a5, a6, a7, a8);
+    if let Some(w) = w_in {
+        let _ = std::panic::catch_unwind(|| crate::flight::prop_after_tick(comp, w));
+    }
+    if let (Some(before), Some(w)) = (angle, w_in) {
+        true_spin(comp, before, w);
+        let step = f32::from_bits(crate::memory::read_u32_at(comp + OFF_PROP_ANGLE)) - before;
+        let _ = std::panic::catch_unwind(|| crate::blur::track_hinge(comp, step as f64));
+    }
+    r
+}
+
+/// Air props and rotors drawn at their real speed (shaft RPS × rotation_speed rev/s). The game
+/// turns them by `w_prev·rotation_speed·0.5/60`, 4π too slow, and `w_prev` is the speed after
+/// the load, not the shaft's: use the shaft speed the tick started from.
+unsafe fn true_spin(comp: usize, before: f32, w_in: f32) {
+    let def = read_usize(comp + OFF_COMP_DEF);
+    if !crate::editor::ptr_ok(def + OFF_DEF_PROP_FLAGS, 4) || crate::memory::read_u32_at(def + OFF_DEF_PROP_FLAGS) & 2 != 0 {
+        return;
+    }
+    if !crate::editor::ptr_ok(def, OFF_DEF_ROTATION_SPEED + 4) {
+        return;
+    }
+    let tau = std::f32::consts::TAU;
+    let at = (comp + OFF_PROP_ANGLE) as *mut f32;
+    let rot = f32::from_bits(crate::memory::read_u32_at(def + OFF_DEF_ROTATION_SPEED));
+    let next = (before + w_in * rot * tau / 60.0).rem_euclid(tau);
+    if next.is_finite() {
+        at.write_unaligned(next);
+    }
+}
+
+unsafe fn read_usize(at: usize) -> usize {
+    crate::memory::read_usize_at(at)
+}
+
+unsafe fn install_prop_hook() {
+    let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_PROP_TICK;
+    if !bytes_match(at, &PROP_TICK_PROLOGUE) {
+        log_line(&format!("force_emitter tick prologue mismatch at {at:#x}; propellers keep the game's forces"));
+        return;
+    }
+    match MinHook::create_hook(at as *mut c_void, prop_tick_detour as *mut c_void) {
+        Ok(o) => {
+            let _ = ORIGINAL_PROP_TICK.set(std::mem::transmute::<*mut c_void, PropTick>(o));
+            match MinHook::enable_hook(at as *mut c_void) {
+                Ok(()) => crate::flight::PROPS_HOOKED.store(true, Ordering::Relaxed),
+                Err(e) => log_line(&format!("enable force_emitter tick hook: {e:?}")),
+            }
+        }
+        Err(e) => log_line(&format!("create force_emitter tick hook: {e:?}")),
+    }
+}
+
 unsafe fn install_thrust_hooks() {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     for (name, rva, prologue, shim, orig) in [
@@ -255,7 +472,9 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
         ("btRigidBody::applyForce", apply, bytes_match(apply, &APPLY_FORCE_PROLOGUE)),
     ] {
         if !ok {
-            return Err(format!("{name} prologue mismatch at {at:#x} (hooked by another plugin, or not build {GAME_BUILD_LABEL}); in-game flight forces disabled"));
+            return Err(format!(
+                "{name} prologue mismatch at {at:#x} (hooked by another plugin, or not build {GAME_BUILD_LABEL}); in-game flight forces disabled"
+            ));
         }
     }
     // Not detoured: its callers rely on registers it leaves untouched (rax at 0x1A1605, r9 at 0x1A171B),
@@ -267,7 +486,9 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
     let _ = ORIGINAL_POST_STEP_SYNC.set(std::mem::transmute::<*mut c_void, PostStepSync>(o));
     MinHook::enable_hook(damping as *mut c_void).map_err(|e| format!("enable damping hook: {e:?}"))?;
     MinHook::enable_hook(sync as *mut c_void).map_err(|e| format!("enable post-step hook: {e:?}"))?;
+    install_air_node_hook();
     install_thrust_hooks();
+    install_prop_hook();
     // Ground effect: the game's raycast and water height (called, not hooked).
     let (ray, water) = (base + RVA_RAYCAST_CLOSEST, base + RVA_WATER_HEIGHT);
     if bytes_match(ray, &RAYCAST_CLOSEST_PROLOGUE) && bytes_match(water, &WATER_HEIGHT_PROLOGUE) {
@@ -288,8 +509,7 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
             "editor update prologue mismatch at {target:#x} (another plugin hooked it, or this game build is not {GAME_BUILD_LABEL}); workbench analysis disabled"
         ));
     }
-    let original = MinHook::create_hook(target as *mut c_void, editor_update_detour as *mut c_void)
-        .map_err(|e| format!("create editor update hook: {e:?}"))?;
+    let original = MinHook::create_hook(target as *mut c_void, editor_update_detour as *mut c_void).map_err(|e| format!("create editor update hook: {e:?}"))?;
     let _ = ORIGINAL_EDITOR_UPDATE.set(std::mem::transmute::<*mut c_void, EditorUpdate>(original));
     MinHook::enable_hook(target as *mut c_void).map_err(|e| format!("enable editor update hook: {e:?}"))?;
     log_line(&format!("editor update hooked at {target:#x}"));

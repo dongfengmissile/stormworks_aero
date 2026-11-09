@@ -280,6 +280,7 @@ name = "stormworks_aero"
 version = "0.1.0"
 dependencies = [
  "hudhook",
+ "imgui",
  "minhook",
  "windows-sys",
 ]

@@ -9,8 +9,10 @@
 
 pub mod body;
 pub mod defs;
+pub mod marks;
 pub mod math;
 pub mod model;
+pub mod prop;
 pub mod shape;
 pub mod spool;
 pub mod vehicle;
@@ -20,17 +22,21 @@ pub mod wing;
 pub mod xml;
 
 #[cfg(windows)]
+mod blur;
+#[cfg(windows)]
+mod drawcap;
+#[cfg(windows)]
 mod editor;
 #[cfg(windows)]
 mod fault;
-#[cfg(windows)]
-mod drawcap;
 #[cfg(windows)]
 mod flight;
 #[cfg(windows)]
 mod hooks;
 #[cfg(windows)]
 mod logging;
+#[cfg(windows)]
+mod markhooks;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]

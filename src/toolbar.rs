@@ -79,23 +79,83 @@ fn fns() -> Option<&'static Fns> {
         };
         Some(Fns {
             op_new: std::mem::transmute::<usize, _>(at(0x95_c6f8, &[0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xeb, 0x0f])?),
-            gstr_reserve: std::mem::transmute::<usize, _>(at(0x17_ca10, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0xbb, 0x20, 0x00, 0x00, 0x00])?),
-            make_toggle: std::mem::transmute::<usize, _>(at(0x26_3a20, &[0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x57, 0x48, 0x81, 0xec, 0x90])?),
-            add_child: std::mem::transmute::<usize, _>(at(0x8f_aa70, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xf1, 0x49])?),
-            separator: std::mem::transmute::<usize, _>(at(0x25_0e50, &[0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x40, 0x0f, 0x29, 0x74, 0x24, 0x30, 0x0f, 0x28, 0xf2])?),
-            capsule_tooltip: std::mem::transmute::<usize, _>(at(0x24_7fa0, &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x18, 0x0f, 0x28, 0xe3, 0x48, 0x8b, 0xd1])?),
-            set_tooltip_holder: std::mem::transmute::<usize, _>(at(0x24_a6b0, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x49, 0x8b, 0xf0])?),
-            basic_tooltip: std::mem::transmute::<usize, _>(at(0x61_4260, &[0x4c, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56])?),
-            set_tooltip_content: std::mem::transmute::<usize, _>(at(0x24_8890, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xfa, 0x48, 0x8b, 0xf1])?),
-            set_tool_mode: std::mem::transmute::<usize, _>(at(0x80_2e50, &[0x48, 0x89, 0x5c, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xd9])?),
-            slide_shelf_ctor: std::mem::transmute::<usize, _>(at(0x25_10c0, &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x18, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x05])?),
-            slide_shelf_init_bg: std::mem::transmute::<usize, _>(at(0x25_11c0, &[0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xf2, 0x48, 0x8b, 0xf9, 0xb9, 0x60, 0x00, 0x00, 0x00, 0xe8])?),
-            rounded_rect_ctor: std::mem::transmute::<usize, _>(at(0x24_58e0, &[0x4c, 0x8b, 0xdc, 0x49, 0x89, 0x5b, 0x18, 0x49, 0x89, 0x4b, 0x08, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xf9, 0xc7])?),
-            rounded_rect_set_size: std::mem::transmute::<usize, _>(at(0x24_5fc0, &[0x48, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x61, 0x10, 0x4c, 0x8b, 0xd2, 0x0f, 0x2e, 0xe2, 0x4c, 0x8b, 0xc9, 0x7a, 0x0e])?),
-            make_action: std::mem::transmute::<usize, _>(at(0x26_3730, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, 0x0f, 0x29, 0x74, 0x24, 0x70])?),
-            icon_find: std::mem::transmute::<usize, _>(at(0x1d_f300, &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x54, 0x24, 0x10, 0x57, 0x41, 0x54, 0x41])?),
-            icon_add_region: std::mem::transmute::<usize, _>(at(0x1d_f190, &[0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x20, 0x45, 0x8b, 0xf1])?),
-            group_select: std::mem::transmute::<usize, _>(at(0x24_d2c0, &[0x48, 0x89, 0x5c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x6c, 0x24, 0x30, 0x4d, 0x8b, 0xf0, 0x8b, 0x69, 0x10])?),
+            gstr_reserve: std::mem::transmute::<usize, _>(at(
+                0x17_ca10,
+                &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0xbb, 0x20, 0x00, 0x00, 0x00],
+            )?),
+            make_toggle: std::mem::transmute::<usize, _>(at(
+                0x26_3a20,
+                &[0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x57, 0x48, 0x81, 0xec, 0x90],
+            )?),
+            add_child: std::mem::transmute::<usize, _>(at(
+                0x8f_aa70,
+                &[
+                    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xf1,
+                    0x49,
+                ],
+            )?),
+            separator: std::mem::transmute::<usize, _>(at(
+                0x25_0e50,
+                &[0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x40, 0x0f, 0x29, 0x74, 0x24, 0x30, 0x0f, 0x28, 0xf2],
+            )?),
+            capsule_tooltip: std::mem::transmute::<usize, _>(at(
+                0x24_7fa0,
+                &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x18, 0x0f, 0x28, 0xe3, 0x48, 0x8b, 0xd1],
+            )?),
+            set_tooltip_holder: std::mem::transmute::<usize, _>(at(
+                0x24_a6b0,
+                &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x49, 0x8b, 0xf0],
+            )?),
+            basic_tooltip: std::mem::transmute::<usize, _>(at(
+                0x61_4260,
+                &[0x4c, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56],
+            )?),
+            set_tooltip_content: std::mem::transmute::<usize, _>(at(
+                0x24_8890,
+                &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xfa, 0x48, 0x8b, 0xf1],
+            )?),
+            set_tool_mode: std::mem::transmute::<usize, _>(at(
+                0x80_2e50,
+                &[0x48, 0x89, 0x5c, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xd9],
+            )?),
+            slide_shelf_ctor: std::mem::transmute::<usize, _>(at(
+                0x25_10c0,
+                &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x18, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x05],
+            )?),
+            slide_shelf_init_bg: std::mem::transmute::<usize, _>(at(
+                0x25_11c0,
+                &[0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xf2, 0x48, 0x8b, 0xf9, 0xb9, 0x60, 0x00, 0x00, 0x00, 0xe8],
+            )?),
+            rounded_rect_ctor: std::mem::transmute::<usize, _>(at(
+                0x24_58e0,
+                &[0x4c, 0x8b, 0xdc, 0x49, 0x89, 0x5b, 0x18, 0x49, 0x89, 0x4b, 0x08, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xf9, 0xc7],
+            )?),
+            rounded_rect_set_size: std::mem::transmute::<usize, _>(at(
+                0x24_5fc0,
+                &[0x48, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x61, 0x10, 0x4c, 0x8b, 0xd2, 0x0f, 0x2e, 0xe2, 0x4c, 0x8b, 0xc9, 0x7a, 0x0e],
+            )?),
+            make_action: std::mem::transmute::<usize, _>(at(
+                0x26_3730,
+                &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, 0x0f, 0x29, 0x74, 0x24, 0x70],
+            )?),
+            icon_find: std::mem::transmute::<usize, _>(at(
+                0x1d_f300,
+                &[
+                    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x54, 0x24, 0x10, 0x57, 0x41, 0x54,
+                    0x41,
+                ],
+            )?),
+            icon_add_region: std::mem::transmute::<usize, _>(at(
+                0x1d_f190,
+                &[
+                    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x20, 0x45, 0x8b,
+                    0xf1,
+                ],
+            )?),
+            group_select: std::mem::transmute::<usize, _>(at(
+                0x24_d2c0,
+                &[0x48, 0x89, 0x5c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x6c, 0x24, 0x30, 0x4d, 0x8b, 0xf0, 0x8b, 0x69, 0x10],
+            )?),
         })
     })
     .as_ref()
@@ -105,7 +165,22 @@ fn fns() -> Option<&'static Fns> {
 /// `Role::ALL`) and the aerofoil (index into `AEROFOILS`); set from the shelf clicks.
 pub(crate) static TOOL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ROLE: AtomicUsize = AtomicUsize::new(1);
-pub(crate) static FOIL: AtomicUsize = AtomicUsize::new(0);
+/// Aerofoil shelf category (0 lifting surfaces, 1 missile fins) and the pick in each.
+pub(crate) static FOIL_CAT: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static FOIL: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(crate::wing::FIN_DEFAULT)];
+
+/// The aerofoil picked on the shelves (index into `AEROFOILS`).
+pub(crate) fn foil() -> usize {
+    FOIL[FOIL_CAT.load(Ordering::Relaxed).min(1)].load(Ordering::Relaxed)
+}
+
+/// `AEROFOILS` range offered in each aerofoil category (the grid section is never offered).
+fn foil_range(cat: usize) -> std::ops::Range<usize> {
+    use crate::wing::{FoilKind, AEROFOILS};
+    let kind = if cat == 0 { FoilKind::Wing } else { FoilKind::Fin };
+    let first = AEROFOILS.iter().position(|a| a.kind == kind).unwrap_or(0);
+    first..first + AEROFOILS[first..].iter().take_while(|a| a.kind == kind).count()
+}
 /// Wing blocks tool: 0 toggle one block, 1 fill slab, 2 fill body, 3 remove slab, 4 new wing.
 pub(crate) static WING_MODE: AtomicUsize = AtomicUsize::new(0);
 const ID_WING: i32 = 231;
@@ -122,10 +197,13 @@ pub(crate) static CAN_REDO: AtomicBool = AtomicBool::new(false);
 pub(crate) static REDO_REQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const ID_TOOL: i32 = 201;
 const ID_ROLE: i32 = 211;
-const ID_FOIL: i32 = 221;
+const ID_FOIL_CAT: i32 = 291;
+/// Aerofoil buttons: `ID_FOIL` + index into `AEROFOILS`.
+const ID_FOIL: i32 = 301;
 
 /// Side shelves (tools, roles, aerofoils) and the toolbar they were built for (game thread only).
-static SHELVES: Mutex<(usize, [usize; 4])> = Mutex::new((0, [0; 4]));
+/// tools, wing modes, roles, aerofoil categories, lifting-surface aerofoils, missile-fin aerofoils.
+static SHELVES: Mutex<(usize, [usize; 6])> = Mutex::new((0, [0; 6]));
 
 /// Our button and the toolbar it was appended to.
 static BUTTON: AtomicUsize = AtomicUsize::new(0);
@@ -189,7 +267,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
 /// icon atlas (1024², DXT5, 11 mips) on a 64-aligned grid so every mip stays block aligned.
-const ICONS: [(&str, &[u8]); 17] = [
+const ICONS: [(&str, &[u8]); 23] = [
     ("aero_foil", include_bytes!("../assets/icons/aero_foil.bc3")),
     ("aero_x1", include_bytes!("../assets/icons/aero_x1.bc3")),
     ("aero_twinotter", include_bytes!("../assets/icons/aero_twinotter.bc3")),
@@ -207,9 +285,31 @@ const ICONS: [(&str, &[u8]); 17] = [
     ("aero_flap", include_bytes!("../assets/icons/aero_flap.bc3")),
     ("aero_wingblocks", include_bytes!("../assets/icons/aero_wingblocks.bc3")),
     ("aero_split", include_bytes!("../assets/icons/aero_split.bc3")),
+    ("aero_missile", include_bytes!("../assets/icons/aero_missile.bc3")),
+    ("aero_m_sparrow", include_bytes!("../assets/icons/aero_m_sparrow.bc3")),
+    ("aero_m_amraam", include_bytes!("../assets/icons/aero_m_amraam.bc3")),
+    ("aero_m_sidewinder", include_bytes!("../assets/icons/aero_m_sidewinder.bc3")),
+    ("aero_m_hellfire", include_bytes!("../assets/icons/aero_m_hellfire.bc3")),
+    ("aero_m_rocket", include_bytes!("../assets/icons/aero_m_rocket.bc3")),
 ];
-/// Aircraft icon per aerofoil, in `AEROFOILS` order.
-const FOIL_ICONS: [&str; 9] = ["aero_x1", "aero_twinotter", "aero_cessna", "aero_spitfire", "aero_extra", "aero_f86", "aero_a320", "aero_f4", "aero_f104"];
+/// Aircraft / missile icon per aerofoil, in `AEROFOILS` order (the grid section is not offered).
+const FOIL_ICONS: [&str; 15] = [
+    "aero_x1",
+    "aero_twinotter",
+    "aero_cessna",
+    "aero_spitfire",
+    "aero_extra",
+    "aero_f86",
+    "aero_a320",
+    "aero_f4",
+    "aero_f104",
+    "aero_m_sparrow",
+    "aero_m_amraam",
+    "aero_m_sidewinder",
+    "aero_m_hellfire",
+    "aero_m_rocket",
+    "mechanics",
+];
 
 /// Atlas pixel origin of icon `i` (8 per row, 128 px apart, from (64, 576)).
 fn icon_origin(i: usize) -> (u32, u32) {
@@ -268,8 +368,20 @@ pub(crate) fn upload_icons() {
             for k in 0..5 {
                 let side = 64u32 >> k;
                 let len = (side as usize / 4).pow(2) * 16;
-                let Some(level) = data.get(off..off + len) else { break };
-                (gl.compressed_tex_sub_image_2d)(0x0DE1, k as i32, (x0 >> k) as i32, (y0 >> k) as i32, side as i32, side as i32, 0x83F3, len as i32, level.as_ptr().cast());
+                let Some(level) = data.get(off..off + len) else {
+                    break;
+                };
+                (gl.compressed_tex_sub_image_2d)(
+                    0x0DE1,
+                    k as i32,
+                    (x0 >> k) as i32,
+                    (y0 >> k) as i32,
+                    side as i32,
+                    side as i32,
+                    0x83F3,
+                    len as i32,
+                    level.as_ptr().cast(),
+                );
                 off += len;
             }
         }
@@ -314,7 +426,16 @@ unsafe fn set_shown(shelf: usize, show: bool, instant: bool) {
 
 /// One vertical slide shelf at the left edge (`x` from it), like the game's selection shelf:
 /// exclusive toggles (left orange bar) with ids `id0..`, `selected` picked. Starts hidden.
-unsafe fn build_shelf(f: &Fns, iface: usize, ctx: usize, x: f32, items: &[(&str, &str, &str)], id0: i32, selected: usize, actions: &[(&str, &str, &str, i32)]) -> usize {
+unsafe fn build_shelf(
+    f: &Fns,
+    iface: usize,
+    ctx: usize,
+    x: f32,
+    items: &[(&str, &str, &str)],
+    id0: i32,
+    selected: usize,
+    actions: &[(&str, &str, &str, i32)],
+) -> usize {
     let s = (f.op_new)(0xF0);
     if s < PTR_MIN {
         return 0;
@@ -375,36 +496,78 @@ unsafe fn build_shelf(f: &Fns, iface: usize, ctx: usize, x: f32, items: &[(&str,
 }
 
 /// The three side shelves for the current interface (game thread, after it finished building).
-unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 4] {
+unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
     use crate::wing::{Role, AEROFOILS};
+    // Old buttons die with the old interface: never call into them if this build fails.
+    UNDO_BTN.store(0, Ordering::SeqCst);
+    REDO_BTN.store(0, Ordering::SeqCst);
     let own = register_icons(f, ctx);
     let tools = [
         (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings; pick how a click works on the next shelf."),
         ("vehicle_control", "Control role", "Click a control surface or a hinged sub-grid to give it the role picked on the next shelf."),
-        (if own { "aero_foil" } else { "mechanics" }, "Aerofoil", "Click a wing to give it the aerofoil picked on the next shelf. One click sets the whole wing; use New wing to split it first."),
+        (
+            if own { "aero_foil" } else { "mechanics" },
+            "Aerofoil",
+            "Click a wing to give it the aerofoil picked on the next shelf. One click sets the whole wing; use New wing to split it first.",
+        ),
     ];
     let wing_items = [
         ("paint_mode", "Toggle a block", "Click a block to make it a wing block, or click it again to unmark it."),
         ("paint_add", "Fill slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
         ("paint_fill", "Fill body", "Click a block to mark every block of its body as wing, however thick (a flying wing)."),
         ("erase", "Remove a slab", "Click a block to unmark the whole thin slab around it."),
-        (if own { "aero_split" } else { "new" }, "New wing", "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back."),
+        (
+            if own { "aero_split" } else { "new" },
+            "New wing",
+            "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back.",
+        ),
     ];
-    let icons = if own { ["aero_role_none", "aero_pitch", "aero_roll", "aero_yaw", "aero_flap"] } else { ["action_cross", "arrows", "rotate", "orbit", "resize"] };
-    let roles: Vec<(String, String)> = Role::ALL.iter().map(|r| (format!("Role: {}", r.name()), match r {
-        Role::None => "Plain wing: not a control surface.".to_string(),
-        Role::Pitch => "Elevator / stabilator: pitch.".to_string(),
-        Role::Roll => "Aileron: roll.".to_string(),
-        Role::Yaw => "Rudder: yaw.".to_string(),
-        Role::Flap => "Flap: lift and drag when lowered.".to_string(),
-    })).collect();
+    let icons =
+        if own { ["aero_role_none", "aero_pitch", "aero_roll", "aero_yaw", "aero_flap"] } else { ["action_cross", "arrows", "rotate", "orbit", "resize"] };
+    let roles: Vec<(String, String)> = Role::ALL
+        .iter()
+        .map(|r| {
+            (
+                format!("Role: {}", r.name()),
+                match r {
+                    Role::None => "Plain wing: not a control surface.".to_string(),
+                    Role::Pitch => "Elevator / stabilator: pitch.".to_string(),
+                    Role::Roll => "Aileron: roll.".to_string(),
+                    Role::Yaw => "Rudder: yaw.".to_string(),
+                    Role::Flap => "Flap: lift and drag when lowered.".to_string(),
+                },
+            )
+        })
+        .collect();
     let role_items: Vec<(&str, &str, &str)> = roles.iter().zip(icons).map(|((t, d), i)| (i, t.as_str(), d.as_str())).collect();
-    let foil_items: Vec<(&str, &str, &str)> = AEROFOILS.iter().zip(FOIL_ICONS).map(|(a, icon)| (if own { icon } else { "mechanics" }, a.name, a.note)).collect();
+    let foil_items = |cat: usize| -> Vec<(&str, &str, &str)> {
+        foil_range(cat).map(|i| (if own { FOIL_ICONS[i] } else { "mechanics" }, AEROFOILS[i].name, AEROFOILS[i].note)).collect()
+    };
+    let cats = [
+        (if own { "aero_foil" } else { "mechanics" }, "Lifting surfaces", "Wings, tails and control surfaces built from blocks."),
+        (
+            if own { "aero_missile" } else { "mechanics" },
+            "Missile fins",
+            "Fins on rockets and missile parts, shaped from the part's mesh. Grid fins pick their own.",
+        ),
+    ];
+    let pick = |cat: usize| FOIL[cat].load(Ordering::Relaxed).saturating_sub(foil_range(cat).start);
     [
-        build_shelf(f, iface, ctx, 0.0, &tools, ID_TOOL, TOOL.load(Ordering::Relaxed), &[("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO), ("redo", "Redo", "Redo the last undone change.", ID_REDO)]),
+        build_shelf(
+            f,
+            iface,
+            ctx,
+            0.0,
+            &tools,
+            ID_TOOL,
+            TOOL.load(Ordering::Relaxed),
+            &[("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO), ("redo", "Redo", "Redo the last undone change.", ID_REDO)],
+        ),
         build_shelf(f, iface, ctx, 0.17, &wing_items, ID_WING, WING_MODE.load(Ordering::Relaxed), &[]),
         build_shelf(f, iface, ctx, 0.17, &role_items, ID_ROLE, ROLE.load(Ordering::Relaxed), &[]),
-        build_shelf(f, iface, ctx, 0.17, &foil_items, ID_FOIL, FOIL.load(Ordering::Relaxed), &[]),
+        build_shelf(f, iface, ctx, 0.17, &cats, ID_FOIL_CAT, FOIL_CAT.load(Ordering::Relaxed), &[]),
+        build_shelf(f, iface, ctx, 0.34, &foil_items(0), ID_FOIL + foil_range(0).start as i32, pick(0), &[]),
+        build_shelf(f, iface, ctx, 0.34, &foil_items(1), ID_FOIL + foil_range(1).start as i32, pick(1), &[]),
     ]
 }
 
@@ -420,7 +583,9 @@ pub(crate) type ToolbarInit = unsafe extern "system" fn(usize, usize);
 pub(crate) static ORIGINAL_INIT: OnceLock<ToolbarInit> = OnceLock::new();
 
 pub(crate) unsafe extern "system" fn toolbar_init_detour(toolbar: usize, ctx: usize) {
-    let Some(orig) = ORIGINAL_INIT.get() else { return };
+    let Some(orig) = ORIGINAL_INIT.get() else {
+        return;
+    };
     orig(toolbar, ctx);
     let _ = std::panic::catch_unwind(|| append(toolbar, ctx));
 }
@@ -429,7 +594,9 @@ pub(crate) type EditorEvent = unsafe extern "system" fn(usize, usize, usize, usi
 pub(crate) static ORIGINAL_EVENT: OnceLock<EditorEvent> = OnceLock::new();
 
 pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usize, a3: usize, a4: usize, a5: usize, id: usize) -> u8 {
-    let Some(orig) = ORIGINAL_EVENT.get() else { return 0 };
+    let Some(orig) = ORIGINAL_EVENT.get() else {
+        return 0;
+    };
     let r = orig(editor, a2, a3, a4, a5, id);
     let i = id as i32;
     if (ID_TOOL..ID_TOOL + 3).contains(&i) {
@@ -446,8 +613,13 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
         }
     } else if (ID_WING..ID_WING + 5).contains(&i) {
         WING_MODE.store((i - ID_WING) as usize, Ordering::Relaxed);
+    } else if (ID_FOIL_CAT..ID_FOIL_CAT + 2).contains(&i) {
+        FOIL_CAT.store((i - ID_FOIL_CAT) as usize, Ordering::Relaxed);
     } else if (ID_FOIL..ID_FOIL + crate::wing::AEROFOILS.len() as i32).contains(&i) {
-        FOIL.store((i - ID_FOIL) as usize, Ordering::Relaxed);
+        let a = (i - ID_FOIL) as usize;
+        if let Some(cat) = (0..2).find(|&c| foil_range(c).contains(&a)) {
+            FOIL[cat].store(a, Ordering::Relaxed);
+        }
     }
     if i == MY_ID {
         let _ = std::panic::catch_unwind(|| {
@@ -467,8 +639,19 @@ pub(crate) type MouseButton = unsafe extern "system" fn(usize, usize, usize, usi
 pub(crate) static ORIGINAL_MOUSE: OnceLock<MouseButton> = OnceLock::new();
 
 /// Left press the game's UI did not take, while our mode is on: queue a pick for the overlay.
-pub(crate) unsafe extern "system" fn mouse_button_detour(editor: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, button: usize, action: usize) -> u8 {
-    let Some(orig) = ORIGINAL_MOUSE.get() else { return 0 };
+pub(crate) unsafe extern "system" fn mouse_button_detour(
+    editor: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    button: usize,
+    action: usize,
+) -> u8 {
+    let Some(orig) = ORIGINAL_MOUSE.get() else {
+        return 0;
+    };
     let r = orig(editor, a2, a3, a4, a5, a6, button, action);
     // The return is not a "UI took it" bool (tool paths leave junk in al: 11 was seen). The UI
     // root's pressed element (root +0x1E0 = editor+0x5D8) is set by a press a UI element takes and
@@ -477,7 +660,13 @@ pub(crate) unsafe extern "system" fn mouse_button_detour(editor: usize, a2: usiz
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if ACTIVE.load(Ordering::Relaxed) && button as u32 == 0 && action as u32 == 1 && N.fetch_add(1, Ordering::Relaxed) < 30 {
         let m = if readable(editor + OFF_MOUSE_X, 8) { ((editor + OFF_MOUSE_X) as *const [f32; 2]).read_unaligned() } else { [f32::NAN; 2] };
-        let ui = |o: usize| if readable(editor + OFF_UI_CTX + o, 8) { read_usize_at(editor + OFF_UI_CTX + o) } else { 0 };
+        let ui = |o: usize| {
+            if readable(editor + OFF_UI_CTX + o, 8) {
+                read_usize_at(editor + OFF_UI_CTX + o)
+            } else {
+                0
+            }
+        };
         log_line(&format!("toolbar: left press ret={r} at {m:?} ui hovered {:#x} pressed {:#x}", ui(0x188), ui(0x190)));
     }
     if !ui_took && button as u32 == 0 && action as u32 == 1 && ACTIVE.load(Ordering::Relaxed) && readable(editor + OFF_MOUSE_X, 8) {
@@ -490,9 +679,10 @@ pub(crate) unsafe extern "system" fn mouse_button_detour(editor: usize, a2: usiz
     r
 }
 
-/// Grey a button out the way the game does (vtable +0x128: enabled flag + dimmed children).
+/// Grey a button out the way the game does: `ui_point_button_set_enabled` (vtable +0x128, RVA
+/// 0x24ac40 on c38c03ff756b). A no-op when the enabled byte (+0xA0) already matches.
 unsafe fn set_enabled(btn: usize, ctx: usize, enabled: bool) {
-    if btn < PTR_MIN || ctx < PTR_MIN || !readable(btn, 0xA4) {
+    if btn < PTR_MIN || ctx < PTR_MIN || !readable(btn, 0xA8) {
         return;
     }
     let vt = read_usize_at(btn);
@@ -532,8 +722,10 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         }
     }
     let tool = TOOL.load(Ordering::Relaxed);
+    let cat = FOIL_CAT.load(Ordering::Relaxed);
     for (k, &shelf) in sh.1.iter().enumerate() {
-        let want = on && (k == 0 || k == tool + 1);
+        // Aerofoil: its category shelf, then the picked category's sections beside it.
+        let want = on && (k == 0 || k == tool + 1 || (tool == 2 && k == 4 + cat));
         if shelf >= PTR_MIN && readable(shelf + 0x81, 1) && (*((shelf + 0x81) as *const u8) != 0) != want {
             set_shown(shelf, want, false);
         }

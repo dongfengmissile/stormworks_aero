@@ -40,12 +40,8 @@ fn exe_dir() -> Option<PathBuf> {
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+        let message =
+            info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
         let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
         log_line(&format!("PANIC: {} at {at} stage={}", message.replace('\n', " "), crate::fault::stage_name(crate::fault::STAGE.load(Ordering::Relaxed))));
         previous(info);
@@ -53,7 +49,9 @@ fn install_panic_hook() {
 }
 
 fn bootstrap() {
-    let Some(dll_path) = self_module_path() else { return };
+    let Some(dll_path) = self_module_path() else {
+        return;
+    };
     let plugin_dir = dll_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let log_dir = plugin_dir.join("logs");
     let _ = fs::create_dir_all(&log_dir);
@@ -82,6 +80,7 @@ fn bootstrap() {
             Ok(()) => log_line("hooks installed"),
             Err(e) => log_line(&e),
         }
+        unsafe { crate::markhooks::install() };
     }
 
     {

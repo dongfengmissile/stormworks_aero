@@ -132,3 +132,38 @@ mod tests {
         assert_eq!(v3(1.0, 0.0, 0.0).cross(v3(0.0, 1.0, 0.0)), v3(0.0, 0.0, 1.0));
     }
 }
+
+/// Row-vector 4x4 product `r · m` with `r` a rotation about unit `axis` by `angle`.
+pub fn rotated4(m: &[f64; 16], axis: [f64; 3], angle: f64) -> [f64; 16] {
+    let (s, c) = angle.sin_cos();
+    let [x, y, z] = axis;
+    let r = [
+        [c + x * x * (1.0 - c), x * y * (1.0 - c) + z * s, x * z * (1.0 - c) - y * s],
+        [y * x * (1.0 - c) - z * s, c + y * y * (1.0 - c), y * z * (1.0 - c) + x * s],
+        [z * x * (1.0 - c) + y * s, z * y * (1.0 - c) - x * s, c + z * z * (1.0 - c)],
+    ];
+    let mut out = *m;
+    for i in 0..3 {
+        for j in 0..4 {
+            out[4 * i + j] = (0..3).map(|k| r[i][k] * m[4 * k + j]).sum();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod rotated4_tests {
+    #[test]
+    fn rotation_keeps_translation_and_turns_about_axis() {
+        let mut m = [0.0; 16];
+        for i in 0..4 {
+            m[5 * i] = 1.0;
+        }
+        m[12] = 5.0;
+        let r = super::rotated4(&m, [0.0, 1.0, 0.0], std::f64::consts::FRAC_PI_2);
+        assert_eq!(r[12], 5.0);
+        // Row x maps into ±z, y stays.
+        assert!((r[2].abs() - 1.0).abs() < 1e-12 && r[0].abs() < 1e-12);
+        assert!((r[5] - 1.0).abs() < 1e-12);
+    }
+}

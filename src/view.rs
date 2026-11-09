@@ -12,6 +12,8 @@ pub struct Face {
     /// Component the face belongs to, and the grid cell just inside it.
     pub comp: u32,
     pub cell: usize,
+    /// Bounds a moving piece (a missile fin), not the part's body.
+    pub moving: bool,
 }
 
 /// Grid-unit point to the body frame (same mapping as `aero_pos`).
@@ -22,7 +24,7 @@ fn to_body(p: V3) -> V3 {
 /// Faces of every part solid, minus those pressed flat against a full neighbour cell.
 pub fn faces(g: &Grid) -> Vec<Face> {
     let mut out = Vec::new();
-    for (comp, solid) in &g.solids {
+    for (k, (comp, solid)) in g.solids.iter().enumerate() {
         let centre = solid.iter().flatten().fold(V3::ZERO, |a, b| a + *b) * (1.0 / solid.iter().map(|f| f.len()).sum::<usize>().max(1) as f64);
         for f in solid {
             if f.len() < 3 {
@@ -34,7 +36,12 @@ pub fn faces(g: &Grid) -> Vec<Face> {
                 n = -n;
             }
             let inside = fc - n * 0.01;
-            let cell = [inside.x, inside.y, inside.z].map(|v| (v + 0.5).floor() as i32);
+            let mut cell = [inside.x, inside.y, inside.z].map(|v| (v + 0.5).floor() as i32);
+            let blade = g.blades.contains(&k);
+            if blade {
+                // Blades sweep past the vehicle's cells: tag them with the nearest one.
+                cell = std::array::from_fn(|a| cell[a].clamp(g.min[a], g.min[a] + g.dims[a] as i32 - 1));
+            }
             let Some(ci) = g.index(cell) else { continue };
             // Axis-aligned face on a cell boundary against a full cell: internal, skip.
             let axis = (0..3).find(|&a| n.get(a).abs() > 0.999);
@@ -46,7 +53,13 @@ pub fn faces(g: &Grid) -> Vec<Face> {
                     continue;
                 }
             }
-            out.push(Face { poly: f.iter().map(|p| to_body(*p)).collect(), normal: to_body(n) * (1.0 / VOXEL_M), comp: *comp, cell: ci });
+            out.push(Face {
+                poly: f.iter().map(|p| to_body(*p)).collect(),
+                normal: to_body(n) * (1.0 / VOXEL_M),
+                comp: *comp,
+                cell: ci,
+                moving: g.moving.contains(&k) || blade,
+            });
         }
     }
     out
@@ -219,7 +232,11 @@ mod tests {
         // clip = (x·fx, y·fy, -, depth) with x, y, depth = d·right, d·up, d·fwd and d = p - eye.
         let col = |a: V3, k: f64| [a.x * k, a.y * k, a.z * k, -(e.dot(a)) * k];
         let (cx, cy, cw) = (col(r, fx), col(u, fy), col(fw, 1.0));
-        let m: [f64; 16] = std::array::from_fn(|i| { let (row, c) = (i / 4, i % 4); let v = [cx, cy, [0.0; 4], cw][c]; v[row] });
+        let m: [f64; 16] = std::array::from_fn(|i| {
+            let (row, c) = (i / 4, i % 4);
+            let v = [cx, cy, [0.0; 4], cw][c];
+            v[row]
+        });
         let img2 = render_with(&f, &|_| [200, 200, 200], &Projection::from_clip(m, 64, 48), 64, 48, [0; 4]);
         assert_eq!(img2.id[24 * 64 + 32], centre);
         assert_eq!(img2.rgba[3], 0, "transparent background");
@@ -236,7 +253,6 @@ pub(crate) fn project(vp: &[f64; 16], p: crate::math::V3, size: [f32; 2]) -> Opt
     let y = (p.x * vp[1] + p.y * vp[5] + p.z * vp[9] + vp[13]) / w;
     Some([((x * 0.5 + 0.5) * size[0] as f64) as f32, ((0.5 - y * 0.5) * size[1] as f64) as f32])
 }
-
 
 #[cfg(test)]
 mod arrow_tests {

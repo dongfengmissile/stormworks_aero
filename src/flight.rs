@@ -17,7 +17,7 @@ use crate::editor::{body_comp_count, ptr_ok, ring, vehicle_bodies, vehicle_comps
 use crate::logging::log_line;
 use crate::math::{v3, V3};
 use crate::memory::{read_u32_at, read_usize_at, RegionCacheScope};
-use crate::model::{Designations, LiveBody, Model};
+use crate::model::{Designations, LiveBody, LiveSrc, Model};
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
 use crate::vehicle::Comp;
@@ -76,7 +76,8 @@ unsafe fn ground_factors(physics_scene: usize, c_scene: usize, m: &Model, lbs: &
     // face of the lowest block, so a runway touching the wheels is ground, not us.
     let (lo, hi) = (
         v3(m.grid.min[0] as f64, (m.grid.min[1] + 1) as f64 - 0.5, m.grid.min[2] as f64) * 0.25 + v3(0.0, 0.02, 0.0),
-        v3((m.grid.min[0] + m.grid.dims[0] as i32) as f64, (m.grid.min[1] + m.grid.dims[1] as i32) as f64, (m.grid.min[2] + m.grid.dims[2] as i32) as f64) * 0.25,
+        v3((m.grid.min[0] + m.grid.dims[0] as i32) as f64, (m.grid.min[1] + m.grid.dims[1] as i32) as f64, (m.grid.min[2] + m.grid.dims[2] as i32) as f64)
+            * 0.25,
     );
     let mb = &lbs[main];
     let own = |obj: usize, hit: V3| {
@@ -93,7 +94,9 @@ unsafe fn ground_factors(physics_scene: usize, c_scene: usize, m: &Model, lbs: &
         .iter()
         .map(|p| {
             let lb = &lbs[m.panel_body(p).min(lbs.len() - 1)];
-            let Some(h) = height_above_surface(physics_scene, c_scene, lb.to_world(p.centroid), max, &own) else { return 1.0 };
+            let Some(h) = height_above_surface(physics_scene, c_scene, lb.to_world(p.centroid), max, &own) else {
+                return 1.0;
+            };
             let level = lb.dir_to_world(p.n).y.abs(); // a fin standing upright feels none
             if level > 0.7 {
                 lowest = Some(lowest.map_or(h, |l: f64| l.min(h)));
@@ -106,7 +109,10 @@ unsafe fn ground_factors(physics_scene: usize, c_scene: usize, m: &Model, lbs: &
     if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 10_000 {
         LAST.store(now, Ordering::Relaxed);
         let min_phi = phis.iter().copied().fold(1.0, f64::min);
-        log_line(&format!("ground effect: lowest level panel {:?} m above the surface (span {span:.1} m), strongest induced-drag factor {min_phi:.2}", lowest.map(|h| (h * 100.0).round() / 100.0)));
+        log_line(&format!(
+            "ground effect: lowest level panel {:?} m above the surface (span {span:.1} m), strongest induced-drag factor {min_phi:.2}",
+            lowest.map(|h| (h * 100.0).round() / 100.0)
+        ));
     }
     (phis, lowest)
 }
@@ -217,7 +223,13 @@ pub(crate) fn note_engine_force(rb: usize, f: [f64; 3], source: u8, rel: Option<
         log_line(&format!("thrust: engine force {n:.0} N over the wrapper cap ({max} × {scale}); the reading may be high"));
     }
     let mut m = ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner());
-    let com = unsafe { if crate::editor::ptr_ok(rb + OFF_RB_COM, 24) { v3_f64(rb + OFF_RB_COM) } else { V3::ZERO } };
+    let com = unsafe {
+        if crate::editor::ptr_ok(rb + OFF_RB_COM, 24) {
+            v3_f64(rb + OFF_RB_COM)
+        } else {
+            V3::ZERO
+        }
+    };
     let at = com + rel.map_or(V3::ZERO, |r| v3(r[0], r[1], r[2]));
     let e = m.entry(rb).or_insert((V3::ZERO, 0, 0, V3::ZERO, 0.0));
     e.0 += v3(f[0], f[1], f[2]);
@@ -226,7 +238,6 @@ pub(crate) fn note_engine_force(rb: usize, f: [f64; 3], source: u8, rel: Option<
     e.3 += at * n;
     e.4 += n;
 }
-
 
 pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static APPLIED: AtomicU64 = AtomicU64::new(0);
@@ -271,7 +282,7 @@ pub(crate) struct VehicleDebug {
     pub lift: f64,
     pub drag: f64,
     pub weight: f64,
-    /// Vehicle mass from the game's physics bodies (fuel and cargo included as the game counts them), kg.
+    /// Vehicle mass gravity acts on, kg: the physics bodies plus the fluid in their tanks (`fluid_mass`).
     pub mass: f64,
     /// Estimated thrust along the nose, N.
     pub thrust: f64,
@@ -297,6 +308,24 @@ pub(crate) struct VehicleDebug {
     pub arrows: Vec<Arrow>,
     pub stalled: usize,
     pub panels: usize,
+    pub props: Vec<PropDebug>,
+}
+
+/// One propeller or rotor in the flight data.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PropDebug {
+    pub name: String,
+    /// Blade speed, RPS.
+    pub rps: f64,
+    /// Shaft speed, RPS (the game's unit).
+    pub shaft: f64,
+    pub thrust: f64,
+    /// Power the air takes from the shaft, W (negative: the air drives it).
+    pub power: f64,
+    pub vrs: f64,
+    /// Blade angle at 0.75 R, degrees, and the stalled share of the blades (0..1).
+    pub blade_deg: f64,
+    pub stalled: f64,
 }
 
 /// Set by the overlay while the flight data window or the arrows are shown.
@@ -346,7 +375,9 @@ pub(crate) fn frame_build_ts(g: usize) -> Option<u64> {
 
 /// After the game drew the frame (slot 7 returned): keep its alpha and camera with the build time read before.
 pub(crate) fn note_sim_frame(ts: Option<u64>) {
-    let (Some(ts), Some((alpha, _)), Some(vp)) = (ts, render_frame(), main_viewproj()) else { return };
+    let (Some(ts), Some((alpha, _)), Some(vp)) = (ts, render_frame(), main_viewproj()) else {
+        return;
+    };
     *FRAME_SNAP.lock().unwrap_or_else(|p| p.into_inner()) = Some((FrameSnap { alpha, ts, vp }, crate::editor::now_ms()));
 }
 
@@ -412,6 +443,8 @@ pub(crate) static DEBUG: Mutex<Vec<VehicleDebug>> = Mutex::new(Vec::new());
 struct Craft {
     key: u64,
     bodies: Vec<usize>,
+    /// Component pointers in `Model::comps` order (live fin angles).
+    comp_ptrs: Vec<usize>,
     built: Built,
     designations: String,
     stall: Vec<f64>,
@@ -425,6 +458,102 @@ struct Craft {
     /// Main body's centre of mass when forces were last applied: unchanged = no step since.
     last_com: [f64; 3],
     warned: bool,
+    /// Per `Model::props`: mean inflow state (m/s), and the load calibration by (blades, length).
+    prop_v: Vec<f64>,
+    /// Vehicle key whose marks `fly` / `vrs` were read from (they gate the build).
+    read_key: u64,
+    /// The vehicle's own settings (None: the global `ENABLED` / `VRS`).
+    fly: Option<bool>,
+    vrs: Option<bool>,
+}
+
+/// Physics object (`body + OFF_BODY_PHYS_OBJ`) -> the plugin flies its vehicle, from the last
+/// tick. The force hooks drop the game's air forces only for these.
+/// Read from the game's worker threads (hull air), so a read-write lock.
+static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, bool>>> = LazyLock::new(Default::default);
+/// The game's hull air forces are skipped per body (`fluid_air_node_forces` hook), so the
+/// settings air constants stay vanilla.
+pub(crate) static AIR_PER_BODY: AtomicBool = AtomicBool::new(false);
+
+/// The plugin flies this physics object's vehicle (unknown objects: the global setting).
+pub(crate) fn flies_obj(obj: usize) -> bool {
+    FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).copied().unwrap_or_else(|| ENABLED.load(Ordering::Relaxed))
+}
+
+/// The propeller tick hook is in: the plugin may take over propellers (else the game's stay).
+pub(crate) static PROPS_HOOKED: AtomicBool = AtomicBool::new(false);
+/// Vortex ring state on (F7 Settings tab; a vehicle may override it): rotors sinking into their own wake lose lift.
+pub(crate) static VRS: AtomicBool = AtomicBool::new(false);
+/// Physics steps seen (prop load freshness).
+static STEP: AtomicU64 = AtomicU64::new(0);
+
+/// A propeller the plugin flies, by component pointer: the air's torque against the spin (N·m),
+/// the shaft-speed direction it opposes (±1), the speed drop per N·m and tick, and the step.
+#[derive(Clone, Copy)]
+struct PropLoad {
+    torque: f64,
+    sign: f64,
+    per_nm: f64,
+    step: u64,
+}
+static PROP_LOADS: std::sync::LazyLock<Mutex<HashMap<usize, PropLoad>>> = std::sync::LazyLock::new(Default::default);
+
+fn prop_loads() -> std::sync::MutexGuard<'static, HashMap<usize, PropLoad>> {
+    PROP_LOADS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The plugin flies this propeller now: the game's own thrust for it is dropped.
+pub(crate) fn prop_modeled(comp: usize) -> bool {
+    prop_loads().get(&comp).is_some_and(|l| l.step + 30 >= STEP.load(Ordering::Relaxed))
+}
+pub(crate) fn any_prop_modeled() -> bool {
+    !prop_loads().is_empty()
+}
+
+/// After the game's propeller tick: the shaft speed loses what our blades' torque takes (or gains
+/// what the air gives a windmilling rotor), instead of the game's own speed drop.
+/// `w_in`: the speed the tick started from (shaft network speed when linked).
+pub(crate) unsafe fn prop_after_tick(comp: usize, w_in: f32) {
+    let Some(l) = prop_loads().get(&comp).copied() else {
+        return;
+    };
+    if l.step + 30 < STEP.load(Ordering::Relaxed) || !w_in.is_finite() {
+        return;
+    }
+    let w = w_in as f64 * 0.9999;
+    let mut next = w - l.per_nm * l.torque * l.sign;
+    // Drag stops a shaft, it does not reverse it.
+    if l.torque > 0.0 && next * l.sign < 0.0 {
+        next = 0.0;
+    }
+    ((comp + OFF_PROP_SPEED) as *mut f32).write_unaligned(next as f32);
+}
+
+/// Live state of a propeller part.
+unsafe fn prop_live_state(comp: usize, rotor: bool) -> Option<(crate::model::PropLive, bool, bool)> {
+    if !ptr_ok(comp, OFF_PROP_FORCE_ACC) {
+        return None;
+    }
+    let f = |o: usize| f32::from_bits(read_u32_at(comp + o)) as f64;
+    if *((comp + OFF_PROP_FOLDED) as *const u8) != 0 {
+        return None;
+    }
+    let count = read_u32_at(comp + OFF_PROP_BLADES).clamp(2, 8);
+    let active = (read_u32_at(comp + OFF_PROP_ACTIVE) & ((1u32 << count) - 1)).count_ones();
+    let pitch = (read_u32_at(comp + OFF_PROP_PITCH) as i32 as f64 + f(OFF_PROP_COLLECTIVE)).clamp(-1.0, 1.0);
+    let linked = read_usize_at(comp + OFF_PROP_LINK) != 0;
+    let live = crate::model::PropLive {
+        // Linked, comp+0x150 is the speed handed back to the network (after our load), not the shaft's.
+        w: f(if linked { OFF_PROP_SHAFT } else { OFF_PROP_SPEED }),
+        pitch,
+        cyclic: if rotor { [f(OFF_PROP_CYCLIC), f(OFF_PROP_CYCLIC + 4)] } else { [0.0; 2] },
+        blades: active,
+        length: f(OFF_PROP_LENGTH),
+        reversed: *((comp + OFF_PROP_REVERSE) as *const u8) != 0,
+        flip: crate::blur::hinge_against(comp),
+    };
+    let ok = [live.w, live.pitch, live.cyclic[0], live.cyclic[1], live.length].iter().all(|v| v.is_finite()) && active > 0;
+    ok.then_some((live, linked, read_usize_at(comp + OFF_PROP_HINGE) != 0))
 }
 
 struct State {
@@ -435,8 +564,7 @@ struct State {
     lib: Option<Arc<Mutex<Library>>>,
 }
 
-static STATE: std::sync::LazyLock<Mutex<State>> =
-    std::sync::LazyLock::new(|| Mutex::new(State { crafts: HashMap::new(), saved: None, scene: 0, lib: None }));
+static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new(State { crafts: HashMap::new(), saved: None, scene: 0, lib: None }));
 
 unsafe fn f64_at(a: usize) -> f64 {
     f64::from_bits(read_usize_at(a) as u64)
@@ -449,6 +577,32 @@ unsafe fn v3_f64(a: usize) -> V3 {
 }
 unsafe fn v3_f32(a: usize) -> V3 {
     v3(f32_at(a) as f64, f32_at(a + 4) as f64, f32_at(a + 8) as f64)
+}
+
+/// Current game angle of a live panel, radians. Rudder: `comp+0x274` about the hinge. Rocket fin
+/// pair A (else C) about its `FinCtrl` axis (`solid_rocket_draw` 0x43ECC0: α_A = −(s13 + s11)/√2,
+/// α_C = (s13 − s11)/√2, the two channel angles signed by the inversion bytes).
+unsafe fn live_angle(comp: usize, src: LiveSrc) -> Option<f64> {
+    let a = match src {
+        LiveSrc::Rudder => {
+            let t = if ptr_ok(comp, OFF_RUDDER_ANGLE + 4) {
+                f32_at(comp + OFF_RUDDER_ANGLE) as f64
+            } else {
+                return None;
+            };
+            return (t.is_finite() && t.abs() < 1.6).then_some(t);
+        }
+        LiveSrc::Rocket { a } => a,
+    };
+    if !ptr_ok(comp, OFF_ROCKET_FIN_ANGLE + 8) {
+        return None;
+    }
+    let ang = |o: usize| f32_at(comp + OFF_ROCKET_FIN_ANGLE + o) as f64;
+    let inv = |o: usize| *((comp + OFF_ROCKET_FIN_INVERT + o) as *const u8) != 0;
+    let s11 = if inv(0) { 1.0 } else { -1.0 } * ang(0);
+    let s13 = if inv(1) { -1.0 } else { 1.0 } * ang(4);
+    let alpha = if a { -(s13 + s11) } else { s13 - s11 } * std::f64::consts::FRAC_1_SQRT_2;
+    (alpha.is_finite() && alpha.abs() < 1.6).then_some(alpha)
 }
 
 /// Write the vanilla air constants: zeros while enabled, the saved values when switched off.
@@ -481,6 +635,33 @@ unsafe fn air_constants(st: &mut State, enabled: bool) {
     }
 }
 
+/// Mass the game's gravity adds for the fluid in a body's tanks (`body_fluid_force_compute`
+/// 0x48D5B0: a downward force, not body mass), kg. Every liquid weighs as water; gas only past
+/// the tank's capacity. shortcut: the game settings' defaults (water density 1000, factors 1,
+/// buoyancy mass 10..20 over 2000..25000 kg); read them from settings if a mod changes them.
+unsafe fn fluid_mass(body: usize, body_mass: f64) -> f64 {
+    const LIQUIDS: [usize; 7] = [0, 1, 2, 5, 6, 8, 9];
+    const GASES: [usize; 6] = [3, 4, 7, 10, 11, 12];
+    let Some(items) = crate::editor::ring(body + OFF_BODY_COMPARTMENTS, 1 << 16) else {
+        return 0.0;
+    };
+    let v14 = 10.0 + ((body_mass - 2000.0) / 23000.0).clamp(0.0, 1.0) * 10.0;
+    let mut sum = 0.0;
+    for item in items {
+        if !ptr_ok(item, OFF_COMPARTMENT_AMOUNTS + 13 * 4) {
+            continue;
+        }
+        let at = |t: usize| f32_at(item + OFF_COMPARTMENT_AMOUNTS + 4 * t) as f64;
+        let liq: f64 = LIQUIDS.iter().map(|&t| at(t)).sum();
+        let gas = (GASES.iter().map(|&t| at(t)).sum::<f64>() - f32_at(item + OFF_COMPARTMENT_CAPACITY) as f64 / 60.0).max(0.0);
+        let m = 0.02 * 1000.0 * (liq + gas) / v14;
+        if m.is_finite() && m > 0.0 {
+            sum += m;
+        }
+    }
+    sum
+}
+
 /// Live pose and motion of one body; None if it is not a simulated, movable body.
 unsafe fn live_body(body: usize) -> Option<(LiveBody, usize, f64)> {
     let obj = read_usize_at(body + OFF_BODY_PHYS_OBJ);
@@ -509,17 +690,7 @@ unsafe fn live_body(body: usize) -> Option<(LiveBody, usize, f64)> {
     finite.then_some((lb, rb, mass))
 }
 
-/// The user's designations for this vehicle: the best-matching `.aero` file. Half the marks is enough:
-/// editing a vehicle after designating it leaves marks on removed or moved blocks.
-fn find_designations(dir: &std::path::Path, comps: &[Comp]) -> (Designations, String) {
-    match Designations::best_match(dir, comps, 0.5) {
-        Some((d, name, _, 0)) => (d, format!("{name}.aero")),
-        Some((d, name, score, missing)) => (d, format!("{name}.aero ({missing} marks on missing blocks, {:.0}% found)", score * 100.0)),
-        None => Default::default(),
-    }
-}
-
-fn spawn_build(lib: Arc<Mutex<Library>>, comps: Vec<Comp>, key: u64, out: Built, id: u32) {
+fn spawn_build(lib: Arc<Mutex<Library>>, comps: Vec<Comp>, marked: Option<Designations>, key: u64, out: Built, id: u32) {
     let main = {
         let mut count: HashMap<u32, usize> = HashMap::new();
         comps.iter().for_each(|c| *count.entry(c.body).or_default() += 1);
@@ -528,8 +699,10 @@ fn spawn_build(lib: Arc<Mutex<Library>>, comps: Vec<Comp>, key: u64, out: Built,
     BUILDING.store(true, Ordering::SeqCst);
     let spawned = std::thread::Builder::new().name("aero-flight-model".into()).spawn(move || {
         let _done = Done;
-        let dir = PATHS.get().map(|p| p.1.join("data/vehicles")).unwrap_or_default();
-        let (des, name) = find_designations(&dir, &comps);
+        let (des, name) = match marked {
+            Some(d) => (d, "on the parts".to_string()),
+            None => Default::default(),
+        };
         let n = comps.len();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut lib = lib.lock().unwrap_or_else(|p| p.into_inner());
@@ -565,14 +738,11 @@ impl Drop for Done {
 /// After the game synced physics state, before it computes this tick's vehicle forces.
 pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     let enabled = ENABLED.load(Ordering::Relaxed);
+    let step = STEP.fetch_add(1, Ordering::Relaxed) + 1;
+    prop_loads().retain(|_, l| l.step + 30 >= step);
     let mut st = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    air_constants(&mut st, enabled);
-    if !enabled {
-        if !st.crafts.is_empty() {
-            st.crafts.clear();
-        }
-        return;
-    }
+    air_constants(&mut st, enabled && !AIR_PER_BODY.load(Ordering::Relaxed));
+    let mut flown: HashMap<usize, bool> = HashMap::new();
     TICKS.fetch_add(1, Ordering::Relaxed);
     let _fault = crate::fault::enter(crate::fault::stage::FLIGHT);
     let _cache = RegionCacheScope::new();
@@ -582,7 +752,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         st.crafts.clear();
         st.scene = scene;
     }
-    let Some(records) = ring(scene + OFF_SCENE_VEHICLES, 1 << 16) else { return };
+    let Some(records) = ring(scene + OFF_SCENE_VEHICLES, 1 << 16) else {
+        return;
+    };
     let lib = st
         .lib
         .get_or_insert_with(|| {
@@ -590,20 +762,26 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             Arc::new(Mutex::new(Library::new(&game, &appdata)))
         })
         .clone();
-    let Some(apply_force) = APPLY_FORCE.get().copied() else { return };
+    let Some(apply_force) = APPLY_FORCE.get().copied() else {
+        return;
+    };
     let mut seen = HashSet::new();
     let want_debug = DEBUG_WANTED.load(Ordering::Relaxed);
     // The game's forces of the last step (applied after our previous tick, before the step).
     let engine_forces = std::mem::take(&mut *ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner()));
     let mut debug = Vec::new();
     let mut stalled: HashMap<usize, HashSet<[i32; 3]>> = HashMap::new();
+    // Stalled moving meshes (missile fins, vanilla control surfaces): component pointer -> red.
+    let mut stalled_parts: HashMap<usize, u32> = HashMap::new();
     let mut stepped = false;
     for rec in records {
         if !ptr_ok(rec, 0x18) || *(rec as *const u8) != 0 || read_u32_at(rec + 0x10) != 5 {
             continue;
         }
         let id = read_u32_at(rec + 4);
-        let Some(bodies) = vehicle_bodies(read_usize_at(rec + 8)) else { continue };
+        let Some(bodies) = vehicle_bodies(read_usize_at(rec + 8)) else {
+            continue;
+        };
         if bodies.is_empty() {
             continue;
         }
@@ -615,27 +793,69 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 key = (key ^ v).wrapping_mul(0x100000001b3);
             }
         }
-        let craft = st.crafts.entry(id).or_insert_with(|| Craft { key: 0, bodies: Vec::new(), built: Arc::default(), designations: String::new(), stall: Vec::new(), prev_vel: None, prev_aero: V3::ZERO, thrust: 0.0, prev_com: None, dt: 1.0 / 60.0, last_com: [f64::NAN; 3], warned: false });
+        let craft = st.crafts.entry(id).or_insert_with(|| Craft {
+            key: 0,
+            bodies: Vec::new(),
+            comp_ptrs: Vec::new(),
+            built: Arc::default(),
+            designations: String::new(),
+            stall: Vec::new(),
+            prev_vel: None,
+            prev_aero: V3::ZERO,
+            thrust: 0.0,
+            prev_com: None,
+            dt: 1.0 / 60.0,
+            last_com: [f64::NAN; 3],
+            warned: false,
+            prop_v: Vec::new(),
+            read_key: 0,
+            fly: None,
+            vrs: None,
+        });
+        // The vehicle's own settings ride on its parts' marks.
+        if craft.read_key != key {
+            if let Some((comps, _, ptrs)) = vehicle_comps(read_usize_at(rec + 8)) {
+                craft.read_key = key;
+                let d = crate::marks::designations(&comps, &ptrs);
+                craft.fly = d.as_ref().and_then(|d| d.fly);
+                craft.vrs = d.as_ref().and_then(|d| d.vrs);
+            }
+        }
+        let fly = craft.fly.unwrap_or(enabled);
+        for &b in &bodies {
+            if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) {
+                flown.insert(read_usize_at(b + OFF_BODY_PHYS_OBJ), fly);
+            }
+        }
+        if !fly {
+            continue;
+        }
         // (Re)build when the vehicle changed and can move; one build at a time, so a vehicle
         // waiting its turn keeps its old key and retries next tick.
         if craft.key != key && !BUILDING.load(Ordering::SeqCst) && bodies.iter().any(|&b| live_body(b).is_some()) {
-            if let Some((comps, _)) = vehicle_comps(read_usize_at(rec + 8)) {
+            if let Some((comps, _, ptrs)) = vehicle_comps(read_usize_at(rec + 8)) {
                 craft.key = key;
                 craft.bodies = bodies.clone();
+                let marked = crate::marks::designations(&comps, &ptrs);
+                craft.comp_ptrs = ptrs;
                 craft.built = Arc::default();
                 craft.stall.clear();
                 craft.warned = false;
-                spawn_build(lib.clone(), comps, key, craft.built.clone(), id);
+                spawn_build(lib.clone(), comps, marked, key, craft.built.clone(), id);
             }
         }
-        let Some((bkey, model, main, des_name)) = craft.built.lock().unwrap_or_else(|p| p.into_inner()).clone() else { continue };
+        let Some((bkey, model, main, des_name)) = craft.built.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            continue;
+        };
         craft.designations = des_name;
         if bkey != key {
             continue;
         }
         // Live state of every body; a body that is not simulated keeps its index but no forces.
         let live: Vec<Option<(LiveBody, usize, f64)>> = bodies.iter().map(|&b| live_body(b)).collect();
-        let Some((mb, _, _)) = live.get(main).copied().flatten() else { continue };
+        let Some((mb, _, _)) = live.get(main).copied().flatten() else {
+            continue;
+        };
         let com = [mb.com.x, mb.com.y, mb.com.z];
         if com == craft.last_com {
             continue; // physics has not stepped since our last forces (second sync call)
@@ -666,8 +886,12 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             // Arrow frame check: the body render matrix must place the model CoM where physics does.
             let r = body_render_matrix(bodies[main]).unwrap_or([0.0; 16]);
             let g = mb.world_to_grid(mb.to_world(model.com));
-            let p = v3(g.x * r[0] + g.y * r[4] + g.z * r[8] + r[12], g.x * r[1] + g.y * r[5] + g.z * r[9] + r[13], g.x * r[2] + g.y * r[6] + g.z * r[10] + r[14]);
-            log_line(&format!("flight: vehicle {id}: render matrix places the CoM {:.2} m from physics (arrows fall back to tick positions above 20 m)", (p - mb.to_world(model.com)).len()));
+            let p =
+                v3(g.x * r[0] + g.y * r[4] + g.z * r[8] + r[12], g.x * r[1] + g.y * r[5] + g.z * r[9] + r[13], g.x * r[2] + g.y * r[6] + g.z * r[10] + r[14]);
+            log_line(&format!(
+                "flight: vehicle {id}: render matrix places the CoM {:.2} m from physics (arrows fall back to tick positions above 20 m)",
+                (p - mb.to_world(model.com)).len()
+            ));
         }
         craft.last_com = com;
         stepped = true;
@@ -677,12 +901,52 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         let filler = mb;
         let lbs: Vec<LiveBody> = live.iter().map(|l| l.map_or(filler, |x| x.0)).collect();
         let total_mass: f64 = live.iter().flatten().map(|l| l.2).sum();
+        // Tank fluid adds weight but not inertia: the game applies it as a force.
+        let weight_mass = total_mass + bodies.iter().zip(&live).filter_map(|(&b, l)| l.map(|l| fluid_mass(b, l.2))).sum::<f64>();
         // Safety net against a blow-up: no single force above 60 g of the whole vehicle.
         let fmax = 60.0 * 9.81 * total_mass.max(1.0);
         let rbs: HashSet<usize> = live.iter().flatten().map(|l| l.1).collect();
         let jet_fill = fill_jets(&rbs, apply_force);
         let (ground, wing_height) = ground_factors(physics_scene, scene, &model, &lbs, main, &bodies);
-        let forces = model.live_forces(&lbs, main, &mut craft.stall, &ground);
+        let deflect: Vec<f64> =
+            model.fin_live.iter().map(|f| f.and_then(|f| Some(f.sign * live_angle(*craft.comp_ptrs.get(f.comp)?, f.src)?)).unwrap_or(0.0)).collect();
+        let mut forces = model.live_forces(&lbs, main, &mut craft.stall, &ground, &deflect);
+        // Wings and fuselage only: the flight data's lift, drag and coefficients leave out rotor thrust.
+        let n_aero = forces.len();
+        // Propellers and rotors: blade-element forces at each one's live speed and pitch.
+        craft.prop_v.resize(model.props.len(), 0.0);
+        let step = STEP.load(Ordering::Relaxed);
+        let vrs = craft.vrs.unwrap_or_else(|| VRS.load(Ordering::Relaxed));
+        let mut prop_out: Vec<(usize, crate::model::PropOut, f64)> = Vec::new();
+        for (k, u) in model.props.iter().enumerate().filter(|_| PROPS_HOOKED.load(Ordering::Relaxed)) {
+            let Some(&ptr) = craft.comp_ptrs.get(u.comp) else {
+                continue;
+            };
+            let Some(lb) = live.get(u.body as usize).copied().flatten().map(|l| l.0) else {
+                continue;
+            };
+            let state = prop_live_state(ptr, u.def.rotor()).map(|(s, linked, hinged)| {
+                let per_nm = model.prop_load(k, s.blades);
+                (s, linked, hinged, per_nm)
+            });
+            // Under water (air props only push in air) or folded: the game's own behaviour.
+            let Some((s, linked, _, per_nm)) = state.filter(|_| lb.to_world(u.hub).y > 0.0) else {
+                prop_loads().remove(&ptr);
+                continue;
+            };
+            let out = model.prop_live(k, &lb, &s, craft.prop_v[k], vrs);
+            if !(out.force.len().is_finite() && out.moment.len().is_finite() && out.v_target.is_finite()) {
+                continue;
+            }
+            craft.prop_v[k] += (craft.dt / out.tau).min(1.0) * (out.v_target - craft.prop_v[k]);
+            prop_loads().insert(ptr, PropLoad { torque: out.torque, sign: if s.w < 0.0 { -1.0 } else { 1.0 }, per_nm, step });
+            // The air's torque on the spin axis reaches the airframe through a driven shaft (the
+            // engine or hinge motor holds it); a free rotor just changes speed. A hinge motor only
+            // holds the hub's speed: the air never loads the hub, so it reacts with nothing itself.
+            let torque = if linked { out.moment } else { out.moment - out.axial };
+            forces.push(crate::model::LiveForce { body: u.body as usize, force: out.force, at: out.at, torque });
+            prop_out.push((k, out, s.w));
+        }
         // Thrust = what accelerates the vehicle besides our air forces and gravity (engines, props;
         // also ground contact while rolling), along the nose.
         if let Some(pc) = craft.prev_com {
@@ -691,7 +955,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         craft.prev_com = Some(mb.com);
         let vcom = live.iter().flatten().fold(V3::ZERO, |a, l| a + l.0.vel * l.2) * (1.0 / total_mass.max(1e-9));
         if let Some(pv) = craft.prev_vel {
-            let other = (vcom - pv) * (total_mass / craft.dt) - craft.prev_aero - v3(0.0, -9.81 * total_mass, 0.0);
+            let other = (vcom - pv) * (total_mass / craft.dt) - craft.prev_aero - v3(0.0, -9.81 * weight_mass, 0.0);
             let raw = other.dot(mb.dir_to_world(v3(1.0, 0.0, 0.0)));
             if raw.is_finite() {
                 craft.thrust += (raw - craft.thrust) * 0.05;
@@ -700,17 +964,47 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         craft.prev_vel = Some(vcom);
         craft.prev_aero = forces.iter().map(|f| if f.force.len() > fmax { f.force * (fmax / f.force.len()) } else { f.force }).fold(V3::ZERO, |a, f| a + f);
         if want_debug {
-            for (p, _) in model.panels.iter().zip(&craft.stall).filter(|(_, &st)| st > 0.5) {
+            // Missile fins: their own mesh, not their cells (that would paint the body).
+            for (j, _) in craft.stall.iter().enumerate().filter(|(_, &st)| st > 0.5) {
+                let part = model
+                    .fin_comp
+                    .get(j)
+                    .copied()
+                    .flatten()
+                    .map(|c| c as usize)
+                    .or_else(|| model.fin_live.get(j).copied().flatten().filter(|f| f.src == LiveSrc::Rudder).map(|f| f.comp));
+                if let Some(&ptr) = part.and_then(|c| craft.comp_ptrs.get(c)) {
+                    stalled_parts.insert(ptr, crate::paint::rgba(crate::paint::RED));
+                }
+            }
+            for (p, _) in model.panels.iter().zip(&craft.stall).zip(&model.fin_comp).filter(|((_, &st), f)| st > 0.5 && f.is_none()).map(|(x, _)| x) {
                 let body = bodies.get(model.panel_body(p).min(bodies.len().saturating_sub(1))).copied().unwrap_or(0);
                 stalled.entry(body).or_default().extend(p.cells.iter().map(|&c| model.grid.cell(c)));
             }
-            let mut d = flight_data(id, &craft.designations, &model, &lbs, &bodies, main, &forces, &craft.stall, total_mass);
+            let mut d = flight_data(id, &craft.designations, &model, &lbs, &bodies, main, &forces[..n_aero], &craft.stall, weight_mass);
             let nose = mb.dir_to_world(v3(1.0, 0.0, 0.0));
-            let (mut ef, mut ecalls, mut bits, mut wp, mut w) =
-                live.iter().flatten().filter_map(|l| engine_forces.get(&l.1)).fold((V3::ZERO, 0, 0u8, V3::ZERO, 0.0), |a, e| (a.0 + e.0, a.1 + e.1, a.2 | e.2, a.3 + e.3, a.4 + e.4));
+            let (mut ef, mut ecalls, mut bits, mut wp, mut w) = live
+                .iter()
+                .flatten()
+                .filter_map(|l| engine_forces.get(&l.1))
+                .fold((V3::ZERO, 0, 0u8, V3::ZERO, 0.0), |a, e| (a.0 + e.0, a.1 + e.1, a.2 | e.2, a.3 + e.3, a.4 + e.4));
             if jet_fill.1 > 0 {
                 // Jets the plugin kept pushing this tick.
                 (ef, ecalls, bits, wp, w) = (ef + jet_fill.0, ecalls + jet_fill.1, bits | 1, wp + jet_fill.2, w + jet_fill.3);
+            }
+            for (k, o, shaft) in &prop_out {
+                let along = o.force.len();
+                (ef, ecalls, bits, wp, w) = (ef + o.force, ecalls + 1, bits | 4, wp + o.at * along, w + along);
+                d.props.push(PropDebug {
+                    name: model.comps[model.props[*k].comp].def.clone(),
+                    rps: o.omega / (2.0 * std::f64::consts::PI),
+                    shaft: *shaft,
+                    thrust: o.thrust,
+                    power: o.torque * o.omega,
+                    vrs: o.vrs,
+                    blade_deg: o.blade_angle.to_degrees(),
+                    stalled: o.stalled,
+                });
             }
             if w > 1.0 {
                 let at = wp * (1.0 / w);
@@ -728,12 +1022,17 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) > 10_000 {
                 LAST_LOG.store(now, Ordering::Relaxed);
                 log_line(&format!(
-                    "thrust: vehicle {id}: {ecalls} engine force calls last step ({}), {:.0} N along nose; weight {:.0} N, estimate {:.0} N",
-                    d.thrust_source, ef.dot(nose), total_mass * 9.81, craft.thrust
+                    "thrust: vehicle {id}: {ecalls} engine force calls last step ({}), {:.0} N along nose; weight {:.0} N (tank fluid {:.0} kg), estimate {:.0} N",
+                    d.thrust_source,
+                    ef.dot(nose),
+                    weight_mass * 9.81,
+                    weight_mass - total_mass,
+                    craft.thrust
                 ));
             }
             d.thrust = craft.thrust;
-            // Live CG (the game's own centre of mass: fuel and cargo included) and centre of lift (neutral
+            // Live CG (the game's own centre of mass; tank fluid is not in it, the game hangs its weight on
+            // the tanks as a force) and centre of lift (neutral
             // point at this Mach), with their main-body grid positions so the overlay can place them smoothly.
             let cg = live.iter().flatten().fold(V3::ZERO, |a, l| a + l.0.com * l.2) * (1.0 / total_mass.max(1e-9));
             d.main_body = bodies[main];
@@ -751,7 +1050,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         // Every air load goes to the main body at its true point: same net force and moment on the
         // vehicle, but hinges and pivots no longer carry it, so sub-grid surfaces don't bend.
         // shortcut: assumes the vehicle's bodies are rigidly joined; per-body forces if loose parts matter.
-        let Some((lb, rb, _)) = live.get(main).copied().flatten() else { continue };
+        let Some((lb, rb, _)) = live.get(main).copied().flatten() else {
+            continue;
+        };
         for f in forces {
             let scale = if f.force.len() > fmax { fmax / f.force.len() } else { 1.0 };
             let force = f.force * scale;
@@ -772,11 +1073,13 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         APPLIED.fetch_add(1, Ordering::Relaxed);
     }
+    *FLOWN.write().unwrap_or_else(|p| p.into_inner()) = flown;
     st.crafts.retain(|id, _| seen.contains(id));
     VEHICLES.store(st.crafts.len() as u64, Ordering::Relaxed);
     // Empty while F9 is closed, so the render thread stops painting; kept on a repeat sync call.
     if stepped || !want_debug || st.crafts.is_empty() {
         crate::paint::publish(stalled);
+        crate::paint::publish_flight_tint(std::mem::take(&mut stalled_parts));
     }
     if want_debug {
         *DEBUG.lock().unwrap_or_else(|p| p.into_inner()) = debug;
@@ -786,7 +1089,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
 
 /// Same thread as the game's frame build, so `frame+0xED0` and `body+0x308` are from one build.
 fn record_builds(bodies: impl Iterator<Item = usize>) {
-    let Some(ts) = frame_build_ts(SIM_STATE.load(Ordering::Relaxed)) else { return };
+    let Some(ts) = frame_build_ts(SIM_STATE.load(Ordering::Relaxed)) else {
+        return;
+    };
     let mut map = BUILT_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
     let mut keep = HashSet::new();
     for b in bodies {
@@ -795,7 +1100,9 @@ fn record_builds(bodies: impl Iterator<Item = usize>) {
         if h.last().is_some_and(|(t, _)| *t == ts) {
             continue;
         }
-        let Some(m) = body_built_matrix(b) else { continue };
+        let Some(m) = body_built_matrix(b) else {
+            continue;
+        };
         h.push((ts, m));
         if h.len() > 4 {
             h.remove(0);
@@ -806,7 +1113,17 @@ fn record_builds(bodies: impl Iterator<Item = usize>) {
 
 /// Airflow, coefficients and lift/drag arrows (fuselage + one per whole wing) from this tick's forces.
 #[allow(clippy::too_many_arguments)]
-fn flight_data(id: u32, des: &str, m: &Model, lbs: &[LiveBody], bodies: &[usize], main: usize, forces: &[crate::model::LiveForce], stall: &[f64], mass: f64) -> VehicleDebug {
+fn flight_data(
+    id: u32,
+    des: &str,
+    m: &Model,
+    lbs: &[LiveBody],
+    bodies: &[usize],
+    main: usize,
+    forces: &[crate::model::LiveForce],
+    stall: &[f64],
+    mass: f64,
+) -> VehicleDebug {
     let mb = &lbs[main];
     let com = mb.to_world(m.com);
     let v = mb.vel + mb.omega.cross(com - mb.com) - mb.wind;
@@ -826,7 +1143,8 @@ fn flight_data(id: u32, des: &str, m: &Model, lbs: &[LiveBody], bodies: &[usize]
         let (l, dr) = split(f.force);
         lift += l;
         drag += dr;
-        let (key, area) = if i == 0 { (0, f64::MAX) } else { (1 + m.wing_of.get(i - 1).copied().unwrap_or(i - 1), m.panels.get(i - 1).map_or(0.0, |p| p.area)) };
+        let (key, area) =
+            if i == 0 { (0, f64::MAX) } else { (1 + m.wing_of.get(i - 1).copied().unwrap_or(i - 1), m.panels.get(i - 1).map_or(0.0, |p| p.area)) };
         let g = groups.entry(key).or_insert((V3::ZERO, V3::ZERO, 0.0, f.body, -1.0));
         let w = f.force.len().max(1e-6);
         g.0 += f.force;
@@ -899,6 +1217,6 @@ fn flight_data(id: u32, des: &str, m: &Model, lbs: &[LiveBody], bodies: &[usize]
         arrows,
         stalled: stall.iter().filter(|&&s| s > 0.5).count(),
         panels: m.panels.len(),
+        props: Vec::new(),
     }
 }
-

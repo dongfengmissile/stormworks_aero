@@ -45,7 +45,7 @@ pub const MAX_DEFLECT: f64 = 15.0 * PI / 180.0;
 /// these let a panel trade lift for drag like real aerofoils do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aerofoil {
-    /// Stable id for the `.aero` file.
+    /// Stable id in the vehicle file's `aero` attribute.
     pub id: &'static str,
     pub name: &'static str,
     pub note: &'static str,
@@ -59,6 +59,15 @@ pub struct Aerofoil {
     pub kappa: f64,
     /// Supersonic wave drag = k · (t/c)² / β: 16/3 biconvex, 4 double wedge, more for blunt noses.
     pub k_wave: f64,
+    pub kind: FoilKind,
+}
+
+/// Which list a section is offered in. `Grid` is never offered: grid fin parts get it themselves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FoilKind {
+    Wing,
+    Fin,
+    Grid,
 }
 
 impl Aerofoil {
@@ -74,17 +83,40 @@ impl Aerofoil {
 
 /// Selectable sections. The first is FAR's: its drag rise at Mach 0.8 and supersonic wave drag
 /// 0.009216/β are those of a ~4 % symmetric section.
-pub const AEROFOILS: [Aerofoil; 9] = [
-    Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. A safe all-round choice.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0 },
-    Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, slow flight)", note: "Thick and strongly curved: lots of lift at low speed, but it stalls early and drags a lot when fast.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca2412", name: "NACA 2412 (light aircraft)", note: "Moderate curve and thickness: the usual light-aircraft wing, easy to fly.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca23015", name: "NACA 23015 (warbird)", note: "Old warbird wing: thick with little curve, so a high maximum lift without much lift at zero angle.", t_c: 0.15, cl0: 0.12, cl_max: 1.65, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca0012", name: "NACA 0012 (symmetric, tails)", note: "No lift at zero angle and works the same upside down: tails, fins and aerobatic wings.", t_c: 0.12, cl0: 0.0, cl_max: 1.5, kappa: 0.87, k_wave: 8.0 },
-    Aerofoil { id: "naca64a010", name: "NACA 64A010 (fast jets)", note: "Thin and flat: keeps its drag rise later near the speed of sound, in exchange for less maximum lift.", t_c: 0.10, cl0: 0.0, cl_max: 1.3, kappa: 0.9, k_wave: 6.0 },
-    Aerofoil { id: "supercritical", name: "Supercritical SC(2)-0712 (airliner)", note: "Flat on top, so a thick wing stays efficient near the speed of sound; poor above it.", t_c: 0.12, cl0: 0.5, cl_max: 1.7, kappa: 0.95, k_wave: 8.0 },
-    Aerofoil { id: "slotted0012", name: "Slotted symmetric (very high angle)", note: "Symmetric, with a slot at the front edge that keeps it lifting to about twice the angle of a plain wing, at the cost of drag. For all-moving tails and flaps that swing far.", t_c: 0.14, cl0: 0.0, cl_max: 2.6, kappa: 0.86, k_wave: 9.0 },
-    Aerofoil { id: "biconvex4", name: "Biconvex 4% (supersonic)", note: "Knife-edge shape: least drag above the speed of sound, but little lift and an early stall when slow.", t_c: 0.04, cl0: 0.0, cl_max: 0.9, kappa: 0.87, k_wave: 16.0 / 3.0 },
+pub const AEROFOILS: [Aerofoil; 15] = [
+    Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. A safe all-round choice.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0, kind: FoilKind::Wing },
+    Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, slow flight)", note: "Thick and strongly curved: lots of lift at low speed, but it stalls early and drags a lot when fast.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
+    Aerofoil { id: "naca2412", name: "NACA 2412 (light aircraft)", note: "Moderate curve and thickness: the usual light-aircraft wing, easy to fly.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
+    Aerofoil { id: "naca23015", name: "NACA 23015 (warbird)", note: "Old warbird wing: thick with little curve, so a high maximum lift without much lift at zero angle.", t_c: 0.15, cl0: 0.12, cl_max: 1.65, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
+    Aerofoil { id: "naca0012", name: "NACA 0012 (symmetric, tails)", note: "No lift at zero angle and works the same upside down: tails, fins and aerobatic wings.", t_c: 0.12, cl0: 0.0, cl_max: 1.5, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
+    Aerofoil { id: "naca64a010", name: "NACA 64A010 (fast jets)", note: "Thin and flat: keeps its drag rise later near the speed of sound, in exchange for less maximum lift.", t_c: 0.10, cl0: 0.0, cl_max: 1.3, kappa: 0.9, k_wave: 6.0, kind: FoilKind::Wing },
+    Aerofoil { id: "supercritical", name: "Supercritical SC(2)-0712 (airliner)", note: "Flat on top, so a thick wing stays efficient near the speed of sound; poor above it.", t_c: 0.12, cl0: 0.5, cl_max: 1.7, kappa: 0.95, k_wave: 8.0, kind: FoilKind::Wing },
+    Aerofoil { id: "slotted0012", name: "Slotted symmetric (very high angle)", note: "Symmetric, with a slot at the front edge that keeps it lifting to about twice the angle of a plain wing, at the cost of drag. For all-moving tails and flaps that swing far.", t_c: 0.14, cl0: 0.0, cl_max: 2.6, kappa: 0.86, k_wave: 9.0, kind: FoilKind::Wing },
+    Aerofoil { id: "biconvex4", name: "Biconvex 4% (supersonic)", note: "Knife-edge shape: least drag above the speed of sound, but little lift and an early stall when slow.", t_c: 0.04, cl0: 0.0, cl_max: 0.9, kappa: 0.87, k_wave: 16.0 / 3.0, kind: FoilKind::Wing },
+    // Missile fins: thin sharp-edged sections (modified double wedge or biconvex, t/c ≈ 3–5 %,
+    // NSWC TR 81-156). Wave drag k: 4 diamond, 8 hexagonal with a flat middle half, more blunt.
+    // High-angle: sharp edges on low aspect ratio fins keep lifting through a leading-edge vortex.
+    Aerofoil { id: "fin_hex4", name: "Hexagonal 4% (all-round missile fin)", note: "The usual missile fin: a thin plate with sharpened front and back edges. Works well from slow to very fast.", t_c: 0.04, cl0: 0.0, cl_max: 1.2, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Fin },
+    Aerofoil { id: "fin_diamond3", name: "Diamond 3% (long range, very fast)", note: "Very thin with knife edges front and back: the least drag at high speed, so the missile keeps its speed longer. Turns less hard when slow.", t_c: 0.03, cl0: 0.0, cl_max: 1.0, kappa: 0.88, k_wave: 4.0, kind: FoilKind::Fin },
+    Aerofoil { id: "fin_dogfight", name: "Sharp high-angle (dogfight)", note: "Keeps lifting at steep angles, so the missile can pull very hard turns at short range. A little more drag.", t_c: 0.035, cl0: 0.0, cl_max: 1.8, kappa: 0.86, k_wave: 6.0, kind: FoilKind::Fin },
+    Aerofoil { id: "fin_round10", name: "Rounded 10% (slow missiles, bombs)", note: "Thicker with a rounded front: smooth and forgiving below the speed of sound, but draggy above it. For anti-tank missiles, glide bombs and drones.", t_c: 0.10, cl0: 0.0, cl_max: 1.4, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Fin },
+    Aerofoil { id: "fin_flat", name: "Flat plate, square edges (rockets)", note: "A plain flat sheet with square edges: simple, but more drag at every speed and it stalls early. For unguided rockets and simple builds.", t_c: 0.05, cl0: 0.0, cl_max: 0.9, kappa: 0.80, k_wave: 12.0, kind: FoilKind::Fin },
+    // Grid (lattice) fins, given to grid fin parts: the lattice face as a planar fin of the same
+    // area (DERA: a grid fin's normal force is about a planar fin's), no stall, axial force 2–3×
+    // (DeSpirito et al. 2000, ARL-TR-2318), lift lost to cell choking near Mach 1 (`grid_choke`).
+    Aerofoil { id: "grid", name: "Grid fin (lattice)", note: "A lattice of small cells: keeps steering at very steep angles, but drags a lot and loses grip near the speed of sound.", t_c: 0.06, cl0: 0.0, cl_max: 3.0, kappa: 0.80, k_wave: 6.0, kind: FoilKind::Grid },
 ];
+
+/// Default section of missile fin panels.
+pub const FIN_DEFAULT: usize = 9;
+pub const GRID: usize = 14;
+
+/// Grid fin cells choke from about Mach 0.75: normal force sags to ~half at Mach 1 and recovers
+/// once supersonic (Washington & Miller 1993; Simpson & Sadler 1998). (lift factor, drag factor.)
+fn grid_choke(mach: f64) -> (f64, f64) {
+    let bump = (1.0 - ((mach - 1.0) / 0.3).powi(2)).max(0.0);
+    (1.0 - 0.5 * bump, 2.5 * (1.0 + bump))
+}
 
 pub fn aerofoil_index(id: &str) -> Option<usize> {
     AEROFOILS.iter().position(|a| a.id == id)
@@ -138,11 +170,7 @@ pub enum Key {
 }
 
 /// Build panels. `key_of(component index)` says whether a component's cells are wing cells.
-pub fn build_panels(
-    grid: &Grid,
-    key_of: &dyn Fn(u32) -> Option<(Key, Role)>,
-    com: V3,
-) -> Vec<Panel> {
+pub fn build_panels(grid: &Grid, key_of: &dyn Fn(u32) -> Option<(Key, Role)>, com: V3) -> Vec<Panel> {
     let n = grid.fill.len();
     let mut key: Vec<Option<(Key, Role)>> = vec![None; n];
     for i in 0..n {
@@ -156,7 +184,9 @@ pub fn build_panels(
     let mut panel_of = vec![usize::MAX; n];
     let mut panels = Vec::new();
     for start in 0..n {
-        let Some((k, role)) = key[start] else { continue };
+        let Some((k, role)) = key[start] else {
+            continue;
+        };
         if panel_of[start] != usize::MAX {
             continue;
         }
@@ -167,7 +197,9 @@ pub fn build_panels(
             cells.push(i);
             let c = grid.cell(i);
             for d in DIRS {
-                let Some(j) = grid.index([c[0] + d[0], c[1] + d[1], c[2] + d[2]]) else { continue };
+                let Some(j) = grid.index([c[0] + d[0], c[1] + d[1], c[2] + d[2]]) else {
+                    continue;
+                };
                 if panel_of[j] == usize::MAX && key[j].map(|x| x.0) == Some(k) {
                     panel_of[j] = panels.len();
                     queue.push_back(j);
@@ -184,7 +216,11 @@ pub fn build_panels(
         let right = ys.iter().filter(|y| **y > 0.01).count();
         if matches!(k, Key::Wing(_) | Key::Split(_)) && left > 4 && right > 4 {
             let (l, r) = cells.iter().zip(&ys).fold((vec![], vec![]), |(mut l, mut r), (&c, &y)| {
-                if y < 0.0 { l.push(c) } else { r.push(c) }
+                if y < 0.0 {
+                    l.push(c)
+                } else {
+                    r.push(c)
+                }
                 (l, r)
             });
             split.push((k, role, l));
@@ -273,7 +309,7 @@ fn chain_aspect_ratios(panels: &mut [Panel]) {
 }
 
 /// Symmetric 3x3 eigen-decomposition (Jacobi). Returns (values, column vectors).
-fn eigen3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [V3; 3]) {
+pub(crate) fn eigen3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [V3; 3]) {
     let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for _ in 0..32 {
         let (mut p, mut q, mut max) = (0, 1, 0.0);
@@ -311,6 +347,157 @@ fn eigen3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [V3; 3]) {
     ([a[0][0], a[1][1], a[2][2]], [col(0), col(1), col(2)])
 }
 
+/// Principal axes of a point set: (axes sorted thinnest first, mean); None for under 3 points.
+fn principal(pts: &[V3]) -> Option<([V3; 3], V3)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let mean = pts.iter().fold(V3::ZERO, |a, p| a + *p) * (1.0 / pts.len() as f64);
+    let mut cov = [[0.0; 3]; 3];
+    for p in pts {
+        let d = *p - mean;
+        for i in 0..3 {
+            for j in 0..3 {
+                cov[i][j] += d.get(i) * d.get(j);
+            }
+        }
+    }
+    let (vals, vecs) = eigen3(cov);
+    let mut order = [0, 1, 2];
+    order.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
+    Some((order.map(|k| vecs[k]), mean))
+}
+
+/// Extents of a point set along its principal axes, thinnest first.
+pub fn extents(pts: &[V3]) -> Option<[f64; 3]> {
+    let (axes, _) = principal(pts)?;
+    Some(axes.map(|a| {
+        let (lo, hi) = pts.iter().fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.dot(a)), h.max(p.dot(a))));
+        hi - lo
+    }))
+}
+
+/// Lifting panel straight from a flat mesh piece (a missile fin, aero frame metres): plane fit
+/// to its vertices, planform from their outline. For fins far smaller than a voxel.
+pub fn plate_panel(pts: &[V3], cells: Vec<usize>, role: Role, com: V3) -> Option<Panel> {
+    let (axes, mean) = principal(pts)?;
+    let n = axes[0];
+    let fwd = v3(1.0, 0.0, 0.0);
+    if n.x.abs() > 0.9 {
+        return None; // faces the flow: no chord
+    }
+    let u = fwd.reject(n).norm();
+    let mut s = n.cross(u).norm();
+    let range = |s: V3| pts.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.dot(s)), b.max(p.dot(s))));
+    let (lo, hi) = range(s);
+    let b = hi - lo;
+    if b < 1e-3 {
+        return None;
+    }
+    // Span runs root to tip: the root is the end nearer the CoM line (the missile body).
+    let off = |end: f64| {
+        let sel: Vec<f64> = pts.iter().filter(|p| (p.dot(s) - end).abs() < 0.1 * b).map(|p| (*p - com).reject(fwd).len()).collect();
+        sel.iter().sum::<f64>() / sel.len().max(1) as f64
+    };
+    if off(hi) < off(lo) {
+        s = -s;
+    }
+    let (lo, _) = range(s);
+    let outline = hull_2d(pts.iter().map(|p| [p.dot(s) - lo, p.dot(u)]).collect());
+    // Spanwise strips across the outline: chord and mid-chord, least squares against span.
+    const N: usize = 16;
+    let ds = b / N as f64;
+    let nmean = mean.dot(n);
+    let (mut area, mut centroid) = (0.0, V3::ZERO);
+    let (mut sx, mut sxx, mut sc, mut sxc, mut sm, mut sxm, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for k in 0..N {
+        let x = (k as f64 + 0.5) * ds;
+        let Some((cl, ch)) = slice_2d(&outline, x) else {
+            continue;
+        };
+        let (chord, mid) = (ch - cl, 0.5 * (cl + ch));
+        area += chord * ds;
+        centroid += (u * mid + s * (x + lo) + n * nmean) * (chord * ds);
+        sx += x;
+        sxx += x * x;
+        sc += chord;
+        sxc += x * chord;
+        sm += mid;
+        sxm += x * mid;
+        cnt += 1.0;
+    }
+    if area < 1e-6 || cnt < 2.0 {
+        return None;
+    }
+    let den = cnt * sxx - sx * sx;
+    let (chord_slope, mid_slope) = if den.abs() > 1e-12 { ((cnt * sxc - sx * sc) / den, (cnt * sxm - sx * sm) / den) } else { (0.0, 0.0) };
+    let (mean_x, mean_c) = (sx / cnt, sc / cnt);
+    let root_c = (mean_c - chord_slope * mean_x).max(1e-3);
+    let tip_c = (mean_c + chord_slope * (b - mean_x)).max(0.0);
+    let mut p = Panel {
+        cells,
+        role,
+        n,
+        u,
+        s,
+        b,
+        mac: area / b,
+        area,
+        taper: (tip_c / root_c).clamp(0.0, 2.0),
+        tan_sweep: -mid_slope,
+        centroid: centroid * (1.0 / area),
+        // Root on the body, which mirrors the fin (FAR: a root against a fuselage doubles AR).
+        ar: (2.0 * b * b / area).clamp(0.25, 30.0),
+        root_covered: 1.0,
+        tip_covered: 0.0,
+        tip_next: None,
+        fwd: Vec::new(),
+        aft: Vec::new(),
+        interference: 1.0,
+        ctrl_sign: 1.0,
+        foil: 0,
+    };
+    p.ctrl_sign = control_sign(&p, com);
+    Some(p)
+}
+
+/// Convex hull (counter-clockwise, monotone chain).
+fn hull_2d(mut p: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    p.dedup();
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut h: Vec<[f64; 2]> = Vec::new();
+    for pass in 0..2 {
+        let start = h.len();
+        let it: Box<dyn Iterator<Item = &[f64; 2]>> = if pass == 0 { Box::new(p.iter()) } else { Box::new(p.iter().rev()) };
+        for &q in it {
+            while h.len() >= start + 2 && cross(h[h.len() - 2], h[h.len() - 1], q) <= 0.0 {
+                h.pop();
+            }
+            h.push(q);
+        }
+        h.pop();
+    }
+    h
+}
+
+/// Extent in y of a convex polygon along the line x = `x`.
+fn slice_2d(poly: &[[f64; 2]], x: f64) -> Option<(f64, f64)> {
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+        if (a[0] - x) * (b[0] - x) <= 0.0 && a[0] != b[0] {
+            let y = a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]);
+            lo = lo.min(y);
+            hi = hi.max(y);
+        }
+    }
+    (hi > lo).then_some((lo, hi))
+}
+
 fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result<Panel, &'static str> {
     if cells.len() < 2 {
         return Err("single-cell group");
@@ -333,14 +520,15 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
     let mut order = [0, 1, 2];
     order.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
     let mut n = vecs[order[0]];
-    // A strip one voxel thick and one voxel wide is ambiguous: prefer a horizontal surface.
+    let mut short = vecs[order[1]]; // shorter in-plane axis
+                                    // A strip one voxel thick and one voxel wide is ambiguous: prefer a horizontal surface.
     if vals[order[1]] < vals[order[0]] * 1.1 && vecs[order[1]].z.abs() > n.z.abs() {
-        n = vecs[order[1]];
+        (n, short) = (vecs[order[1]], vecs[order[0]]);
     }
     let fwd = v3(1.0, 0.0, 0.0);
-    // A plate facing the flow (Starship-style drag flaps) has no chord from the airflow: use the
-    // plate's own long axis instead.
-    let u = if n.x.abs() > 0.9 { vecs[order[1]].reject(n).norm() } else { fwd.reject(n).norm() };
+    // A plate facing the flow (Starship-style drag flaps) has no chord from the airflow: the chord
+    // runs along its shorter side, the span along its longer one.
+    let u = if n.x.abs() > 0.9 { short.reject(n).norm() } else { fwd.reject(n).norm() };
     let mut s = n.cross(u).norm();
     // Span points away from the root: the end nearer the CoM line is the root.
     let off = |p: V3| (p - com).reject(fwd).len();
@@ -387,11 +575,7 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
     }
     centroid = centroid * (1.0 / area);
     let den = cnt * sxx - sx * sx;
-    let (chord_slope, mid_slope) = if den.abs() > 1e-9 {
-        ((cnt * sxc - sx * sc) / den, (cnt * sxm - sx * sm) / den)
-    } else {
-        (0.0, 0.0)
-    };
+    let (chord_slope, mid_slope) = if den.abs() > 1e-9 { ((cnt * sxc - sx * sc) / den, (cnt * sxm - sx * sm) / den) } else { (0.0, 0.0) };
     let mean_x = sx / cnt;
     let mean_c = sc / cnt;
     let root_c = (mean_c - chord_slope * mean_x).max(VOXEL_M * 0.5);
@@ -479,20 +663,17 @@ fn interactions(grid: &Grid, panels: &mut [Panel], owner: &[usize]) {
             for k in 0..5 {
                 let target = lo + (0.2 * k as f64 + 0.1) * (hi - lo + VOXEL_M) - VOXEL_M * 0.5;
                 // Start from the panel cell of this strip furthest along the ray direction.
-                let Some(&start) = p
-                    .cells
-                    .iter()
-                    .filter(|&&i| (span_pos(i) - target).abs() < 0.13)
-                    .max_by_key(|&&i| {
-                        let c = grid.cell(i);
-                        c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2]
-                    })
-                else {
+                let Some(&start) = p.cells.iter().filter(|&&i| (span_pos(i) - target).abs() < 0.13).max_by_key(|&&i| {
+                    let c = grid.cell(i);
+                    c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2]
+                }) else {
                     continue;
                 };
                 let c = grid.cell(start);
                 for t in 1..=steps {
-                    let Some(j) = grid.index([c[0] + dir[0] * t, c[1] + dir[1] * t, c[2] + dir[2] * t]) else { break };
+                    let Some(j) = grid.index([c[0] + dir[0] * t, c[1] + dir[1] * t, c[2] + dir[2] * t]) else {
+                        break;
+                    };
                     if !solid_other(j) {
                         continue;
                     }
@@ -581,13 +762,7 @@ pub struct PanelForce {
 
 /// Forces on every panel. `vel(panel, at)`: velocity of a point of that panel through the air.
 /// `deflect[i]`: control deflection of panel i in radians. `stall`: persistent stall state.
-pub fn panel_forces(
-    panels: &[Panel],
-    flow: &WingFlow,
-    vel: &dyn Fn(usize, V3) -> V3,
-    deflect: &[f64],
-    stall: &mut [f64],
-) -> Vec<PanelForce> {
+pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -> V3, deflect: &[f64], stall: &mut [f64]) -> Vec<PanelForce> {
     let mut raw = vec![Raw::default(); panels.len()];
     let mut normals = vec![V3::ZERO; panels.len()];
     for (i, p) in panels.iter().enumerate() {
@@ -602,7 +777,7 @@ pub fn panel_forces(
             // Camber acts as built-in incidence toward body-up (none on fins: no "up" side).
             aoa: normals[i].dot(vn).clamp(-1.0, 1.0).asin() - camber_sign(normals[i]) * af.camber_aoa() * camber_fade(flow.mach),
             lift_slope: ls,
-            aoa_max: aoa_max(flow.mach, ls, af.cl_max),
+            aoa_max: if af.kind == FoilKind::Grid { 1.2 } else { aoa_max(flow.mach, ls, af.cl_max) },
             cos_sweep,
             cd0_inc: cd_compressibility(flow.mach, cos_sweep, af),
             stall: stall[i],
@@ -773,6 +948,11 @@ pub fn panel_forces(
             }
             cd = cdi + cd0;
         }
+        if af.kind == FoilKind::Grid {
+            let (lf, df) = grid_choke(mach);
+            cl *= lf;
+            cd = cdi * lf * lf + cd0 * df;
+        }
         let mut at = p.centroid + pl * ac_offset(mach, p.mac, cos_sweep, cos_a);
         if st > 0.0 {
             at -= pl * (0.75 / 1.6 * p.mac * cl.abs() * st * cos_a);
@@ -863,11 +1043,7 @@ fn le_factor(ar: f64, beta: f64, tan_sweep: f64) -> f64 {
     let art = ar * tan_sweep;
     let bt = beta / tan_sweep.max(1e-9);
     if bt < 1.0 {
-        let f = if bt < 0.5 {
-            1.57 * ar / (art + 0.5)
-        } else {
-            (1.57 - 0.28 * (bt - 0.5)) * ar / (art + 0.5 - 0.25 * (bt - 0.5))
-        };
+        let f = if bt < 0.5 { 1.57 * ar / (art + 0.5) } else { (1.57 - 0.28 * (bt - 0.5)) * ar / (art + 0.5 - 0.25 * (bt - 0.5)) };
         f * beta
     } else {
         1.0 + (1.0 / bt) * (1.43 * art / (art + 0.375) - 1.0)
@@ -986,7 +1162,15 @@ mod tests {
             })
             .collect();
         let g = Grid::from_cells(&cells);
-        let panels = build_panels(&g, &|o| match o { 0 => Some((Key::Wing(0), Role::None)), 2 => Some((Key::Comp(2), Role::Flap)), _ => None }, com);
+        let panels = build_panels(
+            &g,
+            &|o| match o {
+                0 => Some((Key::Wing(0), Role::None)),
+                2 => Some((Key::Comp(2), Role::Flap)),
+                _ => None,
+            },
+            com,
+        );
         assert!(panels.iter().any(|p| p.role == Role::Flap) && panels.iter().any(|p| !p.aft.is_empty() || !p.fwd.is_empty()));
         let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6, gamma: 1.4 };
         let lift = |flap_deg: f64| {
@@ -1098,6 +1282,13 @@ mod tests {
         // Camber gives no lift supersonic.
         let (cls_gal, _) = coeffs("naca4415", 0.0, 1.6);
         assert!(cls_gal.abs() < 1e-6, "{cls_gal}");
+        // Grid fins: still lifting at 40° where a planar fin has stalled, lift sagging at Mach 1.
+        let (cl_grid, cd_grid) = coeffs("grid", 40.0, 0.5);
+        let (cl_hex, _) = coeffs("fin_hex4", 40.0, 0.5);
+        assert!(cl_grid > 1.5 * cl_hex, "grid {cl_grid} vs planar {cl_hex} at 40°");
+        assert!(coeffs("grid", 1.0, 0.5).1 > 2.0 * coeffs("fin_hex4", 1.0, 0.5).1 && cd_grid > 0.0);
+        let per_aoa = |m: f64| coeffs("grid", 5.0, m).0;
+        assert!(per_aoa(1.0) < 0.7 * per_aoa(0.6) && per_aoa(1.5) > per_aoa(1.0), "choking");
         // Supercritical delays the drag rise (zero-lift compressibility drag, straight wing).
         let foil = |id| &AEROFOILS[aerofoil_index(id).unwrap()];
         let (sc, n0012) = (cd_compressibility(0.8, 1.0, foil("supercritical")), cd_compressibility(0.8, 1.0, foil("naca0012")));
@@ -1107,8 +1298,7 @@ mod tests {
     #[test]
     fn thick_body_marked_whole_makes_a_panel() {
         // A flying wing: the body is the wing, 3 voxels thick (grid z = aero x), 8 chord, 8 span.
-        let cells: Vec<([i32; 3], f32, u32)> =
-            (0..8).flat_map(|y| (0..8).flat_map(move |x| (0..3).map(move |z| ([y + 3, z, x], 1.0, 0u32)))).collect();
+        let cells: Vec<([i32; 3], f32, u32)> = (0..8).flat_map(|y| (0..8).flat_map(move |x| (0..3).map(move |z| ([y + 3, z, x], 1.0, 0u32)))).collect();
         let g = Grid::from_cells(&cells);
         let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
         assert_eq!(panels.len(), 1);
@@ -1122,8 +1312,7 @@ mod tests {
         // A plate across the flow (thin along x) like a Starship drag flap: 12 wide, 6 tall, one
         // side of the symmetry plane so it is not split into two.
         // Cells are [grid x, grid y, grid z] = [aero y, -aero z, aero x].
-        let cells: Vec<([i32; 3], f32, u32)> =
-            (3..15).flat_map(|y| (0..6).map(move |z| ([y, z, 0], 1.0, 0u32))).collect();
+        let cells: Vec<([i32; 3], f32, u32)> = (3..15).flat_map(|y| (0..6).map(move |z| ([y, z, 0], 1.0, 0u32))).collect();
         let g = Grid::from_cells(&cells);
         let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
         assert_eq!(panels.len(), 1, "a plate facing the flow is still a wing");

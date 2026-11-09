@@ -4,18 +4,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use crate::body::{aero_pos, BodyAero, Flow};
 use crate::defs::Library;
 use crate::math::{v3, V3};
 use crate::vehicle::Comp;
-use crate::voxel::{Grid, EMPTY, INTERIOR};
+use crate::voxel::{Grid, EMPTY, INTERIOR, VOXEL_M};
 use crate::wing::{build_panels, panel_forces, skin_friction, Key, Panel, Role, WingFlow, MAX_DEFLECT};
 
 pub const G: f64 = 9.81;
 
-/// User choices that are not in the vehicle file (sidecar `.aero`).
-#[derive(Clone, Default, PartialEq)]
+/// User choices, keyed by component position (stored per part: `marks`).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Designations {
     /// Grid positions of components marked as wing blocks.
     pub wings: HashSet<[i32; 3]>,
@@ -25,107 +26,14 @@ pub struct Designations {
     pub foils: HashMap<[i32; 3], usize>,
     /// Aerofoil of every other panel.
     pub default_foil: usize,
+    /// Aerofoil of every other missile fin panel (None: `wing::FIN_DEFAULT`).
+    pub default_fin: Option<usize>,
     /// Wing blocks marked as a separate wing: they form their own panels and wing (for another
     /// aerofoil on part of a wing).
     pub splits: HashSet<[i32; 3]>,
-}
-
-impl Designations {
-    pub fn parse(text: &str) -> Designations {
-        let mut d = Designations::default();
-        for line in text.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            let pos = |i: usize| -> Option<[i32; 3]> {
-                Some([f.get(i)?.parse().ok()?, f.get(i + 1)?.parse().ok()?, f.get(i + 2)?.parse().ok()?])
-            };
-            match f.first() {
-                Some(&"wing") => {
-                    d.wings.extend(pos(1));
-                }
-                Some(&"role") => {
-                    if let (Some(r), Some(p)) = (f.get(1).and_then(|s| Role::parse(s)), pos(2)) {
-                        d.roles.insert(p, r);
-                    }
-                }
-                Some(&"foil") => {
-                    if let (Some(a), Some(p)) = (f.get(1).and_then(|s| crate::wing::aerofoil_index(s)), pos(2)) {
-                        d.foils.insert(p, a);
-                    }
-                }
-                Some(&"split") => {
-                    d.splits.extend(pos(1));
-                }
-                Some(&"foil_default") => {
-                    d.default_foil = f.get(1).and_then(|s| crate::wing::aerofoil_index(s)).unwrap_or(0);
-                }
-                _ => {}
-            }
-        }
-        d
-    }
-
-    /// Share of the marked positions present in `comps` (None with fewer than 3 marks), and how many are missing.
-    /// Marks go stale when blocks are removed or moved after designating.
-    pub fn match_score(&self, comps: &[Comp]) -> Option<(f64, usize)> {
-        let have: HashSet<[i32; 3]> = comps.iter().map(|c| c.pos).collect();
-        let marks: Vec<&[i32; 3]> = self.wings.iter().chain(self.roles.keys()).chain(self.foils.keys()).chain(self.splits.iter()).collect();
-        if marks.len() < 3 {
-            return None;
-        }
-        let missing = marks.iter().filter(|m| !have.contains(**m)).count();
-        Some((1.0 - missing as f64 / marks.len() as f64, missing))
-    }
-
-    /// Drop marks on positions with no component (deleted blocks). Returns how many went.
-    pub fn retain_present(&mut self, comps: &[Comp]) -> usize {
-        let have: HashSet<[i32; 3]> = comps.iter().map(|c| c.pos).collect();
-        let n = self.wings.len() + self.roles.len() + self.foils.len() + self.splits.len();
-        self.wings.retain(|p| have.contains(p));
-        self.roles.retain(|p, _| have.contains(p));
-        self.foils.retain(|p, _| have.contains(p));
-        self.splits.retain(|p| have.contains(p));
-        n - self.wings.len() - self.roles.len() - self.foils.len() - self.splits.len()
-    }
-
-    /// The `.aero` file in `dir` whose marks best match `comps` (at least `min` of them present):
-    /// (designations, file stem, share found, marks missing). Vehicles don't carry their file name.
-    pub fn best_match(dir: &std::path::Path, comps: &[Comp], min: f64) -> Option<(Designations, String, f64, usize)> {
-        let mut best: Option<(Designations, String, f64, usize)> = None;
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.extension().is_none_or(|x| x != "aero") {
-                continue;
-            }
-            let Ok(t) = std::fs::read_to_string(&p) else { continue };
-            let d = Designations::parse(&t);
-            let Some((score, missing)) = d.match_score(comps) else { continue };
-            if score >= min && best.as_ref().is_none_or(|b| score > b.2) {
-                best = Some((d, p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), score, missing));
-            }
-        }
-        best
-    }
-
-    pub fn to_text(&self) -> String {
-        let mut lines = vec!["# stormworks_aero designations: grid positions of components".to_string()];
-        let mut w: Vec<_> = self.wings.iter().collect();
-        w.sort();
-        lines.extend(w.iter().map(|p| format!("wing {} {} {}", p[0], p[1], p[2])));
-        let mut r: Vec<_> = self.roles.iter().filter(|(_, r)| **r != Role::None).collect();
-        r.sort_by_key(|(p, _)| **p);
-        lines.extend(r.iter().map(|(p, r)| format!("role {} {} {} {}", r.name(), p[0], p[1], p[2])));
-        let id = |i: usize| crate::wing::AEROFOILS[i.min(crate::wing::AEROFOILS.len() - 1)].id;
-        let mut sp: Vec<_> = self.splits.iter().collect();
-        sp.sort();
-        lines.extend(sp.iter().map(|p| format!("split {} {} {}", p[0], p[1], p[2])));
-        if self.default_foil != 0 {
-            lines.push(format!("foil_default {}", id(self.default_foil)));
-        }
-        let mut f: Vec<_> = self.foils.iter().collect();
-        f.sort_by_key(|(p, _)| **p);
-        lines.extend(f.iter().map(|(p, a)| format!("foil {} {} {} {}", id(**a), p[0], p[1], p[2])));
-        lines.join("\n") + "\n"
-    }
+    /// Per-vehicle settings (None: the global one): plugin flight model, vortex ring state.
+    pub fly: Option<bool>,
+    pub vrs: Option<bool>,
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
@@ -146,7 +54,9 @@ fn wing_groups(grid: &Grid, panel_of: &[usize], n: usize, joins: &dyn Fn(usize, 
         }
         let at = grid.cell(c);
         for d in [[1, 0, 0], [0, 1, 0], [0, 0, 1]] {
-            let Some(b) = grid.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]).map(|j| panel_of[j]) else { continue };
+            let Some(b) = grid.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]).map(|j| panel_of[j]) else {
+                continue;
+            };
             if b != usize::MAX && joins(a, b) {
                 let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
                 parent[ra] = rb;
@@ -164,7 +74,11 @@ pub fn measure_step(dt: f64, dx: V3, v: V3) -> f64 {
         return dt; // under 2 m/s the ratio is noise
     }
     let raw = dx.dot(v) / v2;
-    if (0.002..0.25).contains(&raw) { dt + (raw - dt) * 0.2 } else { dt }
+    if (0.002..0.25).contains(&raw) {
+        dt + (raw - dt) * 0.2
+    } else {
+        dt
+    }
 }
 
 /// Ground effect factor on induced drag (McCormick): φ = (16h/b)² / (1 + (16h/b)²) for a wing of span `b`
@@ -176,7 +90,6 @@ pub fn ground_effect(h: f64, span: f64) -> f64 {
     let x = (16.0 * h.max(0.0) / span).powi(2);
     x / (1.0 + x)
 }
-
 
 /// A vehicle body's pose and motion in the world, for `Model::live_forces`.
 /// World point of a model point: `(grid metres - origin)·rot + trans` (rows of `rot` are the
@@ -303,6 +216,70 @@ pub struct Coeffs {
     pub body_cd: f64,
 }
 
+/// Which live angle of the game deflects a panel (`flight::live_angle`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LiveSrc {
+    /// Solid rocket fin pair A (else C).
+    Rocket { a: bool },
+    /// Type-18 fin / control surface (`comp+0x274`).
+    Rudder,
+}
+
+/// A panel the game deflects live: component index, angle source, and the sign turning the
+/// game's angle into this panel's deflection (`panel_forces`).
+#[derive(Clone, Copy, Debug)]
+pub struct FinLive {
+    pub comp: usize,
+    pub src: LiveSrc,
+    pub sign: f64,
+}
+
+/// Sign of a game rotation about `axis` (part frame) as this panel's deflection: turn the chord
+/// and see which way it tilts. `after_mirror`: the game turns the mesh after its mirror flags
+/// (rudder_draw `v·F·R·C`) rather than before (solid_rocket_draw `v·R·F·C`). 0 = no tilt.
+fn live_sign(c: &Comp, p: &Panel, axis: V3, after_mirror: bool) -> f64 {
+    let lin = |v: V3| c.part_to_aero(v) - c.part_to_aero(V3::ZERO);
+    let m = if after_mirror { c.mirror } else { 0 };
+    let flip = |v: V3| v3(if m & 1 != 0 { -v.x } else { v.x }, if m & 2 != 0 { -v.y } else { v.y }, if m & 4 != 0 { -v.z } else { v.z });
+    let e = [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)];
+    let u_part = e.iter().fold(V3::ZERO, |a, &ei| a + ei * lin(ei).dot(p.u));
+    let tilt = lin(flip(game_axis_angle(flip(u_part), axis, 0.01))).dot(p.n);
+    if tilt.abs() < 1e-6 {
+        0.0
+    } else {
+        -tilt.signum()
+    }
+}
+
+/// A rocket fin piece (part frame; rocket axis y) that is a grid fin, its lattice face across the
+/// flow: the same points with the face's sideways width turned to run along the rocket axis, a
+/// planar fin of the face's area (the lattice's lift acts across the face like a planar fin's).
+/// None for a planar fin, which lies along the axis already.
+fn grid_face(pts: &[V3]) -> Option<Vec<V3>> {
+    let n = pts.len().max(1) as f64;
+    let mid = pts.iter().fold(V3::ZERO, |a, &p| a + p) * (1.0 / n);
+    let y = v3(0.0, 1.0, 0.0);
+    let r = v3(mid.x, 0.0, mid.z).norm();
+    let w = y.cross(r);
+    let span = |d: V3| pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.dot(d)), hi.max(p.dot(d))));
+    let ((y0, y1), (w0, w1)) = (span(y), span(w));
+    if !(r.len() > 0.5 && y1 - y0 < 0.5 * (w1 - w0)) {
+        return None;
+    }
+    let (ym, wm) = ((y0 + y1) * 0.5, (w0 + w1) * 0.5);
+    Some(pts.iter().map(|&p| r * p.dot(r) + w * wm + y * (ym + p.dot(w) - wm)).collect())
+}
+
+/// The game's `mat4_set_axis_angle_rotation` 0x179850 applied as a row vector (p·M).
+fn game_axis_angle(p: V3, a: V3, t: f64) -> V3 {
+    let (s, c) = t.sin_cos();
+    let k = 1.0 - c;
+    let r0 = v3(a.x * a.x * k + c, a.x * a.y * k + a.z * s, a.x * a.z * k - a.y * s);
+    let r1 = v3(a.x * a.y * k - a.z * s, a.y * a.y * k + c, a.y * a.z * k + a.x * s);
+    let r2 = v3(a.x * a.z * k + a.y * s, a.y * a.z * k - a.x * s, a.z * a.z * k + c);
+    r0 * p.x + r1 * p.y + r2 * p.z
+}
+
 pub struct Model {
     pub comps: Vec<Comp>,
     pub grid: Grid,
@@ -314,6 +291,15 @@ pub struct Model {
     pub wing_of: Vec<usize>,
     /// Panel marked as a separate wing (`Designations::splits`).
     pub separate: Vec<bool>,
+    /// Per panel: the rocket fin it is, deflected live by the game (`flight::fin_angle`).
+    pub fin_live: Vec<Option<FinLive>>,
+    /// Per panel: the component of a missile fin made from its mesh (default section
+    /// `Designations::default_fin`). These panels are not in `panel_of`: they share their cells
+    /// with the part's body, which is not a wing.
+    pub fin_comp: Vec<Option<u32>>,
+    /// Component -> its first fin panel, and whether its fins are separate moving solids
+    /// (`Grid::moving`; else the whole part stands for them in the views).
+    pub fin_of: HashMap<u32, (usize, bool)>,
     pub mass: f64,
     pub com: V3,
     /// Ixx, Iyy, Izz, Ixy, Iyz, Ixz about the CoM, body frame, kg·m².
@@ -321,9 +307,186 @@ pub struct Model {
     pub s_ref: f64,
     pub mac_ref: f64,
     pub b_ref: f64,
+    /// Air propellers and rotors the plugin flies (`prop.rs`).
+    pub props: Vec<PropUnit>,
 }
 
+/// One propeller or rotor part.
+#[derive(Clone, Debug)]
+pub struct PropUnit {
+    pub comp: usize,
+    pub body: u32,
+    /// Blade-plane centre and spin axis, the part's x and z axes (cyclic): aero body frame.
+    pub hub: V3,
+    pub axis: V3,
+    pub ex: V3,
+    pub ez: V3,
+    /// Spin for positive shaft speed: mirrored parts turn the other way (`force_emitter_draw`).
+    pub spin: f64,
+    pub def: crate::defs::PropDef,
+}
+
+/// A propeller's live state, read from the game each step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PropLive {
+    /// Shaft speed (game units: the blades turn `w · rotation_speed` rev/s).
+    pub w: f64,
+    /// Blade pitch −1..1 (blade angle 0.75·pitch rad, as drawn) and the cyclic inputs.
+    pub pitch: f64,
+    pub cyclic: [f64; 2],
+    pub blades: u32,
+    pub length: f64,
+    pub reversed: bool,
+    /// The hinge turns the hub against the shaft speed's sign (`blur::hinge_against`).
+    pub flip: bool,
+}
+
+/// A propeller's forces this step (world frame).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PropOut {
+    pub force: V3,
+    pub at: V3,
+    /// Moment about the hub: in-plane (P-factor, hub stiffness) and the air's torque on the spin axis.
+    pub moment: V3,
+    pub axial: V3,
+    pub thrust: f64,
+    /// The air's torque against the spin (N·m) and the spin direction it was computed for.
+    pub torque: f64,
+    pub spin: f64,
+    pub omega: f64,
+    /// Quasi-steady inflow (m/s) the disc's inflow lags towards, its time constant (s), and the
+    /// vortex ring depth (0..1).
+    pub v_target: f64,
+    pub tau: f64,
+    pub vrs: f64,
+    /// Blade angle at 0.75 R (rad, collective only) and the stalled share of the blades (0..1).
+    pub blade_angle: f64,
+    pub stalled: f64,
+}
+
+/// Shaft inertia per unit of the game's slot mass, kg·m². The shaft network conserves slot
+/// mass × speed (`vehicle_shaft_network_step` 0x4C02A0), so a torque removes `Q·dt / (2π·I)`.
+/// shortcut: picked so a large engine (mass 100) gives about 0.7 MW to a rotor at 5.4 RPS;
+/// retune from players' readings.
+const SHAFT_INERTIA: f64 = 1.0;
+
+/// Cyclic blade angle per unit input, rad.
+const CYCLIC_RAD: f64 = 0.2;
+
 impl Model {
+    /// Shaft speed drop per tick per N·m of our blades' torque: the part's slot mass is
+    /// `max_force/1000 · blades/8` (blade parts), shaft torque = blade torque × `rotation_speed`.
+    pub fn prop_load(&self, k: usize, blades: u32) -> f64 {
+        let d = &self.props[k].def;
+        let mass = d.max_force / 1000.0 * blades.clamp(2, 8) as f64 / 8.0;
+        if mass > 0.0 {
+            d.rotation_speed / (60.0 * 2.0 * PI * SHAFT_INERTIA * mass)
+        } else {
+            0.0
+        }
+    }
+
+    /// The pitch input (−1..1, blade angle 0.75·p rad) where part `k` makes the most static
+    /// sea-level thrust at blade speed `rps`: the first peak (attached flow), not the deep-stall
+    /// rise near 45°. Returns (pitch, thrust N, power W, blade stall share there).
+    pub fn prop_peak(&self, k: usize, blades: u32, length: f64, rps: f64) -> Option<(f64, f64, f64, f64)> {
+        let u = &self.props[k];
+        if !(rps > 0.0) || u.def.rotation_speed <= 0.0 {
+            return None;
+        }
+        let lb = LiveBody {
+            origin: V3::ZERO,
+            rot: [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)],
+            trans: v3(0.0, 100.0, 0.0),
+            com: V3::ZERO,
+            vel: V3::ZERO,
+            omega: V3::ZERO,
+            wind: V3::ZERO,
+        };
+        let at = |pitch: f64| {
+            let s = PropLive { w: rps / u.def.rotation_speed, pitch, cyclic: [0.0; 2], blades, length, reversed: false, flip: false };
+            let mut v = 0.0;
+            let mut out = self.prop_live(k, &lb, &s, v, false);
+            for _ in 0..60 {
+                v += 0.3 * (out.v_target - v);
+                out = self.prop_live(k, &lb, &s, v, false);
+            }
+            out
+        };
+        let mut best: Option<(f64, PropOut)> = None;
+        for i in 1..=100 {
+            let p = i as f64 * 0.01;
+            let o = at(p);
+            match &best {
+                Some((_, b)) if o.thrust < 0.98 * b.thrust => break,
+                Some((_, b)) if o.thrust <= b.thrust => {}
+                _ => best = Some((p, o)),
+            }
+        }
+        best.map(|(p, o)| (p, o.thrust, o.torque * o.omega, o.stalled))
+    }
+
+    /// Blade geometry at the part's blade count and length.
+    pub fn prop_geom(&self, k: usize, blades: u32, length: f64) -> crate::prop::Prop {
+        let d = &self.props[k].def;
+        let s = crate::defs::PropDef::scale(length);
+        crate::prop::Prop {
+            radius: d.radius * s,
+            hub: d.root * s,
+            chord: d.chord * s,
+            blades: blades.clamp(2, 8),
+            foil: if d.rotor() { 4 } else { 2 }, // NACA 0012 rotors, NACA 2412 propellers
+            propeller: !d.rotor(),
+        }
+    }
+
+    /// Forces of propeller `k` on body pose `lb` at mean inflow `v` (m/s).
+    pub fn prop_live(&self, k: usize, lb: &LiveBody, s: &PropLive, v: f64, vrs: bool) -> PropOut {
+        let u = &self.props[k];
+        let geom = self.prop_geom(k, s.blades, s.length);
+        let at = lb.to_world(u.hub);
+        let axis = lb.dir_to_world(u.axis).norm() * if s.reversed { -1.0 } else { 1.0 };
+        let air = lb.wind - (lb.vel + lb.omega.cross(at - lb.com));
+        let atm = atmosphere(at.y);
+        // Turning backwards, the trailing edge leads: the blade angle from the new motion is π − β.
+        let back = s.w < 0.0;
+        let spin = u.spin * if back { -1.0 } else { 1.0 } * if s.flip { -1.0 } else { 1.0 };
+        let beta = 0.75 * s.pitch.clamp(-1.0, 1.0);
+        let mut cyclic = V3::ZERO;
+        if u.def.rotor() {
+            let t = lb.dir_to_world(u.ex) * s.cyclic[0] + lb.dir_to_world(u.ez) * s.cyclic[1];
+            cyclic = axis.cross(t) * (CYCLIC_RAD * spin * if back { -1.0 } else { 1.0 });
+        }
+        let flow = crate::prop::PropFlow {
+            axis,
+            spin,
+            omega: 2.0 * PI * s.w.abs() * u.def.rotation_speed,
+            pitch: if back { PI - beta } else { beta },
+            cyclic,
+            air,
+            rho: atm.rho,
+            a: atm.a,
+        };
+        // "Coaxial" rotors are one disc with a power output on top for a second rotor.
+        let f = geom.forces(&flow, v);
+        let (v_target, vrs_depth, tau) = geom.inflow(&flow, f.thrust, vrs);
+        PropOut {
+            force: f.force,
+            at,
+            moment: f.moment,
+            axial: axis * f.moment.dot(axis),
+            thrust: f.thrust,
+            torque: f.torque,
+            spin,
+            omega: flow.omega,
+            v_target,
+            tau,
+            vrs: vrs_depth,
+            blade_angle: beta,
+            stalled: f.stalled,
+        }
+    }
+
     pub fn build(comps: Vec<Comp>, lib: &mut Library, des: &Designations) -> Model {
         let grid = Grid::build(&comps, lib);
         let (mass, com, inertia) = mass_properties(&comps, &grid, lib);
@@ -333,10 +496,19 @@ impl Model {
         let index: HashMap<[i32; 3], u32> = comps.iter().enumerate().map(|(i, c)| (c.pos, i as u32)).collect();
         let mut is_cs = vec![false; comps.len()];
         let mut is_wing = vec![false; comps.len()];
+        // Parts whose flat mesh pieces lift as their own panels (missile fins far below voxel
+        // size): rocket fins always, other non-block parts once marked as wing. Vanilla wing
+        // parts stay voxel panels, so they keep joining into whole wings.
+        let mut plates: Vec<(usize, Arc<crate::defs::Def>)> = Vec::new();
         for (i, c) in comps.iter().enumerate() {
             if let Some(d) = lib.get(&c.def) {
                 is_cs[i] = d.is_control_surface();
                 is_wing[i] = d.is_wing();
+                let marked = des.wings.contains(&c.pos) && d.type_ != crate::defs::TYPE_RUDDER && !d.block;
+                if !d.plates.is_empty() && (d.fins || marked) {
+                    plates.push((i, d.clone()));
+                    continue;
+                }
             }
             is_wing[i] |= des.wings.contains(&c.pos);
         }
@@ -373,14 +545,60 @@ impl Model {
                 .find_map(|o| des.foils.get(&comps[o as usize].pos).copied())
                 .unwrap_or(des.default_foil);
         }
-        let mut panel_of = vec![usize::MAX; grid.fill.len()];
-        for (i, p) in panels.iter().enumerate() {
+        // Voxel panels replace the skin of their cells; plate panels share cells with the body.
+        let mut no_skin = vec![false; grid.fill.len()];
+        for p in &panels {
             for &c in &p.cells {
-                panel_of[c] = i;
+                no_skin[c] = true;
             }
         }
-
-        let no_skin: Vec<bool> = panel_of.iter().map(|&p| p != usize::MAX).collect();
+        // Vanilla fins and control surfaces: one panel set per component (`Key::Comp`).
+        let mut fin_live: Vec<Option<FinLive>> = panels
+            .iter()
+            .map(|p| {
+                let o = *grid.owner.get(*p.cells.first()?)? as usize;
+                let d = lib.get(&comps.get(o)?.def).filter(|_| is_cs[o])?;
+                let sign = live_sign(&comps[o], p, d.hinge, true);
+                (sign != 0.0).then_some(FinLive { comp: o, src: LiveSrc::Rudder, sign })
+            })
+            .collect();
+        let mut fin_comp: Vec<Option<u32>> = vec![None; panels.len()];
+        for (i, d) in &plates {
+            let c = &comps[*i];
+            for (piece, ctrl) in &d.plates {
+                let raw: Vec<V3> = piece.iter().flat_map(|t| t.0).collect();
+                let grid_fin = ctrl.is_some() && grid_face(&raw).is_some();
+                let pts: Vec<V3> = grid_face(&raw).filter(|_| grid_fin).unwrap_or(raw).into_iter().map(|p| c.part_to_aero(p)).collect();
+                // Cells the fin reaches, its part's own cell first (its body for live forces).
+                let mut cells: Vec<usize> = std::iter::once(c.pos)
+                    .chain(pts.iter().map(|p| [(p.y / VOXEL_M).round() as i32, (-p.z / VOXEL_M).round() as i32, (p.x / VOXEL_M).round() as i32]))
+                    .filter_map(|g| grid.index(g))
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                cells.retain(|x| seen.insert(*x));
+                if let Some(mut p) = crate::wing::plate_panel(&pts, cells, Role::None, com) {
+                    p.foil = if grid_fin {
+                        crate::wing::GRID
+                    } else {
+                        des.foils.get(&c.pos).copied().unwrap_or(des.default_fin.unwrap_or(crate::wing::FIN_DEFAULT))
+                    };
+                    let live = ctrl.map(|f| FinLive { comp: *i, src: LiveSrc::Rocket { a: f.a }, sign: live_sign(c, &p, f.axis, false) });
+                    panels.push(p);
+                    fin_live.push(live);
+                    fin_comp.resize(panels.len() - 1, None);
+                    fin_comp.push(Some(*i as u32));
+                }
+            }
+        }
+        fin_comp.resize(panels.len(), None);
+        let mut panel_of = vec![usize::MAX; grid.fill.len()];
+        for (i, p) in panels.iter().enumerate().filter(|(i, _)| fin_comp[*i].is_none()) {
+            for &c in &p.cells {
+                if panel_of[c] == usize::MAX {
+                    panel_of[c] = i;
+                }
+            }
+        }
         let body = BodyAero::build(&grid, &no_skin);
 
         let s: f64 = panels.iter().map(|p| p.area).sum();
@@ -402,9 +620,45 @@ impl Model {
             .iter()
             .map(|p| p.cells.iter().map(|&c| grid.owner[c]).any(|o| (o as usize) < comps.len() && des.splits.contains(&comps[o as usize].pos)))
             .collect();
-        let joins = |a: usize, b: usize| separate[a] == separate[b] && (body_of[a] == body_of[b] || panels[a].role != Role::None || panels[b].role != Role::None);
-        let wing_of = wing_groups(&grid, &panel_of, panels.len(), &joins);
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, mass, com, inertia, s_ref, mac_ref, b_ref }
+        let joins =
+            |a: usize, b: usize| separate[a] == separate[b] && (body_of[a] == body_of[b] || panels[a].role != Role::None || panels[b].role != Role::None);
+        let mut wing_of = wing_groups(&grid, &panel_of, panels.len(), &joins);
+        // One part's fins are one wing (one click sets them all).
+        let mut fin_of: HashMap<u32, (usize, bool)> = HashMap::new();
+        for (j, c) in fin_comp.iter().enumerate() {
+            if let Some(c) = *c {
+                let first = fin_of.entry(c).or_insert((j, false)).0;
+                wing_of[j] = wing_of[first];
+            }
+        }
+        for &k in &grid.moving {
+            if let Some(f) = fin_of.get_mut(&grid.solids[k].0) {
+                f.1 = true;
+            }
+        }
+        let props = comps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let def = lib.get(&c.def)?.prop.clone()?;
+                let r = c.rot.map(|v| v as f64);
+                // Part frame -> grid: p·R (+ voxel position), as `voxel::place`.
+                let dir = |p: V3| v3(p.x * r[0] + p.y * r[3] + p.z * r[6], p.x * r[1] + p.y * r[4] + p.z * r[7], p.x * r[2] + p.y * r[5] + p.z * r[8]);
+                let pos = v3(c.pos[0] as f64, c.pos[1] as f64, c.pos[2] as f64) * VOXEL_M;
+                let det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
+                Some(PropUnit {
+                    comp: i,
+                    body: c.body,
+                    hub: grid_to_aero(pos + dir(v3(0.0, def.blade_height, 0.0))),
+                    axis: grid_to_aero(dir(def.axis)),
+                    ex: grid_to_aero(dir(v3(1.0, 0.0, 0.0))),
+                    ez: grid_to_aero(dir(v3(0.0, 0.0, 1.0))),
+                    spin: if det < 0.0 { -1.0 } else { 1.0 },
+                    def,
+                })
+            })
+            .collect();
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -475,8 +729,11 @@ impl Model {
     /// body `b` (the `Comp::body` index); `main` carries the fuselage forces. World frame:
     /// metres, y up. Returns forces at world points and torques, per body.
     /// `ground[i]`: ground-effect factor φ of panel i (1 = none, see `ground_effect`); empty = no ground effect.
-    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64]) -> Vec<LiveForce> {
-        let Some(mb) = bodies.get(main) else { return Vec::new() };
+    /// `deflect`: live control deflection per panel, radians (empty = none).
+    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64], deflect: &[f64]) -> Vec<LiveForce> {
+        let Some(mb) = bodies.get(main) else {
+            return Vec::new();
+        };
         let com_w = mb.to_world(self.com);
         let air = |b: &LiveBody, p: V3| b.vel + b.omega.cross(p - b.com) - b.wind;
         let alt = com_w.y;
@@ -520,7 +777,8 @@ impl Model {
             .collect();
         let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m, gamma: at.gamma };
         let zero = vec![0.0; world.len()];
-        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p), &zero, stall);
+        let deflect = if deflect.len() == world.len() { deflect } else { &zero };
+        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p), deflect, stall);
         for (f, &b) in pf.iter().zip(&owner) {
             out.push(LiveForce { body: b, force: f.force, at: f.at, torque: V3::ZERO });
         }
@@ -529,11 +787,7 @@ impl Model {
 
     /// Body (`Comp::body`) a panel's cells belong to.
     pub fn panel_body(&self, p: &Panel) -> usize {
-        p.cells
-            .iter()
-            .map(|&c| self.grid.owner[c])
-            .find(|&o| (o as usize) < self.comps.len())
-            .map_or(0, |o| self.comps[o as usize].body as usize)
+        p.cells.iter().map(|&c| self.grid.owner[c]).find(|&o| (o as usize) < self.comps.len()).map_or(0, |o| self.comps[o as usize].body as usize)
     }
 
     pub fn fresh_stall(&self) -> Vec<f64> {
@@ -731,12 +985,7 @@ impl Stability {
     pub fn simulate(&self, lateral: bool, x0: [f64; 4], end: f64, dt: f64) -> (Vec<f64>, Vec<[f64; 4]>) {
         let s = self;
         let a: [[f64; 4]; 4] = if !lateral {
-            [
-                [s.zw, s.zu, s.zq + s.u0, 0.0],
-                [s.xw, s.xu, s.xq, -G],
-                [s.mw, s.mu, s.mq, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ]
+            [[s.zw, s.zu, s.zq + s.u0, 0.0], [s.xw, s.xu, s.xq, -G], [s.mw, s.mu, s.mq, 0.0], [0.0, 0.0, 1.0, 0.0]]
         } else {
             let [ix, _, iz, _, _, ixz] = s.inertia;
             let d = 1.0 - ixz * ixz / (ix * iz);
@@ -820,6 +1069,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grid_fins_lift_across_their_face() {
+        // A modded grid fin rocket (lattice faces across the flow): four live planar-equivalent
+        // panels of the face's area, normal across the rocket axis, with the grid section.
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
+        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let name = "solid_rocket_grid_fin_small";
+        if lib.get(name).is_none() {
+            return;
+        }
+        // Rocket axis (part y) pointing forward: grid z, aero x.
+        let comp = Comp { def: name.into(), pos: [0, 0, 0], rot: [1, 0, 0, 0, 0, 1, 0, -1, 0], body: 0, mirror: 0, prop: None };
+        let m = Model::build(vec![comp], &mut lib, &Designations::default());
+        let axis = v3(1.0, 0.0, 0.0);
+        let fins: Vec<(&Panel, &FinLive)> = m.panels.iter().zip(&m.fin_live).filter_map(|(p, f)| Some((p, f.as_ref()?))).collect();
+        assert_eq!(fins.len(), 4);
+        // The rocket body is no wing: fin panels stay out of the cell map, the fins are their own solids.
+        assert!(m.panel_of.iter().all(|&p| p == usize::MAX || m.fin_comp[p].is_none()));
+        assert_eq!(m.fin_of.get(&0).map(|f| f.1), Some(true));
+        for (p, f) in fins {
+            assert_eq!(p.foil, crate::wing::GRID);
+            assert!(p.n.dot(axis).abs() < 0.05 && p.u.dot(axis).abs() > 0.95, "normal {:?} chord {:?}", p.n, p.u);
+            assert!((0.02..0.035).contains(&p.area), "face area {}", p.area);
+            assert!(f.sign != 0.0);
+        }
+    }
+
+    #[test]
+    fn vanilla_control_surfaces_deflect_live() {
+        // Every vanilla control-surface panel of the saved planes reads its live angle, and the
+        // mirror handling holds: mirroring along the hinge keeps the turn, across it reverses it
+        // (F·R(a,θ)·F = R(F·a, det F·θ)).
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
+        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let mut checked = 0;
+        for name in ["f4e", "beaver", "bf109", "ar234b2", "c27j"] {
+            let Ok(text) = std::fs::read_to_string(appdata.join(format!("data/vehicles/{name}.xml"))) else {
+                continue;
+            };
+            let m = Model::build(crate::vehicle::parse_vehicle_xml(&text), &mut lib, &Designations::default());
+            for (p, f) in m.panels.iter().zip(&m.fin_live) {
+                let o = m.grid.owner[p.cells[0]] as usize;
+                let d = lib.get(&m.comps[o].def).unwrap();
+                if !d.is_control_surface() {
+                    assert!(!matches!(f, Some(FinLive { src: LiveSrc::Rudder, .. })), "{name}: live non-control panel");
+                    continue;
+                }
+                let f = f.unwrap_or_else(|| panic!("{name}: control surface {} has no live angle", m.comps[o].def));
+                let h = [d.hinge.x, d.hinge.y, d.hinge.z];
+                let along = (0..3).find(|&k| h[k] != 0.0).unwrap();
+                let c = &m.comps[o];
+                let with = |bit: i32| live_sign(&Comp { mirror: c.mirror ^ bit, ..c.clone() }, p, d.hinge, true);
+                assert_eq!(with(0), f.sign);
+                assert_eq!(with(1 << along), f.sign, "{name}: mirror along the hinge");
+                assert_eq!(with(1 << ((along + 1) % 3)), -f.sign, "{name}: mirror across the hinge");
+                checked += 1;
+            }
+        }
+        if checked > 0 {
+            eprintln!("{checked} live control-surface panels");
+        }
+    }
+
+    #[test]
+    fn rocket_fin_deflection_matches_the_game_rotation() {
+        // Saved AIM-9: each live rocket-fin panel, deflected by sign·α, must face where the game's
+        // own rotation of the fin mesh (p·M about its axis, in the part frame) puts it.
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
+        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let Ok(text) = std::fs::read_to_string(appdata.join("data/vehicles/aim9.xml")) else {
+            return;
+        };
+        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let m = Model::build(crate::vehicle::parse_vehicle_xml(&text), &mut lib, &Designations::default());
+        let mut checked = 0;
+        for (p, f) in m.panels.iter().zip(&m.fin_live) {
+            let Some(f) = f else { continue };
+            let c = &m.comps[f.comp];
+            let d = lib.get(&c.def).unwrap();
+            let alpha = 0.2;
+            // The fin piece whose rest panel is this one (same normal and centroid).
+            let fit = |rot: f64, ctrl: crate::defs::FinCtrl, piece: &[crate::defs::Tri]| {
+                let pts: Vec<V3> = piece.iter().flat_map(|t| t.0).map(|q| c.part_to_aero(game_axis_angle(q, ctrl.axis, rot))).collect();
+                crate::wing::plate_panel(&pts, vec![0], Role::None, m.com).unwrap()
+            };
+            let (piece, ctrl) = d
+                .plates
+                .iter()
+                .filter_map(|(t, k)| Some((t, (*k)?)))
+                .find(|(t, k)| f.src == LiveSrc::Rocket { a: k.a } && (fit(0.0, *k, t).centroid - p.centroid).len() < 1e-6)
+                .unwrap();
+            let truth = fit(alpha, ctrl, piece).n;
+            let ours = |t: f64| (p.n * t.cos() + p.u * t.sin()).norm();
+            let (good, bad) = (ours(f.sign * alpha).dot(truth).abs(), ours(-f.sign * alpha).dot(truth).abs());
+            assert!(good > 0.999 && good > bad, "fin {checked}: ours {good} vs flipped {bad}");
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the AIM-9's one finned rocket has 4 live fins");
+    }
+
+    #[test]
     fn step_from_motion() {
         let v = v3(100.0, -5.0, 20.0);
         let mut dt = 1.0 / 60.0;
@@ -827,19 +1181,22 @@ mod tests {
             dt = measure_step(dt, v * 0.025, v); // the game slowed to 40 steps per game second
         }
         assert!((dt - 0.025).abs() < 1e-4);
-        assert_eq!(measure_step(dt, v3(0.01, 0.0, 0.0), v3(0.5, 0.0, 0.0)), dt); // too slow to measure
-    }
-
-    #[test]
-    fn separate_wing_marks_round_trip() {
-        let d = Designations::parse("wing 1 2 3\nsplit 1 2 3\nsplit -4 0 7\n");
-        assert_eq!(d.splits.len(), 2);
-        assert!(Designations::parse(&d.to_text()) == d);
+        assert_eq!(measure_step(dt, v3(0.01, 0.0, 0.0), v3(0.5, 0.0, 0.0)), dt);
+        // too slow to measure
     }
 
     #[test]
     fn touching_panels_form_one_wing() {
-        let grid = Grid { min: [0, 0, 0], dims: [5, 1, 1], fill: vec![1.0; 5], owner: vec![0; 5], solids: Vec::new(), missing: Vec::new() };
+        let grid = Grid {
+            min: [0, 0, 0],
+            dims: [5, 1, 1],
+            fill: vec![1.0; 5],
+            owner: vec![0; 5],
+            solids: Vec::new(),
+            moving: Default::default(),
+            missing: Vec::new(),
+            blades: Default::default(),
+        };
         let w = wing_groups(&grid, &[0, 1, usize::MAX, 2, 2], 3, &|_, _| true);
         assert_eq!(w[0], w[1]);
         assert_ne!(w[0], w[2]);
@@ -862,25 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_marks_lower_the_score() {
-        let comp = |pos| Comp { def: String::new(), pos, rot: crate::vehicle::IDENTITY, body: 0 };
-        let mut d = Designations::default();
-        d.wings.extend([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]);
-        assert_eq!(d.match_score(&[comp([0, 0, 0]), comp([1, 0, 0]), comp([2, 0, 0])]), Some((0.75, 1)));
-        assert_eq!(Designations::default().match_score(&[]), None);
-        assert_eq!(d.retain_present(&[comp([0, 0, 0])]), 3);
-        assert_eq!(d.wings.len(), 1);
-    }
-
-    #[test]
-    fn designations_round_trip() {
-        let mut d = Designations::default();
-        d.wings.insert([1, -2, 3]);
-        d.roles.insert([0, 0, -9], Role::Pitch);
-        d.foils.insert([4, 0, 1], 3);
-        d.default_foil = 1;
-        let back = Designations::parse(&d.to_text());
-        assert!(back == d);
+    fn atmosphere_curve() {
         assert!((atmosphere(0.0).rho - 1.225).abs() < 1e-9);
         assert!((atmosphere(10_000.0).rho - 0.3143).abs() < 0.001, "Stormworks curve at 10 km");
         assert_eq!(atmosphere(41_000.0).rho, 0.0);

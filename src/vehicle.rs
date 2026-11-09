@@ -14,6 +14,20 @@ pub struct Comp {
     pub rot: [i32; 9],
     /// Body (sub-grid) index within this vehicle; 0 is the first body.
     pub body: u32,
+    /// Mirror flags (1 x, 2 y, 4 z), already folded into `rot`; kept for moving meshes the game
+    /// turns after mirroring (`model::live_sign`).
+    pub mirror: i32,
+    /// Propeller / rotor settings (`<o blade_count blade_pitch blade_length>`); None for other
+    /// parts, and fields the vehicle leaves at the part's default.
+    pub prop: Option<PropSet>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PropSet {
+    pub blades: Option<u32>,
+    /// Blade pitch −1..1 (setting plus the live collective input).
+    pub pitch: Option<f64>,
+    pub length: Option<f64>,
 }
 
 pub const IDENTITY: [i32; 9] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -21,6 +35,18 @@ pub const IDENTITY: [i32; 9] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 impl Comp {
     /// Grid cell of a definition-local voxel offset (offset as a row vector times `rot`;
     /// the same convention the infrared plugin verified in game).
+    /// Part-frame point in metres -> aero body frame (x fwd, y right, z down), metres.
+    pub fn part_to_aero(&self, p: crate::math::V3) -> crate::math::V3 {
+        let r = self.rot.map(|v| v as f64);
+        let (x, y, z) = (p.x * 4.0, p.y * 4.0, p.z * 4.0); // voxel units
+        let g = [
+            self.pos[0] as f64 + r[0] * x + r[3] * y + r[6] * z,
+            self.pos[1] as f64 + r[1] * x + r[4] * y + r[7] * z,
+            self.pos[2] as f64 + r[2] * x + r[5] * y + r[8] * z,
+        ];
+        crate::math::v3(g[2] * 0.25, g[0] * 0.25, -g[1] * 0.25)
+    }
+
     pub fn cell(&self, o: [i32; 3]) -> [i32; 3] {
         let r = &self.rot;
         [
@@ -57,7 +83,13 @@ pub fn valid_rotation(r: &[i32; 9]) -> bool {
 
 /// Components of every body of a saved vehicle XML (microcontroller internals skipped).
 pub fn parse_vehicle_xml(text: &str) -> Vec<Comp> {
+    parse_vehicle_xml_marked(text).0
+}
+
+/// Components and the plugin's `aero` attribute of each (`""` when absent).
+pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
     let mut out = Vec::new();
+    let mut aero = Vec::new();
     let mut stack: Vec<&str> = Vec::new();
     let mut body: i64 = -1;
     let mut cur: Option<Comp> = None;
@@ -67,7 +99,7 @@ pub fn parse_vehicle_xml(text: &str) -> Vec<Comp> {
     for tag in xml::tags(text) {
         if tag.close {
             if tag.name == "c" && ends(&stack, &["body", "components", "c"]) {
-                out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), ..c }));
+                out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), mirror: flip & 7, ..c }));
             }
             if let Some(i) = stack.iter().rposition(|n| *n == tag.name) {
                 stack.truncate(i);
@@ -82,13 +114,20 @@ pub fn parse_vehicle_xml(text: &str) -> Vec<Comp> {
                     pos: [0; 3],
                     rot: IDENTITY,
                     body: body.max(0) as u32,
+                    mirror: 0,
+                    prop: None,
                 });
                 flip = tag.int0("t");
+                aero.push(tag.get("aero").unwrap_or("").to_string());
                 if tag.empty {
-                    out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), ..c }));
+                    out.extend(cur.take().map(|c| Comp { rot: flipped(c.rot, flip), mirror: flip & 7, ..c }));
                 }
             }
             "o" if ends(&stack, &["components", "c"]) => {
+                if let Some(c) = cur.as_mut() {
+                    let p = PropSet { blades: tag.num("blade_count"), pitch: tag.num("blade_pitch"), length: tag.num("blade_length") };
+                    c.prop = (p != PropSet::default()).then_some(p);
+                }
                 if let (Some(c), Some(r)) = (cur.as_mut(), tag.get("r")) {
                     let v: Vec<i32> = r.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                     if let Ok(rot) = <[i32; 9]>::try_from(v) {
@@ -109,7 +148,7 @@ pub fn parse_vehicle_xml(text: &str) -> Vec<Comp> {
             stack.push(tag.name);
         }
     }
-    out
+    (out, aero)
 }
 
 #[cfg(test)]
