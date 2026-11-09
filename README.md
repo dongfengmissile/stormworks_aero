@@ -58,20 +58,6 @@ Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil t
 | F7 | analysis window: AoA / Mach sweeps, stability derivatives, response simulation, area ruling, voxel view, the pitch / collective for each propeller and rotor's maximum thrust |
 | F9 | in flight: flight data (airspeed, Mach, AoA, Cl, Cd, L/D, thrust, air density, static margin…, and each propeller's RPS, thrust, power and vortex ring state), lift/drag arrows, CG / CoL / CoT markers, stalled blocks painted red |
 
-## In flight
-
-The plugin flight model is on by default (F7 window, Settings tab). It switches off the game's aerodynamic forces and applies its own: wings with their aerofoils, missile fins (shaped from the part's mesh; grid fins too), control surfaces (vanilla ones follow the game's own deflection, hinged sub-grids deflect by moving), fuselage lift and drag, ground effect, and Stormworks' own air density curve. Water forces are unchanged.
-
-Propellers and helicopter rotors are flown blade by blade from their shaft speed, blade count, length and pitch: they windmill and drag when unpowered, a free rotor autorotates (gyrocopters), rotors flap and take cyclic, and a driven rotor twists the airframe the other way (single main rotors need a tail rotor). The air's load on the blades slows or drives the shaft. Blade speed is the shaft's RPS (× the part's built-in ratio: 1.5 heavy rotor, 3 aircraft propeller), so set real rotor speeds (a UH-1's 324 rpm main rotor is 5.4 RPS), and they are drawn at that speed (the game draws them 12.6× slower); vanilla builds that spin rotors fast make much more lift than in the base game. "Vortex ring state" in the Settings tab (off by default) makes rotors that sink slowly, nearly straight down, lose lift into their own wake. A rotor turned backwards (negative RPS, as from a reversing gearbox) is flown as the mirror-image rotor, so a counter-rotating pair works: give it the opposite pitch, as in the base game. Fans and boat propellers keep the game's forces.
-
-A propeller or rotor's configuration panel in the workbench gets a "Blade Width" slider (25 to 200% of the part's own blade): wider blades make more thrust and absorb more power, and are drawn wider. The width is saved on the part in the vehicle file. The Rotors tab's "Shape" column picks how each one's blades are shaped: propeller (cambered, helical twist, rigid) or rotor (symmetric, gentle twist, flapping). Auto picks propeller for parts with a single pitch input or "propeller" in the name.
-
-Blade pitch input 1 is 43° of blade angle, far past stall: rotors lift most at about 0.35 collective. The F7 Rotors tab gives each one's best pitch at the shaft speed you enter (shaft RPS, as the game's sensors read it), and F9 shows the blade angle and a warning when the blades stall.
-
-"Rotor blur" (on by default) draws fast blades as a faint smear over the arc they sweep in about 1/20 s. The flight model and vortex ring settings apply to all vehicles, and the Settings tab can override them for the vehicle open in the workbench: that choice is saved in the vehicle file with its designations.
-
-In multiplayer the host flies every vehicle, so only the host needs the plugin for the physics. A client with the plugin applies no forces and shows the F9 data and arrows from the positions the host sends: speeds are averaged between updates, so the numbers step and lag a little, more for distant vehicles.
-
 ## Credits
 
 The aerodynamics are a port of FAR Continued (Ferram Aerospace Research, © ferram4 and the KSPModStewards contributors).
