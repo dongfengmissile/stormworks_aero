@@ -204,8 +204,8 @@ pub fn induced(vz: f64, vx: f64, vrs: bool) -> (f64, f64) {
 /// Zero-lift angle, lift slope (per rad) and stall angle past it (rad) at `mach`.
 fn stall_angle(foil: usize, mach: f64) -> (f64, f64, f64) {
     let f = &AEROFOILS[foil.min(AEROFOILS.len() - 1)];
-    let m = mach.min(0.95);
-    let slope = 2.0 * PI / (1.0 - m * m).max(0.1).sqrt().max(0.3);
+    // Prandtl-Glauert below Mach 1, Ackeret's 4/√(M²−1) above, capped where they would run away near Mach 1.
+    let slope = (if mach < 1.0 { 2.0 * PI } else { 4.0 } / (1.0 - mach * mach).abs().sqrt().max(1e-3)).min(10.0);
     (-f.camber_aoa(), slope, cl_max(foil, mach) / slope)
 }
 
@@ -250,6 +250,9 @@ pub fn section(foil: usize, alpha: f64, mach: f64, re: f64) -> (f64, f64) {
     if mach > 1.0 {
         cd += f.k_wave * f.t_c * f.t_c / (mach * mach - 1.0).sqrt().max(0.3);
     }
+    // Supersonic flow gives no leading-edge suction: the lift leans back by the angle of attack (wave drag
+    // due to lift, cd = cl·α), coming in from Mach 0.9 to 1.1. Without it supersonic blades thrust for free.
+    cd += ((mach - 0.9) / 0.2).clamp(0.0, 1.0) * (1.0 - w) * (cl * ae.tan()).abs();
     (cl, cd)
 }
 
@@ -577,6 +580,16 @@ mod rotors {
 
     /// Stall share: none in a normal hover, most of the outer blade past the thrust peak, and the
     /// retreating side first in fast forward flight.
+    /// Supersonic blade sections: lift slope falls (Ackeret) and the lift leans back, so L/D is about 1/α.
+    #[test]
+    fn supersonic_section_pays_for_its_lift() {
+        let a = 0.1;
+        let (cl, cd) = section(2, a, 2.0, 1e6);
+        assert!((0.15..0.4).contains(&cl) && cd > cl * a, "cl {cl} cd {cd}");
+        let (cl_sub, cd_sub) = section(2, a, 0.5, 1e6);
+        assert!(cl_sub / cd_sub > 5.0 * cl / cd);
+    }
+
     #[test]
     fn stall_share() {
         let r = Prop { blades: 2, ..rotor() };

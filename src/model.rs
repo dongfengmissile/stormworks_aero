@@ -477,20 +477,22 @@ impl Model {
         let axis = lb.dir_to_world(u.axis).norm() * if s.reversed { -1.0 } else { 1.0 };
         let air = lb.wind - (lb.vel + lb.omega.cross(at - lb.com));
         let atm = atmosphere(at.y);
-        // Turning backwards, the trailing edge leads: the blade angle from the new motion is π − β.
+        // Turning backwards (a counter-rotating rotor on a reversing gearbox) it is the mirror-image rotor:
+        // left-handed blades at the opposite pitch, so thrust follows sign(speed · pitch) as in the game.
+        // The game has no left-handed blades, so the trailing edge leading is not held against it.
         let back = s.w < 0.0;
         let spin = u.spin * if back { -1.0 } else { 1.0 } * if s.flip { -1.0 } else { 1.0 };
         let beta = 0.75 * s.pitch.clamp(-1.0, 1.0);
         let mut cyclic = V3::ZERO;
         if u.def.rotor() {
             let t = lb.dir_to_world(u.ex) * s.cyclic[0] + lb.dir_to_world(u.ez) * s.cyclic[1];
-            cyclic = axis.cross(t) * (CYCLIC_RAD * spin * if back { -1.0 } else { 1.0 });
+            cyclic = axis.cross(t) * (CYCLIC_RAD * spin);
         }
         let flow = crate::prop::PropFlow {
             axis,
             spin,
             omega: 2.0 * PI * s.w.abs() * u.def.rotation_speed,
-            pitch: if back { PI - beta } else { beta },
+            pitch: if back { -beta } else { beta },
             cyclic,
             air,
             rho: atm.rho,
@@ -511,7 +513,7 @@ impl Model {
             v_target,
             tau,
             vrs: vrs_depth,
-            blade_angle: beta,
+            blade_angle: flow.pitch,
             stalled: f.stalled,
         }
     }
