@@ -21,7 +21,14 @@ pub struct Mark {
     pub default_fin: Option<usize>,
     pub fly: Option<bool>,
     pub vrs: Option<bool>,
+    /// Propeller/rotor blade width, x the part's own (`BLADE_WIDTH_RANGE`).
+    pub blade_width: Option<f32>,
+    /// Blade shape chosen for a propeller/rotor: true propeller, false rotor (None: auto).
+    pub airscrew: Option<bool>,
 }
+
+/// Blade width multiplier range.
+pub const BLADE_WIDTH_RANGE: (f32, f32) = (0.25, 2.0);
 
 fn foil_id(i: usize) -> &'static str {
     AEROFOILS[i.min(AEROFOILS.len() - 1)].id
@@ -33,7 +40,7 @@ impl Mark {
     }
 
     /// Attribute value: space-separated `w`, `s`, `r:<role>`, `f:<foil>`, `fd:<foil>`, `ff:<foil>`,
-    /// `fm:on|off`, `vrs:on|off`.
+    /// `fm:on|off`, `vrs:on|off`, `bw:<width>`, `sh:prop|rotor`.
     pub fn encode(&self) -> String {
         let mut t: Vec<String> = Vec::new();
         if self.wing {
@@ -49,6 +56,8 @@ impl Mark {
         let on_off = |b: bool| if b { "on" } else { "off" };
         t.extend(self.fly.map(|b| format!("fm:{}", on_off(b))));
         t.extend(self.vrs.map(|b| format!("vrs:{}", on_off(b))));
+        t.extend(self.blade_width.map(|w| format!("bw:{w:.2}")));
+        t.extend(self.airscrew.map(|a| format!("sh:{}", if a { "prop" } else { "rotor" })));
         t.join(" ")
     }
 
@@ -65,6 +74,9 @@ impl Mark {
                 Some(("ff", v)) => m.default_fin = aerofoil_index(v),
                 Some(("fm", v)) => m.fly = on_off(v),
                 Some(("vrs", v)) => m.vrs = on_off(v),
+                Some(("sh", "prop")) => m.airscrew = Some(true),
+                Some(("sh", "rotor")) => m.airscrew = Some(false),
+                Some(("bw", v)) => m.blade_width = v.parse::<f32>().ok().filter(|w| w.is_finite()).map(|w| w.clamp(BLADE_WIDTH_RANGE.0, BLADE_WIDTH_RANGE.1)),
                 _ => {}
             }
         }
@@ -94,6 +106,8 @@ pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
             default_fin: if i == 0 { des.default_fin } else { None },
             fly: if i == 0 { des.fly } else { None },
             vrs: if i == 0 { des.vrs } else { None },
+            blade_width: des.widths.get(&c.pos).map(|&w| w as f32),
+            airscrew: des.shapes.get(&c.pos).copied(),
         })
         .collect()
 }
@@ -117,6 +131,12 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
         }
         if let Some(f) = m.foil {
             d.foils.insert(c.pos, f);
+        }
+        if let Some(w) = m.blade_width {
+            d.widths.insert(c.pos, w as f64);
+        }
+        if let Some(a) = m.airscrew {
+            d.shapes.insert(c.pos, a);
         }
     }
     d.default_foil = marks.iter().find_map(|m| m.default_foil).unwrap_or(0);
@@ -185,6 +205,18 @@ mod tests {
 
     fn comp(pos: [i32; 3]) -> Comp {
         Comp { def: "x".into(), pos, rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None }
+    }
+
+    #[test]
+    fn blade_width_round_trips_and_clamps() {
+        let m = Mark { blade_width: Some(1.5), airscrew: Some(false), ..Default::default() };
+        assert_eq!(Mark::decode(&m.encode()), m);
+        assert_eq!(Mark::decode("bw:9").blade_width, Some(BLADE_WIDTH_RANGE.1));
+        assert_eq!(Mark::decode("bw:nan").blade_width, None);
+        let comps = [comp([1, 2, 3])];
+        let des = to_designations(&comps, &[m.clone()]).unwrap();
+        assert_eq!(des.widths.get(&[1, 2, 3]), Some(&1.5));
+        assert_eq!(from_designations(&des, &comps)[0], m);
     }
 
     #[test]

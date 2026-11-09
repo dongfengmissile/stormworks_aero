@@ -20,6 +20,7 @@ unsafe extern "system" fn editor_update_detour(a1: usize, a2: usize, a3: usize, 
     }
     // A panic cannot unwind out of an extern "system" fn: contain it here.
     let _ = std::panic::catch_unwind(|| crate::editor::on_tick(a1));
+    let _ = std::panic::catch_unwind(|| crate::toolbar::width_tick(a1));
     if TOOLBAR_HOOKED.load(Ordering::Relaxed) {
         let _ = std::panic::catch_unwind(|| crate::toolbar::on_tick(a1));
     }
@@ -257,8 +258,29 @@ unsafe fn install_blur_hooks() {
         let Some(o) = hook(rva, detour) else { return };
         let _ = slot.set(std::mem::transmute::<*mut c_void, crate::blur::PushShadow>(o));
     }
+    // Blade width row in the propeller's configuration panel (the width is drawn by the hooks below).
+    if bytes_match(base + crate::toolbar::RVA_PROP_PANEL, &crate::toolbar::PROP_PANEL_PROLOGUE) {
+        if let Some(o) = hook(crate::toolbar::RVA_PROP_PANEL, crate::toolbar::prop_panel_detour as *mut c_void) {
+            let _ = crate::toolbar::ORIGINAL_PROP_PANEL.set(std::mem::transmute::<*mut c_void, crate::toolbar::PropPanel>(o));
+        }
+    } else {
+        log_line("force emitter config panel prologue mismatch: no Blade Width row");
+    }
     let Some(o) = hook(RVA_FORCE_EMITTER_DRAW, crate::blur::draw_detour as *mut c_void) else { return };
     let _ = crate::blur::ORIGINAL_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::ClassDraw>(o));
+    // Blade width: only the blades, so the hub keeps its size.
+    if bytes_match(base + RVA_DRAW_DEF_MESH1, &DRAW_DEF_MESH1_PROLOGUE) {
+        if let Some(o) = hook(RVA_DRAW_DEF_MESH1, crate::blur::mesh1_detour as *mut c_void) {
+            let _ = crate::blur::ORIGINAL_MESH1.set(std::mem::transmute::<*mut c_void, crate::blur::Mesh1Draw>(o));
+            if bytes_match(base + RVA_FORCE_EMITTER_EDITOR_DRAW, &FORCE_EMITTER_EDITOR_DRAW_PROLOGUE) {
+                if let Some(o) = hook(RVA_FORCE_EMITTER_EDITOR_DRAW, crate::blur::editor_draw_detour as *mut c_void) {
+                    let _ = crate::blur::ORIGINAL_EDITOR_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::EditorDraw>(o));
+                }
+            }
+        }
+    } else {
+        log_line("draw_def_mesh1 prologue mismatch: blades drawn at their own width");
+    }
     log_line("rotor blur hooks installed");
 }
 

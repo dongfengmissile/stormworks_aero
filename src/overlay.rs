@@ -28,6 +28,25 @@ const CM_COLOR: [f32; 4] = [0.95, 0.80, 0.30, 1.0];
 const LD_COLOR: [f32; 4] = [0.45, 0.85, 0.45, 1.0];
 const DIM: [f32; 4] = [0.60, 0.62, 0.66, 1.0];
 const GOOD: [f32; 4] = [0.45, 0.85, 0.45, 1.0];
+/// A tooltip wrapped to a readable width (imgui tooltips are one line per paragraph otherwise).
+fn hover_tip(ui: &Ui, text: impl AsRef<str>) {
+    ui.tooltip(|| {
+        let _wrap = ui.push_text_wrap_pos_with_pos(ui.current_font_size() * 30.0);
+        ui.text(text.as_ref());
+    });
+}
+
+/// Airspeeds (m/s) of the F7 propeller thrust curve.
+const CURVE_SPEEDS: [f64; 61] = {
+    let mut v = [0.0; 61];
+    let mut i = 0;
+    while i < 61 {
+        v[i] = i as f64 * 4.0;
+        i += 1;
+    }
+    v
+};
+const CURVE_COLORS: [[f32; 4]; 4] = [CL_COLOR, CM_COLOR, LD_COLOR, CD_COLOR];
 const BAD: [f32; 4] = [0.95, 0.40, 0.35, 1.0];
 const WARN: [f32; 4] = [0.95, 0.70, 0.30, 1.0];
 /// Controls column width, and where its fields start.
@@ -108,9 +127,11 @@ pub(crate) struct Overlay {
     show_curv: bool,
     show_cp: bool,
 
-    /// Propellers tab, per `Model::props`: blade RPS asked for, and its peak (rps, result).
+    /// Propellers tab, per `Model::props`: shaft RPS asked for, and its peak (rps, result).
     prop_rps: Vec<f32>,
     prop_peaks: Vec<Option<(f32, Option<(f64, f64, f64, f64)>)>>,
+    /// Per propeller: thrust (kN) at `CURVE_SPEEDS` at its best pitch, for (shaft RPS, pitch).
+    prop_curves: Vec<Option<(f32, f64, Vec<f64>)>>,
 
     // Voxel view.
     cam: Camera,
@@ -177,6 +198,7 @@ impl Overlay {
             show_cp: false,
             prop_rps: Vec::new(),
             prop_peaks: Vec::new(),
+            prop_curves: Vec::new(),
             cam: Camera { yaw: 0.6, pitch: 0.45, dist: 25.0, target: V3::ZERO },
             tool: Tool::Inspect,
             role_pick: 1,
@@ -372,6 +394,7 @@ impl Overlay {
             }
             self.model = Some(Arc::new(b.model));
             self.prop_peaks.clear();
+            self.prop_curves.clear();
             self.faces = Arc::new(b.faces);
             self.view_dirty = true;
             self.sweep = None;
@@ -454,7 +477,7 @@ impl Overlay {
                 if m.panels.is_empty() {
                     ui.text_colored(WARN, "No wings marked");
                     if ui.is_item_hovered() {
-                        ui.tooltip_text("Mark wing blocks on the Wings tab. Without wings, the reference area and length come from the fuselage.");
+                        hover_tip(ui, "Mark wing blocks on the Wings tab. Without wings, the reference area and length come from the fuselage.");
                     }
                 }
                 if !m.grid.missing.is_empty() {
@@ -567,7 +590,7 @@ impl Overlay {
         let Some(s) = &self.stab else {
             ui.text_colored(DIM, "Not calculated");
             if ui.is_item_hovered() {
-                ui.tooltip_text("Trims for level flight (lift = weight) at this speed, then perturbs each state.");
+                hover_tip(ui, "Trims for level flight (lift = weight) at this speed, then perturbs each state.");
             }
             return;
         };
@@ -730,13 +753,13 @@ impl Overlay {
             kv(ui, "Max section", &format!("{:.3} m²", b.max_area));
             kv(ui, "Wave drag area", &format!("{:.3} m²", b.sonic_drag_area));
             if ui.is_item_hovered() {
-                ui.tooltip_text("Drag area from shock waves at Mach 1. A smooth cross-section curve with little curvature keeps it low.");
+                hover_tip(ui, "Drag area from shock waves at Mach 1. A smooth cross-section curve with little curvature keeps it low.");
             }
             kv(ui, "Critical Mach", &format!("{:.3}", b.critical_mach));
             if 0.75 * b.sonic_drag_area >= b.max_area && b.max_area > 0.0 {
                 ui.text_colored(WARN, "High wave drag");
                 if ui.is_item_hovered() {
-                    ui.tooltip_text("Wave drag is high for this cross-section: smooth the area curve.");
+                    hover_tip(ui, "Wave drag is high for this cross-section: smooth the area curve.");
                 }
             }
             heading(ui, "Curves");
@@ -796,7 +819,7 @@ impl Overlay {
                 self.tool = t;
             }
             if ui.is_item_hovered() {
-                ui.tooltip_text(tip);
+                hover_tip(ui, tip);
             }
         }
         if (tool_before == Tool::Foil) != (self.tool == Tool::Foil) {
@@ -831,7 +854,7 @@ impl Overlay {
             heading(ui, "Picked");
             ui.text(a.name);
             if ui.is_item_hovered() {
-                ui.tooltip_text(a.note);
+                hover_tip(ui, a.note);
             }
             kv(ui, "Thickness", &format!("{:.0}%", a.t_c * 100.0));
             kv(ui, "CL at 0°", &format!("{:.2}", a.cl0));
@@ -1015,10 +1038,6 @@ impl Overlay {
                     return;
                 };
                 let p = &m.panels[pi];
-                if p.foil == crate::wing::GRID {
-                    self.status = "grid fins always use the grid fin section".into();
-                    return;
-                }
                 // The whole wing: its panels and the surfaces on it.
                 let targets: Vec<usize> = (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).collect();
                 let _ = p;
@@ -1084,22 +1103,25 @@ impl Overlay {
     fn tab_props(&mut self, ui: &Ui, m: &Arc<Model>) {
         let n = m.props.len();
         if self.prop_rps.len() != n {
-            // Default: a 200 m/s blade tip, a typical real one.
-            self.prop_rps = (0..n).map(|k| ((200.0 / (std::f64::consts::TAU * m.prop_geom(k, 2, 0.5).radius)) * 10.0).round() as f32 / 10.0).collect();
+            // Default: the shaft speed for a 200 m/s blade tip, a typical real one.
+            self.prop_rps = (0..n).map(|k| ((200.0 / (std::f64::consts::TAU * m.prop_geom(k, 2, 0.5).radius * m.props[k].def.rotation_speed)) * 10.0).round() as f32 / 10.0).collect();
         }
         self.prop_peaks.resize(n, None);
+        self.prop_curves.resize(n, None);
         let cols = [
             ("Part", 0.0),
+            ("Shape", 100.0),
             ("Blades", 52.0),
             ("Radius", 60.0),
-            ("Blade speed", 96.0),
+            ("Shaft speed", 96.0),
+            ("Tip Mach", 64.0),
             ("Best pitch", 78.0),
             ("Blade angle", 82.0),
             ("Thrust", 72.0),
             ("Power", 72.0),
         ];
-        let Some(_t) = table(ui, "##rotors", &cols) else { return };
-        headers(ui, &cols, 1);
+        let Some(t) = table(ui, "##rotors", &cols) else { return };
+        headers(ui, &cols, 2);
         for (k, u) in m.props.iter().enumerate() {
             let c = &m.comps[u.comp];
             let set = c.prop.as_ref();
@@ -1114,38 +1136,92 @@ impl Overlay {
             ui.same_line();
             ui.text_colored(DIM, format!("{}, {}, {}", c.pos[0], c.pos[1], c.pos[2]));
             ui.table_set_column_index(1);
-            right(ui, &blades.to_string(), None);
+            let auto = if u.def.airscrew { "Auto prop" } else { "Auto rotor" };
+            let mut pick = match self.des.shapes.get(&c.pos) {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            };
+            ui.set_next_item_width(-1.0);
+            if ui.combo_simple_string(format!("##shape{k}"), &mut pick, &[auto, "Propeller", "Rotor"]) {
+                match pick {
+                    1 => self.des.shapes.insert(c.pos, true),
+                    2 => self.des.shapes.insert(c.pos, false),
+                    _ => self.des.shapes.remove(&c.pos),
+                };
+                self.designations_changed();
+            }
+            if ui.is_item_hovered() {
+                hover_tip(ui, "Blade shape. Propeller: cambered blades with a helical twist, rigid, for aeroplanes. Rotor: symmetric blades with a gentle twist that flap, for helicopters. Auto picks propeller for parts with a single pitch input or \"propeller\" in the name. Saved on the part.");
+            }
             ui.table_set_column_index(2);
-            right(ui, &format!("{:.2} m", m.prop_geom(k, blades, length).radius), None);
+            right(ui, &blades.to_string(), None);
             ui.table_set_column_index(3);
+            right(ui, &format!("{:.2} m", m.prop_geom(k, blades, length).radius), None);
+            ui.table_set_column_index(4);
             ui.set_next_item_width(-1.0);
             ui.input_float(format!("##rps{k}"), &mut self.prop_rps[k]).display_format("%.1f RPS").build();
             let rps = self.prop_rps[k];
+            let ratio = u.def.rotation_speed;
+            if ui.is_item_hovered() {
+                hover_tip(ui, format!("Shaft RPS, as the game's sensors read it. This part turns its blades {ratio}x the shaft: {:.1} rev/s.", rps as f64 * ratio));
+            }
+            // Tip Mach from the spin alone (static, sea level), red where propellers start losing
+            // thrust to compressibility (NACA TR 684: mild below tip Mach 0.8).
+            let geom = m.prop_geom(k, blades, length);
+            let tip = rps as f64 * ratio * std::f64::consts::TAU * geom.radius / 340.0;
+            let foil = &AEROFOILS[geom.foil];
+            let rise = foil.kappa - foil.t_c + 0.05;
+            ui.table_set_column_index(5);
+            right(ui, &format!("{tip:.2}"), (tip > rise).then_some(BAD));
+            if ui.is_item_hovered() {
+                hover_tip(ui, format!(
+                    "Blade tip speed from the spin alone, standing still at sea level. Past Mach {rise:.2} the tips hit the drag rise of the speed of sound: they take much more power for little more thrust, and it gets worse as the plane speeds up. Turn the shaft slower or use shorter blades."
+                ));
+            }
             if self.prop_peaks[k].is_none_or(|(r, _)| r != rps) {
-                self.prop_peaks[k] = Some((rps, m.prop_peak(k, blades, length, rps as f64)));
+                self.prop_peaks[k] = Some((rps, m.prop_peak(k, blades, length, rps as f64 * ratio)));
             }
             let Some((p, thrust, power, _)) = self.prop_peaks[k].and_then(|p| p.1) else {
-                ui.table_set_column_index(4);
+                ui.table_set_column_index(6);
                 right(ui, "-", Some(DIM));
                 if ui.is_item_hovered() {
-                    ui.tooltip_text("No thrust peak at this blade speed.");
+                    hover_tip(ui, "No thrust peak at this shaft speed.");
                 }
                 continue;
             };
+            if u.airscrew && self.prop_curves[k].as_ref().is_none_or(|c| c.0 != rps || c.1 != p) {
+                let curve = CURVE_SPEEDS.map(|v| m.prop_settled(k, blades, length, rps as f64 * ratio, p, v).thrust / 1000.0);
+                self.prop_curves[k] = Some((rps, p, curve.to_vec()));
+            }
             let need = p - setting;
             let out = !(-1.0..=1.0).contains(&need);
             let vals = [format!("{need:.2}"), format!("{:.1}°", (0.75 * p).to_degrees()), format!("{:.1} kN", thrust / 1000.0), format!("{:.0} kW", power / 1000.0)];
             for (i, v) in vals.iter().enumerate() {
-                ui.table_set_column_index(4 + i);
+                ui.table_set_column_index(6 + i);
                 right(ui, v, if i > 0 { None } else if out { Some(WARN) } else { Some(CL_COLOR) });
                 if i == 0 && ui.is_item_hovered() {
                     let offset = if setting != 0.0 { format!(" with blade_pitch {setting:+.0}") } else { String::new() };
                     let range = if out { "\nOutside the input's -1 to 1 range with this blade_pitch setting." } else { "" };
-                    ui.tooltip_text(format!(
-                        "The {input}{offset} that gives the most static thrust (standing still, sea level). More than this stalls the blades: less thrust for more power.{range}"
+                    hover_tip(ui, format!(
+                        "The {input}{offset} that gives the most static thrust (standing still, sea level). More than this stalls the blades: no more thrust, for much more power.{range}"
                     ));
                 }
             }
+        }
+        drop(t);
+        // Propellers (not rotors): thrust against airspeed at the best pitch above.
+        let curves: Vec<(usize, &Vec<f64>)> =
+            self.prop_curves.iter().enumerate().filter(|(k, _)| m.props[*k].airscrew).filter_map(|(k, c)| Some((k, &c.as_ref()?.2))).collect();
+        if !curves.is_empty() && ui.collapsing_header("Thrust against airspeed", imgui::TreeNodeFlags::empty()) {
+            // Up to just past the speed where the last propeller stops pushing.
+            let last = curves.iter().filter_map(|(_, c)| c.iter().rposition(|&t| t > 0.0)).max().unwrap_or(0);
+            let len = (last + 2).clamp(2, CURVE_SPEEDS.len());
+            let x: Vec<f64> = CURVE_SPEEDS[..len].iter().map(|v| v * 3.6).collect();
+            let names: Vec<String> = curves.iter().map(|(k, _)| format!("{} kN", m.comps[m.props[*k].comp].def)).collect();
+            let series: Vec<(&str, [f32; 4], Vec<f64>)> =
+                curves.iter().zip(&names).enumerate().map(|(i, ((_, c), name))| (name.as_str(), CURVE_COLORS[i % CURVE_COLORS.len()], c[..len].to_vec())).collect();
+            plot(ui, "prop_curve", [ui.content_region_avail()[0], 220.0], &x, &series, series.len(), "Airspeed (km/h), sea level, at the best pitch and the shaft speed above");
         }
     }
 
@@ -1160,7 +1236,7 @@ impl Overlay {
         let Some(_t) = table(ui, "##settings", &cols) else { return };
         headers(ui, &cols, 3);
         if ui.is_item_hovered() {
-            ui.tooltip_text(if vehicle { "Saved in the vehicle's file; travels with copy and paste." } else { "Open a vehicle in the workbench to give it its own settings." });
+            hover_tip(ui, if vehicle { "Saved in the vehicle's file; travels with copy and paste." } else { "Open a vehicle in the workbench to give it its own settings." });
         }
         let row = |ui: &Ui, name: &str, tip: &str| {
             ui.table_next_row();
@@ -1168,7 +1244,7 @@ impl Overlay {
             ui.align_text_to_frame_padding();
             ui.text(name);
             if ui.is_item_hovered() {
-                ui.tooltip_text(tip);
+                hover_tip(ui, tip);
             }
             ui.table_set_column_index(1);
         };
@@ -1621,7 +1697,7 @@ fn deriv_table<const N: usize>(ui: &Ui, id: &str, heads: &[&str], rows: &[(&str,
             };
             right(ui, &format!("{v:+.4}"), col);
             if ui.is_item_hovered() {
-                ui.tooltip_text(format!("{name} = {v:.4} {unit}\n{tip}"));
+                hover_tip(ui, format!("{name} = {v:.4} {unit}\n{tip}"));
             }
         }
     }
@@ -1716,7 +1792,7 @@ fn plot(ui: &Ui, id: &str, size: [f32; 2], x: &[f64], series: &[(&str, [f32; 4],
         for (name, _, ys) in series.iter().take(legend) {
             text += &format!("\n{name}: {:.4}", ys[i]);
         }
-        ui.tooltip_text(text);
+        hover_tip(ui, text);
     }
 }
 

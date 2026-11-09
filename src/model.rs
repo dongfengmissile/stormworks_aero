@@ -34,6 +34,10 @@ pub struct Designations {
     /// Per-vehicle settings (None: the global one): plugin flight model, vortex ring state.
     pub fly: Option<bool>,
     pub vrs: Option<bool>,
+    /// Propeller/rotor blade width by component position, x the part's own.
+    pub widths: HashMap<[i32; 3], f64>,
+    /// Propeller/rotor blade shape chosen by position: true propeller, false rotor (else auto).
+    pub shapes: HashMap<[i32; 3], bool>,
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
@@ -104,6 +108,13 @@ pub struct LiveBody {
     pub vel: V3,
     pub omega: V3,
     pub wind: V3,
+}
+
+/// Velocity and spin of a body between two poses `dt` apart (centre of mass, body axes in world):
+/// ω = ½ Σ aᵢ × ȧᵢ. For net clients, whose bodies are moved by the host's poses and carry no velocity.
+pub fn pose_motion(com0: V3, rot0: &[V3; 3], com1: V3, rot1: &[V3; 3], dt: f64) -> (V3, V3) {
+    let w = (0..3).fold(V3::ZERO, |a, i| a + rot0[i].cross(rot1[i] - rot0[i])) * (0.5 / dt);
+    ((com1 - com0) * (1.0 / dt), w)
 }
 
 /// Aero body frame (x fwd, y right, z down) -> vehicle grid metres (x right, y up, z fwd).
@@ -324,6 +335,10 @@ pub struct PropUnit {
     /// Spin for positive shaft speed: mirrored parts turn the other way (`force_emitter_draw`).
     pub spin: f64,
     pub def: crate::defs::PropDef,
+    /// Blade width, x the part's own (`Designations::widths`).
+    pub width: f64,
+    /// Propeller blades (cambered, helical twist, rigid), else rotor: the choice, or `def.airscrew`.
+    pub airscrew: bool,
 }
 
 /// A propeller's live state, read from the game each step.
@@ -366,9 +381,11 @@ pub struct PropOut {
 
 /// Shaft inertia per unit of the game's slot mass, kg·m². The shaft network conserves slot
 /// mass × speed (`vehicle_shaft_network_step` 0x4C02A0), so a torque removes `Q·dt / (2π·I)`.
-/// shortcut: picked so a large engine (mass 100) gives about 0.7 MW to a rotor at 5.4 RPS;
-/// retune from players' readings.
-const SHAFT_INERTIA: f64 = 1.0;
+/// Set so a propeller or rotor at its best static pitch drains about what the game's own model
+/// takes for the same thrust (`T/1500` momentum per tick): aircraft propellers and the large
+/// coaxial rotor match; smaller rotors load the shaft less than in the game (0.25..0.75x).
+/// shortcut: one factor for all parts (the game's load follows thrust, ours power); retune from players' readings.
+const SHAFT_INERTIA: f64 = 2.4;
 
 /// Cyclic blade angle per unit input, rad.
 const CYCLIC_RAD: f64 = 0.2;
@@ -387,14 +404,32 @@ impl Model {
     }
 
     /// The pitch input (−1..1, blade angle 0.75·p rad) where part `k` makes the most static
-    /// sea-level thrust at blade speed `rps`: the first peak (attached flow), not the deep-stall
-    /// rise near 45°. Returns (pitch, thrust N, power W, blade stall share there).
+    /// sea-level thrust at blade speed `rps`: the knee where the blades stall and thrust levels
+    /// off (more pitch then costs power for no thrust). Returns (pitch, thrust N, power W, blade stall share there).
     pub fn prop_peak(&self, k: usize, blades: u32, length: f64, rps: f64) -> Option<(f64, f64, f64, f64)> {
         let u = &self.props[k];
         if !(rps > 0.0) || u.def.rotation_speed <= 0.0 {
             return None;
         }
-        let lb = LiveBody {
+        let mut best: Option<(f64, PropOut)> = None;
+        for i in 1..=100 {
+            let p = i as f64 * 0.01;
+            let o = self.prop_settled(k, blades, length, rps, p, 0.0);
+            match &best {
+                // Past the stall thrust levels off while power keeps climbing: stop at the knee.
+                Some((_, b)) if o.stalled > 0.0 && o.thrust < 1.005 * b.thrust => break,
+                Some((_, b)) if o.thrust <= b.thrust => {}
+                _ => best = Some((p, o)),
+            }
+        }
+        best.map(|(p, o)| (p, o.thrust, o.torque * o.omega, o.stalled))
+    }
+
+    /// Part `k` at sea level with its inflow settled: blade speed `rps`, pitch input `pitch`,
+    /// flying along its thrust axis at `speed` m/s.
+    pub fn prop_settled(&self, k: usize, blades: u32, length: f64, rps: f64, pitch: f64, speed: f64) -> PropOut {
+        let u = &self.props[k];
+        let mut lb = LiveBody {
             origin: V3::ZERO,
             rot: [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)],
             trans: v3(0.0, 100.0, 0.0),
@@ -403,27 +438,21 @@ impl Model {
             omega: V3::ZERO,
             wind: V3::ZERO,
         };
-        let at = |pitch: f64| {
-            let s = PropLive { w: rps / u.def.rotation_speed, pitch, cyclic: [0.0; 2], blades, length, reversed: false, flip: false };
-            let mut v = 0.0;
-            let mut out = self.prop_live(k, &lb, &s, v, false);
-            for _ in 0..60 {
-                v += 0.3 * (out.v_target - v);
-                out = self.prop_live(k, &lb, &s, v, false);
-            }
-            out
-        };
-        let mut best: Option<(f64, PropOut)> = None;
-        for i in 1..=100 {
-            let p = i as f64 * 0.01;
-            let o = at(p);
-            match &best {
-                Some((_, b)) if o.thrust < 0.98 * b.thrust => break,
-                Some((_, b)) if o.thrust <= b.thrust => {}
-                _ => best = Some((p, o)),
+        lb.vel = lb.dir_to_world(u.axis).norm() * speed;
+        let s = PropLive { w: rps / u.def.rotation_speed, pitch, cyclic: [0.0; 2], blades, length, reversed: false, flip: false };
+        // Bisect the inflow: more inflow, less thrust, so `v_target − v` falls with v. (Fixed-point
+        // iteration oscillates near zero thrust.)
+        let vtip = 2.0 * PI * rps * self.prop_geom(k, blades, length).radius;
+        let (mut lo, mut hi) = (-0.5 * vtip, 0.5 * vtip);
+        for _ in 0..50 {
+            let mid = 0.5 * (lo + hi);
+            if self.prop_live(k, &lb, &s, mid, false).v_target > mid {
+                lo = mid;
+            } else {
+                hi = mid;
             }
         }
-        best.map(|(p, o)| (p, o.thrust, o.torque * o.omega, o.stalled))
+        self.prop_live(k, &lb, &s, 0.5 * (lo + hi), false)
     }
 
     /// Blade geometry at the part's blade count and length.
@@ -433,10 +462,10 @@ impl Model {
         crate::prop::Prop {
             radius: d.radius * s,
             hub: d.root * s,
-            chord: d.chord * s,
+            chord: d.chord * s * self.props[k].width,
             blades: blades.clamp(2, 8),
-            foil: if d.rotor() { 4 } else { 2 }, // NACA 0012 rotors, NACA 2412 propellers
-            propeller: !d.rotor(),
+            foil: if self.props[k].airscrew { 2 } else { 4 }, // NACA 2412 propellers, NACA 0012 rotors
+            propeller: self.props[k].airscrew,
         }
     }
 
@@ -577,11 +606,7 @@ impl Model {
                 let mut seen = std::collections::HashSet::new();
                 cells.retain(|x| seen.insert(*x));
                 if let Some(mut p) = crate::wing::plate_panel(&pts, cells, Role::None, com) {
-                    p.foil = if grid_fin {
-                        crate::wing::GRID
-                    } else {
-                        des.foils.get(&c.pos).copied().unwrap_or(des.default_fin.unwrap_or(crate::wing::FIN_DEFAULT))
-                    };
+                    p.foil = des.foils.get(&c.pos).copied().unwrap_or(des.default_fin.unwrap_or(crate::wing::FIN_DEFAULT));
                     let live = ctrl.map(|f| FinLive { comp: *i, src: LiveSrc::Rocket { a: f.a }, sign: live_sign(c, &p, f.axis, false) });
                     panels.push(p);
                     fin_live.push(live);
@@ -654,6 +679,8 @@ impl Model {
                     ex: grid_to_aero(dir(v3(1.0, 0.0, 0.0))),
                     ez: grid_to_aero(dir(v3(0.0, 0.0, 1.0))),
                     spin: if det < 0.0 { -1.0 } else { 1.0 },
+                    width: des.widths.get(&c.pos).map_or(1.0, |&w| w.clamp(0.25, 2.0)),
+                    airscrew: des.shapes.get(&c.pos).copied().unwrap_or(def.airscrew),
                     def,
                 })
             })
@@ -1071,7 +1098,7 @@ mod tests {
     #[test]
     fn grid_fins_lift_across_their_face() {
         // A modded grid fin rocket (lattice faces across the flow): four live planar-equivalent
-        // panels of the face's area, normal across the rocket axis, with the grid section.
+        // panels of the face's area, normal across the rocket axis, with the default fin section.
         let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
         let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
         let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
@@ -1090,7 +1117,7 @@ mod tests {
         assert!(m.panel_of.iter().all(|&p| p == usize::MAX || m.fin_comp[p].is_none()));
         assert_eq!(m.fin_of.get(&0).map(|f| f.1), Some(true));
         for (p, f) in fins {
-            assert_eq!(p.foil, crate::wing::GRID);
+            assert_eq!(p.foil, crate::wing::FIN_DEFAULT);
             assert!(p.n.dot(axis).abs() < 0.05 && p.u.dot(axis).abs() > 0.95, "normal {:?} chord {:?}", p.n, p.u);
             assert!((0.02..0.035).contains(&p.area), "face area {}", p.area);
             assert!(f.sign != 0.0);
@@ -1183,6 +1210,16 @@ mod tests {
         assert!((dt - 0.025).abs() < 1e-4);
         assert_eq!(measure_step(dt, v3(0.01, 0.0, 0.0), v3(0.5, 0.0, 0.0)), dt);
         // too slow to measure
+    }
+
+    #[test]
+    fn pose_motion_recovers_velocity_and_spin() {
+        // 0.02 rad about +y in 0.1 s while moving 3 m along x.
+        let (c, sn) = (0.02f64.cos(), 0.02f64.sin());
+        let r0 = [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)];
+        let r1 = [v3(c, 0.0, -sn), v3(0.0, 1.0, 0.0), v3(sn, 0.0, c)];
+        let (v, w) = pose_motion(V3::ZERO, &r0, v3(3.0, 0.0, 0.0), &r1, 0.1);
+        assert!((v.x - 30.0).abs() < 1e-9 && (w.y - 0.2).abs() < 1e-3 && w.x.abs() < 1e-9 && w.z.abs() < 1e-9, "{v:?} {w:?}");
     }
 
     #[test]

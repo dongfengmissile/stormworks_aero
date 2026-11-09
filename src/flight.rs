@@ -562,9 +562,17 @@ struct State {
     saved: Option<[f32; 6]>,
     scene: usize,
     lib: Option<Arc<Mutex<Library>>>,
+    /// Net client, per body: the last replicated pose (tick stamp, CoM, axes) and the motion between the last two.
+    net: HashMap<usize, (u32, V3, [V3; 3], V3, V3)>,
 }
 
-static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new(State { crafts: HashMap::new(), saved: None, scene: 0, lib: None }));
+/// This game is a multiplayer client: the host flies the vehicles, bodies here only follow its poses.
+pub(crate) fn net_client() -> bool {
+    let base = MODULE_BASE.load(Ordering::Relaxed);
+    unsafe { *((base + RVA_NET_IS_MULTIPLAYER) as *const u8) != 0 && *((base + RVA_NET_IS_AUTHORITATIVE) as *const u8) == 0 }
+}
+
+static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new(State { crafts: HashMap::new(), saved: None, scene: 0, lib: None, net: HashMap::new() }));
 
 unsafe fn f64_at(a: usize) -> f64 {
     f64::from_bits(read_usize_at(a) as u64)
@@ -663,14 +671,14 @@ unsafe fn fluid_mass(body: usize, body_mass: f64) -> f64 {
 }
 
 /// Live pose and motion of one body; None if it is not a simulated, movable body.
-unsafe fn live_body(body: usize) -> Option<(LiveBody, usize, f64)> {
+unsafe fn live_body(body: usize, client: bool) -> Option<(LiveBody, usize, f64)> {
     let obj = read_usize_at(body + OFF_BODY_PHYS_OBJ);
     if !ptr_ok(obj, OFF_OBJ_RIGID_BODY + 8) || *((body + OFF_BODY_NO_FORCE) as *const u8) != 0 {
         return None;
     }
     let mass = f32_at(obj + OFF_OBJ_MASS) as f64;
     let rb = read_usize_at(obj + OFF_OBJ_RIGID_BODY);
-    if !(mass > 0.0) || !ptr_ok(rb, OFF_RB_ANGULAR_FACTOR + 24) || read_u32_at(rb + OFF_RB_FLAGS) & 0x800 != 0 {
+    if !(mass > 0.0) || !ptr_ok(rb, OFF_RB_ANGULAR_FACTOR + 24) || (!client && read_u32_at(rb + OFF_RB_FLAGS) & 0x800 != 0) {
         return None;
     }
     if read_u32_at(rb + OFF_RB_ACTIVATION) == 2 {
@@ -750,6 +758,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     if scene != st.scene {
         // World load / respawn swaps the scene: every cached pointer is stale.
         st.crafts.clear();
+        st.net.clear();
         st.scene = scene;
     }
     let Some(records) = ring(scene + OFF_SCENE_VEHICLES, 1 << 16) else {
@@ -766,6 +775,12 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         return;
     };
     let mut seen = HashSet::new();
+    let client = net_client();
+    static WAS_CLIENT: AtomicBool = AtomicBool::new(false);
+    if WAS_CLIENT.swap(client, Ordering::Relaxed) != client {
+        log_line(if client { "flight: multiplayer client: flight data from the host's poses, no forces applied" } else { "flight: host or single player: forces applied" });
+    }
+    let mut net = std::mem::take(&mut st.net);
     let want_debug = DEBUG_WANTED.load(Ordering::Relaxed);
     // The game's forces of the last step (applied after our previous tick, before the step).
     let engine_forces = std::mem::take(&mut *ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner()));
@@ -832,7 +847,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         // (Re)build when the vehicle changed and can move; one build at a time, so a vehicle
         // waiting its turn keeps its old key and retries next tick.
-        if craft.key != key && !BUILDING.load(Ordering::SeqCst) && bodies.iter().any(|&b| live_body(b).is_some()) {
+        if craft.key != key && !BUILDING.load(Ordering::SeqCst) && bodies.iter().any(|&b| live_body(b, client).is_some()) {
             if let Some((comps, _, ptrs)) = vehicle_comps(read_usize_at(rec + 8)) {
                 craft.key = key;
                 craft.bodies = bodies.clone();
@@ -852,12 +867,31 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             continue;
         }
         // Live state of every body; a body that is not simulated keeps its index but no forces.
-        let live: Vec<Option<(LiveBody, usize, f64)>> = bodies.iter().map(|&b| live_body(b)).collect();
+        let mut live: Vec<Option<(LiveBody, usize, f64)>> = bodies.iter().map(|&b| live_body(b, client)).collect();
+        if client {
+            // The host's poses arrive every few ticks and Bullet's velocity is zero between them: the motion
+            // is the change between the last two poses, held until the next one.
+            for (&b, l) in bodies.iter().zip(&mut live) {
+                let Some((lb, _, _)) = l else { continue };
+                let stamp = read_u32_at(b + OFF_BODY_NET_STAMP);
+                let e = net.entry(b).or_insert((stamp, lb.com, lb.rot, V3::ZERO, V3::ZERO));
+                if lb.com != e.1 || lb.rot != e.2 {
+                    let ticks = stamp.wrapping_sub(e.0);
+                    if (1..=120).contains(&ticks) {
+                        let (v, w) = crate::model::pose_motion(e.1, &e.2, lb.com, &lb.rot, ticks as f64 / 60.0);
+                        // A jump (respawn, teleport) is not motion.
+                        (e.3, e.4) = if v.len() < 2000.0 && w.len() < 60.0 { (v, w) } else { (V3::ZERO, V3::ZERO) };
+                    }
+                    (e.0, e.1, e.2) = (stamp, lb.com, lb.rot);
+                }
+                (lb.vel, lb.omega) = (e.3, e.4);
+            }
+        }
         let Some((mb, _, _)) = live.get(main).copied().flatten() else {
             continue;
         };
         let com = [mb.com.x, mb.com.y, mb.com.z];
-        if com == craft.last_com {
+        if com == craft.last_com && !client {
             continue; // physics has not stepped since our last forces (second sync call)
         }
         // Frame check: the model's centre of mass must land near Bullet's.
@@ -939,6 +973,28 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 continue;
             }
             craft.prop_v[k] += (craft.dt / out.tau).min(1.0) * (out.v_target - craft.prop_v[k]);
+            if cfg!(feature = "logging") && step % 60 == 0 {
+                let at = lb.to_world(u.hub);
+                let axis = lb.dir_to_world(u.axis).norm() * if s.reversed { -1.0 } else { 1.0 };
+                let fwd = (lb.vel + lb.omega.cross(at - lb.com) - lb.wind).dot(axis);
+                log_line(&format!(
+                    "prop {k}: shaft {:.2} blade {:.2} rev/s, input {:.2} angle {:.1} deg, axial speed {fwd:.1} m/s, inflow {:.1}/{:.1} m/s, thrust {:.0} N (along nose {:.0}), torque {:.0} Nm, power {:.0} kW, stalled {:.2}, shaft drop {:.3}/tick, rev {} flip {} linked {linked}",
+                    s.w,
+                    out.omega / (2.0 * std::f64::consts::PI),
+                    s.pitch,
+                    out.blade_angle.to_degrees(),
+                    craft.prop_v[k],
+                    out.v_target,
+                    out.thrust,
+                    out.force.dot(mb.dir_to_world(v3(1.0, 0.0, 0.0))),
+                    out.torque,
+                    out.torque * out.omega / 1000.0,
+                    out.stalled,
+                    per_nm * out.torque,
+                    s.reversed,
+                    s.flip
+                ));
+            }
             prop_loads().insert(ptr, PropLoad { torque: out.torque, sign: if s.w < 0.0 { -1.0 } else { 1.0 }, per_nm, step });
             // The air's torque on the spin axis reaches the airframe through a driven shaft (the
             // engine or hinge motor holds it); a free rotor just changes speed. A hinge motor only
@@ -949,7 +1005,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         // Thrust = what accelerates the vehicle besides our air forces and gravity (engines, props;
         // also ground contact while rolling), along the nose.
-        if let Some(pc) = craft.prev_com {
+        if let Some(pc) = craft.prev_com.filter(|_| !client) {
             craft.dt = crate::model::measure_step(craft.dt, mb.com - pc, mb.vel);
         }
         craft.prev_com = Some(mb.com);
@@ -1050,8 +1106,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         // Every air load goes to the main body at its true point: same net force and moment on the
         // vehicle, but hinges and pivots no longer carry it, so sub-grid surfaces don't bend.
         // shortcut: assumes the vehicle's bodies are rigidly joined; per-body forces if loose parts matter.
-        let Some((lb, rb, _)) = live.get(main).copied().flatten() else {
-            continue;
+        let Some((lb, rb, _)) = live.get(main).copied().flatten().filter(|_| !client) else {
+            continue; // a client only shows the flight data: the host applies the forces
         };
         for f in forces {
             let scale = if f.force.len() > fmax { fmax / f.force.len() } else { 1.0 };
@@ -1074,6 +1130,10 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         APPLIED.fetch_add(1, Ordering::Relaxed);
     }
     *FLOWN.write().unwrap_or_else(|p| p.into_inner()) = flown;
+    if net.len() > 4096 {
+        net.clear(); // bodies of despawned vehicles
+    }
+    st.net = net;
     st.crafts.retain(|id, _| seen.contains(id));
     VEHICLES.store(st.crafts.len() as u64, Ordering::Relaxed);
     // Empty while F9 is closed, so the render thread stops painting; kept on a repeat sync call.

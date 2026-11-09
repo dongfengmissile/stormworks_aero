@@ -548,7 +548,7 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
         (
             if own { "aero_missile" } else { "mechanics" },
             "Missile fins",
-            "Fins on rockets and missile parts, shaped from the part's mesh. Grid fins pick their own.",
+            "Fins on rockets and missile parts, shaped from the part's mesh.",
         ),
     ];
     let pick = |cat: usize| FOIL[cat].load(Ordering::Relaxed).saturating_sub(foil_range(cat).start);
@@ -736,4 +736,85 @@ pub(crate) unsafe fn on_tick(editor: usize) {
     if ACTIVE.swap(on, Ordering::Relaxed) != on {
         log_line(&format!("toolbar: Aero wings mode {}", if on { "on" } else { "off" }));
     }
+}
+
+// --- Blade width row in the part's configuration panel (c38c03ff756b, knowledge/editor-ui.md
+// "Component configuration panel"). The panel shows one part at a time and its slider writes
+// `*target` every frame, so one plugin-owned cell serves it; the editor tick copies a moved value
+// into the part's marks.
+
+pub(crate) const RVA_PROP_PANEL: usize = 0x0034_5070;
+pub(crate) const PROP_PANEL_PROLOGUE: [u8; 24] =
+    [0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C, 0x24, 0xC9, 0x48];
+const RVA_ADD_SLIDER_ROW: usize = 0x008B_7EC0;
+const ADD_SLIDER_ROW_PROLOGUE: [u8; 24] =
+    [0x48, 0x89, 0x5C, 0x24, 0x10, 0x4C, 0x89, 0x4C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x70, 0x4D, 0x8B, 0xF1];
+const OFF_SELECTED_COMP: usize = 0x1550;
+pub(crate) type PropPanel = unsafe extern "system" fn(usize, usize, usize);
+pub(crate) static ORIGINAL_PROP_PANEL: OnceLock<PropPanel> = OnceLock::new();
+/// `(panel, ctx, label, fmt, min, max, step, float* target, scale)`, floats as raw bits.
+type AddSliderRow = unsafe extern "system" fn(usize, usize, *mut GStr, *mut GStr, u32, u32, u32, *mut f32, u32);
+
+/// The open row's target (blade width, x the part's own), its part, and the value last synced.
+static WIDTH_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
+static WIDTH_COMP: AtomicUsize = AtomicUsize::new(0);
+static WIDTH_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) unsafe extern "system" fn prop_panel_detour(comp: usize, ctx: usize, panel: usize) {
+    let Some(orig) = ORIGINAL_PROP_PANEL.get() else { return };
+    orig(comp, ctx, panel);
+    let _ = std::panic::catch_unwind(|| add_width_row(comp, ctx, panel));
+}
+
+unsafe fn add_width_row(comp: usize, ctx: usize, panel: usize) {
+    let base = MODULE_BASE.load(Ordering::Relaxed);
+    let Some(f) = fns() else { return };
+    if !bytes_match(base + RVA_ADD_SLIDER_ROW, &ADD_SLIDER_ROW_PROLOGUE) || !readable(comp + 0x58, 8) {
+        return;
+    }
+    // Air propellers and rotors with blades, the parts the plugin flies (`defs`: air_blades).
+    let def = read_usize_at(comp + 0x58);
+    if def < PTR_MIN || !readable(def + crate::offsets::OFF_DEF_PROP_FLAGS, 4) || read_u32_at(def + crate::offsets::OFF_DEF_PROP_FLAGS) & 2 != 0 {
+        return;
+    }
+    let mesh = read_usize_at(def);
+    if mesh < PTR_MIN || !readable(mesh + crate::offsets::OFF_DEF_MESH1, 8) || read_usize_at(mesh + crate::offsets::OFF_DEF_MESH1) == 0 {
+        return;
+    }
+    let w = crate::marks::get(comp).and_then(|m| m.blade_width).unwrap_or(1.0);
+    WIDTH_CELL.store(w.to_bits(), Ordering::SeqCst);
+    WIDTH_SEEN.store(w.to_bits(), Ordering::SeqCst);
+    WIDTH_COMP.store(comp, Ordering::SeqCst);
+    // The callee copies the label (and leaves it to us) and frees the format.
+    static LABEL: OnceLock<(usize, u32, u32)> = OnceLock::new();
+    let &(data, len, cap) = LABEL.get_or_init(|| {
+        let g = gstr(f, "Blade Width");
+        (g.data as usize, g.len, g.cap)
+    });
+    if data == 0 {
+        return;
+    }
+    let mut label = GStr { data: data as *mut u8, len, cap };
+    let mut fmt = gstr(f, "%.0f%%");
+    let add: AddSliderRow = std::mem::transmute(base + RVA_ADD_SLIDER_ROW);
+    let (lo, hi) = crate::marks::BLADE_WIDTH_RANGE;
+    add(panel, ctx, &mut label, &mut fmt, (lo * 100.0).to_bits(), (hi * 100.0).to_bits(), 5.0f32.to_bits(), WIDTH_CELL.as_ptr() as *mut f32, 0.01f32.to_bits());
+}
+
+/// Editor tick: a moved width slider sets the selected part's mark (the workbench re-reads it).
+pub(crate) unsafe fn width_tick(editor: usize) {
+    let comp = WIDTH_COMP.load(Ordering::Relaxed);
+    let bits = WIDTH_CELL.load(Ordering::Relaxed);
+    if comp == 0 || bits == WIDTH_SEEN.load(Ordering::Relaxed) || !readable(editor + OFF_SELECTED_COMP, 8) {
+        return;
+    }
+    WIDTH_SEEN.store(bits, Ordering::Relaxed);
+    if read_usize_at(editor + OFF_SELECTED_COMP) != comp {
+        return;
+    }
+    let (lo, hi) = crate::marks::BLADE_WIDTH_RANGE;
+    let w = ((f32::from_bits(bits) * 100.0).round() / 100.0).clamp(lo, hi);
+    let mut m = crate::marks::get(comp).unwrap_or_default();
+    m.blade_width = (w != 1.0).then_some(w);
+    crate::marks::set(comp, Some(m), true);
 }

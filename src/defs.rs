@@ -59,6 +59,10 @@ pub struct Def {
 pub struct PropDef {
     /// Definition `flags`: bit 4 single pitch input (else cyclic + collective), 0x40000000 "coaxial" (one disc with a power output on top; the game adds a torque-reaction couple).
     pub flags: u32,
+    /// Shaped as an aeroplane propeller (cambered, helical twist, rigid), not a helicopter rotor:
+    /// a single pitch input (flag 4), or "propeller" in the name (mod propellers and the coaxial
+    /// "Rotor Propeller" parts take cyclic and collective like rotors).
+    pub airscrew: bool,
     /// `force_dir`: spin and thrust axis, part frame.
     pub axis: V3,
     /// `force_emitter_rotation_speed`: blade revolutions per unit of shaft speed.
@@ -200,6 +204,7 @@ pub fn parse_def(text: &str) -> Def {
                 // Fins and rudders rest at the middle of their range.
                 rest_angle = (tag.num::<f64>("dynamic_min_rotation").unwrap_or(0.0) + tag.num::<f64>("dynamic_max_rotation").unwrap_or(0.0)) * 0.5;
                 prop.flags = tag.num::<i64>("flags").unwrap_or(0) as u32;
+                prop.airscrew = prop.flags & 4 != 0 || tag.get("name").is_some_and(|n| n.to_ascii_lowercase().contains("propeller"));
                 prop.rotation_speed = tag.num("force_emitter_rotation_speed").unwrap_or(1.0);
                 prop.blade_height = tag.num("force_emitter_blade_height").unwrap_or(0.0);
                 prop.default_pitch = tag.int0("force_emitter_default_pitch");

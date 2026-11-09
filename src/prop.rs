@@ -206,7 +206,14 @@ fn stall_angle(foil: usize, mach: f64) -> (f64, f64, f64) {
     let f = &AEROFOILS[foil.min(AEROFOILS.len() - 1)];
     let m = mach.min(0.95);
     let slope = 2.0 * PI / (1.0 - m * m).max(0.1).sqrt().max(0.3);
-    (-f.camber_aoa(), slope, f.cl_max / slope)
+    (-f.camber_aoa(), slope, cl_max(foil, mach) / slope)
+}
+
+/// Section maximum lift at `mach`: falls above Mach 0.3, a third as fast as on a 2-D NACA 0012
+/// (McCroskey) since spinning blades hold their lift: NACA TR 684 measures only a 3-5 % static
+/// thrust-per-power loss at 20° blade angle from tip Mach 0.5 to 0.7.
+fn cl_max(foil: usize, mach: f64) -> f64 {
+    AEROFOILS[foil.min(AEROFOILS.len() - 1)].cl_max * (1.0 - 0.35 * (mach - 0.3).max(0.0)).max(0.5)
 }
 
 pub fn section(foil: usize, alpha: f64, mach: f64, re: f64) -> (f64, f64) {
@@ -215,11 +222,25 @@ pub fn section(foil: usize, alpha: f64, mach: f64, re: f64) -> (f64, f64) {
     let (a0, slope, stall) = stall_angle(foil, mach);
     let attached = slope * (alpha - a0);
     let (s, c) = alpha.sin_cos();
-    let plate_cl = 2.0 * s * c;
     let cd0 = 2.0 * skin_friction(re, mach) * f.form_factor();
-    // Blend over 4° past the stall angle.
-    let w = (((alpha - a0).abs() - stall) / (4f64).to_radians()).clamp(0.0, 1.0);
-    let cl = attached.clamp(-f.cl_max, f.cl_max) * (1.0 - w) + plate_cl * w;
+    let ae = alpha - a0;
+    // Lift rounds off before the stall (p-norm soft limit, 0.84·cl_max at the stall angle).
+    let soft = |a: f64| a / (1.0 + (a.abs() / cl_max(foil, mach)).powi(4)).powf(0.25);
+    let cl = if ae.abs() <= stall {
+        soft(attached)
+    } else if ae.abs() < PI / 2.0 {
+        // Viterna & Corrigan post-stall lift: falls gently from cl_max to zero at 90° (the
+        // flat-plate cliff made static thrust collapse past ~20° blade angle; NACA TR 684
+        // measures it level).
+        let (ss, cs) = stall.sin_cos();
+        let k = (soft(slope * stall) - VITERNA_CD_MAX * ss * cs) * ss / (cs * cs);
+        let (sa, ca) = ae.abs().sin_cos();
+        ae.signum() * (VITERNA_CD_MAX * sa * ca + k * ca * ca / sa)
+    } else {
+        2.0 * s * c
+    };
+    // Drag: the section's own below the stall, a flat plate's past it, blended over 4°.
+    let w = ((ae.abs() - stall) / (4f64).to_radians()).clamp(0.0, 1.0);
     let mut cd = cd0 + 0.01 * cl * cl * (1.0 - w) + (2.0 * s * s + cd0) * w;
     // Drag divergence (Korn), then wave drag past Mach 1.
     let mdd = f.kappa - f.t_c - cl.abs() / 10.0;
@@ -231,6 +252,14 @@ pub fn section(foil: usize, alpha: f64, mach: f64, re: f64) -> (f64, f64) {
     }
     (cl, cd)
 }
+
+/// Viterna's maximum drag coefficient for the post-stall lift (1.11 + 0.018·AR for a blade of
+/// aspect ratio AR; 2 for a 2-D section).
+const VITERNA_CD_MAX: f64 = 2.0;
+
+/// Induced power factor: real inflow is uneven over the disc, so it takes ~15 % more induced
+/// power than the ideal even inflow (Leishman, Principles of Helicopter Aerodynamics).
+const KAPPA: f64 = 1.15;
 
 const STATIONS: usize = 10;
 const AZIMUTHS: usize = 8;
@@ -359,7 +388,7 @@ impl Prop {
         let sign = thrust.signum();
         let climb = -f.air.dot(ax) * sign;
         let (v, depth) = induced(climb / vh, f.air.reject(ax).len() / vh, vrs);
-        (sign * v * vh, depth, (0.7 * 2.0 * PI * self.radius / vh).clamp(0.05, 3.0))
+        (sign * KAPPA * v * vh, depth, (0.7 * 2.0 * PI * self.radius / vh).clamp(0.05, 3.0))
     }
 
     /// Steady state: forces with the inflow settled (analysis, tests).
@@ -395,6 +424,50 @@ mod tests {
         assert!(f.thrust > 500.0 && power > 0.0);
         assert!((0.4..0.9).contains(&(ideal / power)), "figure of merit {}", ideal / power);
         assert!(f.force.y.abs() + f.force.z.abs() < 1e-6 * f.thrust);
+    }
+
+    #[test]
+    fn static_thrust_matches_naca_tr_684() {
+        // NACA TR 684 fig. 21: 3-blade Clark Y propeller 5868-9, static, tip Mach 0.5, (blade angle
+        // at 0.75 R, CT, CP). The model blade is 12 % more solid (sigma 0.14 vs 0.125), so CT is
+        // compared at x1.12. Thrust levels off past the stall (~17.5°) while power keeps rising.
+        const MEASURED: [(f64, f64, f64); 6] = [(10.0, 0.098, 0.025), (15.0, 0.133, 0.052), (20.0, 0.148, 0.098), (25.0, 0.157, 0.148), (30.0, 0.160, 0.195), (35.0, 0.163, 0.245)];
+        let g = Prop { radius: 1.44, hub: 0.2, chord: 0.212, blades: 3, foil: 2, propeller: true };
+        let n = 0.5 * 340.0 / (2.0 * PI * 1.44);
+        let d = 2.88f64;
+        for (beta, ct_m, cp_m) in MEASURED {
+            let f = PropFlow { axis: v3(1.0, 0.0, 0.0), spin: 1.0, omega: 2.0 * PI * n, pitch: beta.to_radians(), cyclic: V3::ZERO, air: V3::ZERO, rho: 1.225, a: 340.0 };
+            let (o, _) = g.trim(&f, false);
+            let ct = o.thrust / (1.225 * n * n * d.powi(4));
+            let cp = o.torque * f.omega / (1.225 * n.powi(3) * d.powi(5));
+            println!("{beta}°: CT {ct:.3} (measured x1.12 {:.3}) CP {cp:.3} (measured {cp_m:.3})", 1.12 * ct_m);
+            assert!((ct / (1.12 * ct_m) - 1.0).abs() < 0.2, "{beta}°: CT {ct:.3} vs {:.3}", 1.12 * ct_m);
+            if beta >= 20.0 {
+                assert!((cp / cp_m - 1.0).abs() < 0.2, "{beta}°: CP {cp:.3} vs {cp_m:.3}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_thrust_speed_matches_naca_tr_640() {
+        // NACA TR 640 fig. 9 (same 3-blade 5868-9 in the wind tunnel): V/nD where thrust reaches
+        // zero, per blade angle at 0.75 R.
+        let g = Prop { radius: 1.44, hub: 0.2, chord: 0.212, blades: 3, foil: 2, propeller: true };
+        let n = 0.5 * 340.0 / (2.0 * PI * 1.44);
+        let d = 2.88f64;
+        for (beta, j0_m) in [(15.0f64, 0.82), (25.0, 1.28), (35.0, 1.78), (45.0, 2.65)] {
+            let ct = |j: f64| {
+                let f = PropFlow { axis: v3(1.0, 0.0, 0.0), spin: 1.0, omega: 2.0 * PI * n, pitch: beta.to_radians(), cyclic: V3::ZERO, air: v3(-j * n * d, 0.0, 0.0), rho: 1.225, a: 340.0 };
+                g.trim(&f, false).0.thrust
+            };
+            let (mut lo, mut hi) = (0.5 * j0_m, 1.5 * j0_m);
+            for _ in 0..30 {
+                let mid = 0.5 * (lo + hi);
+                if ct(mid) > 0.0 { lo = mid } else { hi = mid }
+            }
+            println!("{beta}°: zero thrust at J {lo:.2} (measured {j0_m})");
+            assert!((lo / j0_m - 1.0).abs() < 0.1, "{beta}°: J0 {lo:.2} vs {j0_m}");
+        }
     }
 
     #[test]

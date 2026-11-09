@@ -64,9 +64,13 @@ The plugin flight model is on by default (F7 window, Settings tab). It switches 
 
 Propellers and helicopter rotors are flown blade by blade from their shaft speed, blade count, length and pitch: they windmill and drag when unpowered, a free rotor autorotates (gyrocopters), rotors flap and take cyclic, and a driven rotor twists the airframe the other way (single main rotors need a tail rotor). The air's load on the blades slows or drives the shaft. Blade speed is the shaft's RPS (× the part's built-in ratio: 1.5 heavy rotor, 3 aircraft propeller), so set real rotor speeds (a UH-1's 324 rpm main rotor is 5.4 RPS), and they are drawn at that speed (the game draws them 12.6× slower); vanilla builds that spin rotors fast make much more lift than in the base game. "Vortex ring state" in the Settings tab (off by default) makes rotors that sink slowly, nearly straight down, lose lift into their own wake. Fans and boat propellers keep the game's forces.
 
-Blade pitch input 1 is 43° of blade angle, far past stall: rotors lift most at about 0.35 collective. The F7 Rotors tab gives each one's best pitch at the blade speed you enter, and F9 shows the blade angle and a warning when the blades stall.
+A propeller or rotor's configuration panel in the workbench gets a "Blade Width" slider (25 to 200% of the part's own blade): wider blades make more thrust and absorb more power, and are drawn wider. The width is saved on the part in the vehicle file. The Rotors tab's "Shape" column picks how each one's blades are shaped: propeller (cambered, helical twist, rigid) or rotor (symmetric, gentle twist, flapping). Auto picks propeller for parts with a single pitch input or "propeller" in the name.
+
+Blade pitch input 1 is 43° of blade angle, far past stall: rotors lift most at about 0.35 collective. The F7 Rotors tab gives each one's best pitch at the shaft speed you enter (shaft RPS, as the game's sensors read it), and F9 shows the blade angle and a warning when the blades stall.
 
 "Rotor blur" (on by default) draws fast blades as a faint smear over the arc they sweep in about 1/20 s. The flight model and vortex ring settings apply to all vehicles, and the Settings tab can override them for the vehicle open in the workbench: that choice is saved in the vehicle file with its designations.
+
+In multiplayer the host flies every vehicle, so only the host needs the plugin for the physics. A client with the plugin applies no forces and shows the F9 data and arrows from the positions the host sends: speeds are averaged between updates, so the numbers step and lag a little, more for distant vehicles.
 
 ## Credits
 

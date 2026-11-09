@@ -28,6 +28,10 @@ pub(crate) type PushShadow = unsafe extern "system" fn(usize, usize, usize, usiz
 type PushDither = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 
 pub(crate) static ORIGINAL_DRAW: OnceLock<ClassDraw> = OnceLock::new();
+pub(crate) type Mesh1Draw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub(crate) static ORIGINAL_MESH1: OnceLock<Mesh1Draw> = OnceLock::new();
+pub(crate) type EditorDraw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub(crate) static ORIGINAL_EDITOR_DRAW: OnceLock<EditorDraw> = OnceLock::new();
 pub(crate) static ORIGINAL_232: OnceLock<Push232> = OnceLock::new();
 pub(crate) static ORIGINAL_SHADOW_A: OnceLock<PushShadow> = OnceLock::new();
 pub(crate) static ORIGINAL_SHADOW_B: OnceLock<PushShadow> = OnceLock::new();
@@ -107,6 +111,8 @@ thread_local! {
     static NEXT: Cell<usize> = const { Cell::new(0) };
     /// matA pointer of the item whose shadow pushes are dropped (blur copies, hidden blades).
     static SWALLOW: Cell<usize> = const { Cell::new(0) };
+    /// While a propeller part draws: its definition and blade width (x the mesh's own).
+    static WIDEN: Cell<(usize, f64)> = const { Cell::new((0, 1.0)) };
 }
 
 /// Diagnostics: copy items routed as blade / dropped as hub.
@@ -183,6 +189,52 @@ unsafe fn force_dir(comp: usize) -> Option<[f64; 3]> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "system" fn draw_detour(c: usize, q: usize, ma: usize, mb: usize, a5: usize, a6: usize, a7: usize, a8: usize, a9: usize, a10: usize) -> usize {
+    widened(c, || draw_part(c, q, ma, mb, a5, a6, a7, a8, a9, a10))
+}
+
+/// The editor's highlight copy (Select tool): widened like the part itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "system" fn editor_draw_detour(c: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) -> usize {
+    let Some(orig) = ORIGINAL_EDITOR_DRAW.get() else { return 0 };
+    widened(c, || orig(c, a2, a3, a4, a5, a6, a7, a8))
+}
+
+/// Run a part's draw with its blade width set for `mesh1_detour`.
+unsafe fn widened(c: usize, draw: impl FnOnce() -> usize) -> usize {
+    let w = crate::marks::get(c).and_then(|m| m.blade_width).map_or(1.0, |w| w as f64);
+    if w == 1.0 || !readable(c + 0x58, 8) {
+        return draw();
+    }
+    WIDEN.with(|x| x.set((read_usize_at(c + 0x58), w)));
+    let r = draw();
+    WIDEN.with(|x| x.set((0, 1.0)));
+    r
+}
+
+/// One blade (`draw_def_mesh1`): widened across its span while a part with a blade width draws.
+/// The blade mesh spans along x (`force_emitter_draw`: Pre = S·P·RotY·R_hub), so scaling the
+/// mesh's y and z (rows 1 and 2 of the row-vector matrix) widens chord and thickness together
+/// and keeps the twist.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "system" fn mesh1_detour(def: usize, q: usize, ma: usize, mb: usize, a5: usize, a6: usize, a7: usize, a8: usize, a9: usize) -> usize {
+    let Some(orig) = ORIGINAL_MESH1.get() else { return 0 };
+    let (d, w) = WIDEN.with(|x| x.get());
+    if d != def || w == 1.0 || !readable(ma, 128) || !readable(mb, 128) {
+        return orig(def, q, ma, mb, a5, a6, a7, a8, a9);
+    }
+    let widen = |p: usize| {
+        let mut m = (p as *const [f64; 16]).read_unaligned();
+        for j in 4..12 {
+            m[j] *= w;
+        }
+        m
+    };
+    let (wa, wb) = (widen(ma), widen(mb));
+    orig(def, q, wa.as_ptr() as usize, wb.as_ptr() as usize, a5, a6, a7, a8, a9)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_part(c: usize, q: usize, ma: usize, mb: usize, a5: usize, a6: usize, a7: usize, a8: usize, a9: usize, a10: usize) -> usize {
     let Some(orig) = ORIGINAL_DRAW.get() else { return 0 };
     let blur = std::panic::catch_unwind(|| blur_of(c)).ok().flatten();
     let phi = hinge_extra(c);

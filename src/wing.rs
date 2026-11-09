@@ -62,12 +62,11 @@ pub struct Aerofoil {
     pub kind: FoilKind,
 }
 
-/// Which list a section is offered in. `Grid` is never offered: grid fin parts get it themselves.
+/// Which list a section is offered in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FoilKind {
     Wing,
     Fin,
-    Grid,
 }
 
 impl Aerofoil {
@@ -83,7 +82,7 @@ impl Aerofoil {
 
 /// Selectable sections. The first is FAR's: its drag rise at Mach 0.8 and supersonic wave drag
 /// 0.009216/β are those of a ~4 % symmetric section.
-pub const AEROFOILS: [Aerofoil; 15] = [
+pub const AEROFOILS: [Aerofoil; 14] = [
     Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. A safe all-round choice.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0, kind: FoilKind::Wing },
     Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, slow flight)", note: "Thick and strongly curved: lots of lift at low speed, but it stalls early and drags a lot when fast.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
     Aerofoil { id: "naca2412", name: "NACA 2412 (light aircraft)", note: "Moderate curve and thickness: the usual light-aircraft wing, easy to fly.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
@@ -101,22 +100,10 @@ pub const AEROFOILS: [Aerofoil; 15] = [
     Aerofoil { id: "fin_dogfight", name: "Sharp high-angle (dogfight)", note: "Keeps lifting at steep angles, so the missile can pull very hard turns at short range. A little more drag.", t_c: 0.035, cl0: 0.0, cl_max: 1.8, kappa: 0.86, k_wave: 6.0, kind: FoilKind::Fin },
     Aerofoil { id: "fin_round10", name: "Rounded 10% (slow missiles, bombs)", note: "Thicker with a rounded front: smooth and forgiving below the speed of sound, but draggy above it. For anti-tank missiles, glide bombs and drones.", t_c: 0.10, cl0: 0.0, cl_max: 1.4, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Fin },
     Aerofoil { id: "fin_flat", name: "Flat plate, square edges (rockets)", note: "A plain flat sheet with square edges: simple, but more drag at every speed and it stalls early. For unguided rockets and simple builds.", t_c: 0.05, cl0: 0.0, cl_max: 0.9, kappa: 0.80, k_wave: 12.0, kind: FoilKind::Fin },
-    // Grid (lattice) fins, given to grid fin parts: the lattice face as a planar fin of the same
-    // area (DERA: a grid fin's normal force is about a planar fin's), no stall, axial force 2–3×
-    // (DeSpirito et al. 2000, ARL-TR-2318), lift lost to cell choking near Mach 1 (`grid_choke`).
-    Aerofoil { id: "grid", name: "Grid fin (lattice)", note: "A lattice of small cells: keeps steering at very steep angles, but drags a lot and loses grip near the speed of sound.", t_c: 0.06, cl0: 0.0, cl_max: 3.0, kappa: 0.80, k_wave: 6.0, kind: FoilKind::Grid },
 ];
 
 /// Default section of missile fin panels.
 pub const FIN_DEFAULT: usize = 9;
-pub const GRID: usize = 14;
-
-/// Grid fin cells choke from about Mach 0.75: normal force sags to ~half at Mach 1 and recovers
-/// once supersonic (Washington & Miller 1993; Simpson & Sadler 1998). (lift factor, drag factor.)
-fn grid_choke(mach: f64) -> (f64, f64) {
-    let bump = (1.0 - ((mach - 1.0) / 0.3).powi(2)).max(0.0);
-    (1.0 - 0.5 * bump, 2.5 * (1.0 + bump))
-}
 
 pub fn aerofoil_index(id: &str) -> Option<usize> {
     AEROFOILS.iter().position(|a| a.id == id)
@@ -777,7 +764,7 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
             // Camber acts as built-in incidence toward body-up (none on fins: no "up" side).
             aoa: normals[i].dot(vn).clamp(-1.0, 1.0).asin() - camber_sign(normals[i]) * af.camber_aoa() * camber_fade(flow.mach),
             lift_slope: ls,
-            aoa_max: if af.kind == FoilKind::Grid { 1.2 } else { aoa_max(flow.mach, ls, af.cl_max) },
+            aoa_max: aoa_max(flow.mach, ls, af.cl_max),
             cos_sweep,
             cd0_inc: cd_compressibility(flow.mach, cos_sweep, af),
             stall: stall[i],
@@ -947,11 +934,6 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
                 cdi = beta * cl * cl / pi_ar_e;
             }
             cd = cdi + cd0;
-        }
-        if af.kind == FoilKind::Grid {
-            let (lf, df) = grid_choke(mach);
-            cl *= lf;
-            cd = cdi * lf * lf + cd0 * df;
         }
         let mut at = p.centroid + pl * ac_offset(mach, p.mac, cos_sweep, cos_a);
         if st > 0.0 {
@@ -1282,13 +1264,6 @@ mod tests {
         // Camber gives no lift supersonic.
         let (cls_gal, _) = coeffs("naca4415", 0.0, 1.6);
         assert!(cls_gal.abs() < 1e-6, "{cls_gal}");
-        // Grid fins: still lifting at 40° where a planar fin has stalled, lift sagging at Mach 1.
-        let (cl_grid, cd_grid) = coeffs("grid", 40.0, 0.5);
-        let (cl_hex, _) = coeffs("fin_hex4", 40.0, 0.5);
-        assert!(cl_grid > 1.5 * cl_hex, "grid {cl_grid} vs planar {cl_hex} at 40°");
-        assert!(coeffs("grid", 1.0, 0.5).1 > 2.0 * coeffs("fin_hex4", 1.0, 0.5).1 && cd_grid > 0.0);
-        let per_aoa = |m: f64| coeffs("grid", 5.0, m).0;
-        assert!(per_aoa(1.0) < 0.7 * per_aoa(0.6) && per_aoa(1.5) > per_aoa(1.0), "choking");
         // Supercritical delays the drag rise (zero-lift compressibility drag, straight wing).
         let foil = |id| &AEROFOILS[aerofoil_index(id).unwrap()];
         let (sc, n0012) = (cd_compressibility(0.8, 1.0, foil("supercritical")), cd_compressibility(0.8, 1.0, foil("naca0012")));
