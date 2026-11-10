@@ -944,7 +944,18 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         let (ground, wing_height) = ground_factors(physics_scene, scene, &model, &lbs, main, &bodies);
         let deflect: Vec<f64> =
             model.fin_live.iter().map(|f| f.and_then(|f| Some(f.sign * live_angle(*craft.comp_ptrs.get(f.comp)?, f.src)?)).unwrap_or(0.0)).collect();
-        let mut forces = model.live_forces(&lbs, main, &mut craft.stall, &ground, &deflect);
+        // Propeller slipstreams, from each one's inflow as of the last tick.
+        craft.prop_v.resize(model.props.len(), 0.0);
+        let slips: Vec<Option<crate::model::Slipstream>> = (0..model.props.len())
+            .map(|k| {
+                let u = &model.props[k];
+                let lb = live.get(u.body as usize).copied().flatten()?.0;
+                let (s, linked, _) = prop_live_state(*craft.comp_ptrs.get(u.comp)?, u.def.rotor())?;
+                (PROPS_HOOKED.load(Ordering::Relaxed) && linked && lb.to_world(u.hub).y > 0.0).then(|| model.slipstream(k, &lb, &s, craft.prop_v[k])).flatten()
+            })
+            .collect();
+        let washes: Vec<crate::model::Slipstream> = slips.iter().flatten().copied().collect();
+        let mut forces = model.live_forces(&lbs, main, &mut craft.stall, &ground, &deflect, &washes);
         // Wings and fuselage only: the flight data's lift, drag and coefficients leave out rotor thrust.
         let n_aero = forces.len();
         // Propellers and rotors: blade-element forces at each one's live speed and pitch.
@@ -999,7 +1010,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             // The air's torque on the spin axis reaches the airframe through a driven shaft (the
             // engine or hinge motor holds it); a free rotor just changes speed. A hinge motor only
             // holds the hub's speed: the air never loads the hub, so it reacts with nothing itself.
-            let torque = if linked { out.moment } else { out.moment - out.axial };
+            // A driven propeller's slipstream swirl hands part of that torque back through the wing and tail.
+            let torque = if linked { out.moment + slips[k].map_or(V3::ZERO, |sl| model.swirl_recovery(&sl, &lbs, &out)) } else { out.moment - out.axial };
             forces.push(crate::model::LiveForce { body: u.body as usize, force: out.force, at: out.at, torque });
             prop_out.push((k, out, s.w));
         }

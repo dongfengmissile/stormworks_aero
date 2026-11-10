@@ -381,11 +381,40 @@ pub struct PropOut {
 
 /// Shaft inertia per unit of the game's slot mass, kg·m². The shaft network conserves slot
 /// mass × speed (`vehicle_shaft_network_step` 0x4C02A0), so a torque removes `Q·dt / (2π·I)`.
-/// Set so a propeller or rotor at its best static pitch drains about what the game's own model
-/// takes for the same thrust (`T/1500` momentum per tick): aircraft propellers and the large
-/// coaxial rotor match; smaller rotors load the shaft less than in the game (0.25..0.75x).
-/// shortcut: one factor for all parts (the game's load follows thrust, ours power); retune from players' readings.
-const SHAFT_INERTIA: f64 = 2.4;
+/// The game has no torque unit, so this is a choice: set so an aircraft propeller at its best static
+/// pitch drains about half of what the game's own model takes for the same thrust (`T/1500` momentum
+/// per tick). Matching the game there (2.4) stalled engines at coarse pitch on take-off, where stalled
+/// blades take ~3x the power per thrust; at half, load passes the game's from about 50 m/s (it follows
+/// power, the game's follows thrust). Smaller rotors load the shaft less still.
+/// shortcut: one factor for all parts; retune from players' readings.
+const SHAFT_INERTIA: f64 = 4.8;
+
+/// A propeller's slipstream this tick, world frame: a tube behind the disc that speeds up from
+/// `v0 + vi` at the disc to `v0 + 2·vi` far behind, and narrows to keep its flow (momentum theory).
+#[derive(Clone, Copy, Debug)]
+pub struct Slipstream {
+    pub hub: V3,
+    /// Thrust direction: the tube runs the other way.
+    pub axis: V3,
+    pub radius: f64,
+    /// Flight speed along the axis and the induced speed at the disc, m/s.
+    pub v0: f64,
+    pub vi: f64,
+}
+
+impl Slipstream {
+    /// Inside the tube at world point `p`: the air's speed along it there and the radial vector from the axis.
+    pub fn at(&self, p: V3) -> Option<(f64, V3)> {
+        let d = p - self.hub;
+        let x = -d.dot(self.axis);
+        if x <= 0.0 {
+            return None; // ahead of the disc
+        }
+        let rv = d + self.axis * x;
+        let speed = self.v0 + self.vi * (1.0 + x / (x * x + self.radius * self.radius).sqrt());
+        (rv.len() <= self.radius * ((self.v0 + self.vi) / speed).sqrt()).then_some((speed, rv))
+    }
+}
 
 /// Cyclic blade angle per unit input, rad.
 const CYCLIC_RAD: f64 = 0.2;
@@ -516,6 +545,63 @@ impl Model {
             blade_angle: flow.pitch,
             stalled: f.stalled,
         }
+    }
+
+    /// The slipstream of propeller `k` (None for rotors, and when it is stopped or windmilling).
+    /// `v`: induced speed at the disc, m/s.
+    pub fn slipstream(&self, k: usize, lb: &LiveBody, s: &PropLive, v: f64) -> Option<Slipstream> {
+        let u = &self.props[k];
+        let axis = lb.dir_to_world(u.axis).norm() * if s.reversed { -1.0 } else { 1.0 };
+        let hub = lb.to_world(u.hub);
+        let v0 = (lb.vel + lb.omega.cross(hub - lb.com) - lb.wind).dot(axis).max(0.0);
+        let radius = self.prop_geom(k, s.blades, s.length).radius;
+        (u.airscrew && v > 0.5 && radius > 0.0).then_some(Slipstream { hub, axis, radius, v0, vi: v })
+    }
+
+    /// Rolling moment (world, N·m) the propeller's rotating slipstream puts on the wing and tail
+    /// cells inside it: it opposes the torque reaction. Momentum theory, constant circulation: the
+    /// wake carries the torque as swirl, r·vθ = Q / (ρ·V_disc·πR²). A cell meets the swirl as a
+    /// change of angle of attack at the wake's speed; its lift slope is that of a wing as wide as
+    /// the tube, and it stalls at cl 1.2. Never more than Q: that is all the swirl there is.
+    /// NACA TN 1146 measured 40-50 % cancelled by wing + fuselage on a low-wing single without its tail.
+    pub fn swirl_recovery(&self, slip: &Slipstream, bodies: &[LiveBody], out: &PropOut) -> V3 {
+        if !(out.torque > 1.0) || bodies.is_empty() {
+            return V3::ZERO;
+        }
+        let (axis, radius) = (slip.axis, slip.radius);
+        let rho = atmosphere(slip.hub.y).rho;
+        let circ = out.torque / (rho * (slip.v0 + slip.vi) * PI * radius * radius);
+        // Per panel: how far behind the disc it sits, and the moment the full swirl would give it.
+        let mut parts: Vec<(f64, f64)> = Vec::new();
+        for p in self.panels.iter().filter(|p| !p.cells.is_empty()) {
+            let b = &bodies[self.panel_body(p).min(bodies.len() - 1)];
+            let n = b.dir_to_world(p.n);
+            let cell_area = p.area / p.cells.len() as f64;
+            let ar = 2.0 * radius / p.mac.max(0.05);
+            let slope = 2.0 * PI * ar / (ar + 2.0);
+            let mut m = 0.0;
+            for &c in &p.cells {
+                let Some((speed, rv)) = slip.at(b.to_world(crate::body::aero_pos(self.grid.cell(c)))) else { continue };
+                let r = rv.len().max(1e-6);
+                // The air turns the way the blades do: along spin·(axis × r).
+                let swirl = axis.cross(rv) * (out.spin * circ / (r * r.max(0.2 * radius)));
+                let cl = (slope * swirl.dot(n) / speed).clamp(-1.2, 1.2);
+                let f = n * (0.5 * rho * speed * speed * cl * cell_area);
+                m += rv.cross(f).dot(axis) * out.spin;
+            }
+            if m != 0.0 {
+                parts.push((-(b.to_world(p.centroid) - slip.hub).dot(axis), m));
+            }
+        }
+        // Front to back: each surface meets only the swirl the ones ahead of it left.
+        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut left = out.torque;
+        for (_, m) in parts {
+            left -= (m * left / out.torque).clamp(-left, left);
+        }
+        // Against the torque reaction (−spin·Q about the axis) only; `left` never passes zero, so at
+        // most all of it: a design with enough surface in the slipstream straightens it completely.
+        axis * ((out.torque - left).clamp(0.0, out.torque) * out.spin)
     }
 
     pub fn build(comps: Vec<Comp>, lib: &mut Library, des: &Designations) -> Model {
@@ -759,7 +845,9 @@ impl Model {
     /// metres, y up. Returns forces at world points and torques, per body.
     /// `ground[i]`: ground-effect factor φ of panel i (1 = none, see `ground_effect`); empty = no ground effect.
     /// `deflect`: live control deflection per panel, radians (empty = none).
-    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64], deflect: &[f64]) -> Vec<LiveForce> {
+    /// `slips`: propeller slipstreams. A panel's cells inside one meet its faster air (strip theory by
+    /// the share of cells inside), so a tail in the propwash steers before the aeroplane moves.
+    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64], deflect: &[f64], slips: &[Slipstream]) -> Vec<LiveForce> {
         let Some(mb) = bodies.get(main) else {
             return Vec::new();
         };
@@ -769,10 +857,34 @@ impl Model {
         let at = atmosphere(alt);
         let v_main = air(mb, com_w);
         let speed = v_main.len();
-        if speed < 1.0 || !speed.is_finite() {
+        let owner: Vec<usize> = self.panels.iter().map(|p| self.panel_body(p).min(bodies.len().saturating_sub(1))).collect();
+        // Per panel: the extra speed along each propeller's axis that gives its mix of free and
+        // slipstream air the right dynamic pressure, q = (1 − φ)·q_free + φ·q_slip.
+        let mut wash = vec![V3::ZERO; self.panels.len()];
+        for sl in slips {
+            for ((p, &b), w) in self.panels.iter().zip(&owner).zip(&mut wash).filter(|((p, _), _)| !p.cells.is_empty()) {
+                let lb = &bodies[b];
+                let (mut n, mut q) = (0usize, 0.0);
+                for &c in &p.cells {
+                    if let Some((v, _)) = sl.at(lb.to_world(crate::body::aero_pos(self.grid.cell(c)))) {
+                        n += 1;
+                        q += v * v;
+                    }
+                }
+                if n > 0 {
+                    let phi = n as f64 / p.cells.len() as f64;
+                    let free = air(lb, lb.to_world(p.centroid)).dot(sl.axis).max(0.0);
+                    *w += sl.axis * ((((1.0 - phi) * free * free + q / p.cells.len() as f64).sqrt() - free).max(0.0));
+                }
+            }
+        }
+        let washed = wash.iter().map(|w| w.len()).fold(0.0, f64::max);
+        if speed.max(washed) < 1.0 || !speed.is_finite() {
             stall.iter_mut().for_each(|s| *s = 0.0);
             return Vec::new();
         }
+        // Standing still in the propwash: the panels' Mach and Reynolds numbers come from the wash.
+        let speed = speed.max(washed);
         let mach = speed / at.a;
         let re_m = reynolds_per_m(&at, mach);
         let mut out = Vec::new();
@@ -781,11 +893,14 @@ impl Model {
         let len = self.body.length.max(0.25);
         let re = re_m * len;
         let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
-        let (fb, mbm) = self.body.forces(&flow, -mb.dir_to_aero(v_main), mb.axial_to_aero(mb.omega), self.com, at.rho);
+        let (fb, mbm) = if v_main.len() >= 1.0 {
+            self.body.forces(&flow, -mb.dir_to_aero(v_main), mb.axial_to_aero(mb.omega), self.com, at.rho)
+        } else {
+            (V3::ZERO, V3::ZERO)
+        };
         out.push(LiveForce { body: main, force: mb.dir_to_world(fb), at: com_w, torque: mb.axial_to_world(mbm) });
 
         // Lifting panels where their body is now: a deflected sub-grid is a tilted panel.
-        let owner: Vec<usize> = self.panels.iter().map(|p| self.panel_body(p).min(bodies.len().saturating_sub(1))).collect();
         let world: Vec<Panel> = self
             .panels
             .iter()
@@ -807,7 +922,7 @@ impl Model {
         let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m, gamma: at.gamma };
         let zero = vec![0.0; world.len()];
         let deflect = if deflect.len() == world.len() { deflect } else { &zero };
-        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p), deflect, stall);
+        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p) + wash[i], deflect, stall);
         for (f, &b) in pf.iter().zip(&owner) {
             out.push(LiveForce { body: b, force: f.force, at: f.at, torque: V3::ZERO });
         }
@@ -1212,6 +1327,17 @@ mod tests {
         assert!((dt - 0.025).abs() < 1e-4);
         assert_eq!(measure_step(dt, v3(0.01, 0.0, 0.0), v3(0.5, 0.0, 0.0)), dt);
         // too slow to measure
+    }
+
+    #[test]
+    fn slipstream_tube_speeds_up_and_narrows_behind_the_disc() {
+        let sl = Slipstream { hub: V3::ZERO, axis: v3(1.0, 0.0, 0.0), radius: 1.5, v0: 20.0, vi: 10.0 };
+        assert!(sl.at(v3(1.0, 0.0, 0.0)).is_none(), "ahead of the disc");
+        let (near, _) = sl.at(v3(-0.01, 1.45, 0.0)).unwrap();
+        let (far, rv) = sl.at(v3(-30.0, 1.0, 0.0)).unwrap();
+        assert!((near - 30.0).abs() < 0.2 && (far - 40.0).abs() < 0.2 && (rv - v3(0.0, 1.0, 0.0)).len() < 1e-9, "{near} {far}");
+        // Far behind the tube is R·√(30/40) = 1.30 m.
+        assert!(sl.at(v3(-30.0, 1.25, 0.0)).is_some() && sl.at(v3(-30.0, 1.35, 0.0)).is_none());
     }
 
     #[test]
