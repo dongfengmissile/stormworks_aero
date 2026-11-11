@@ -13,6 +13,7 @@ pub mod marks;
 pub mod math;
 pub mod model;
 pub mod prop;
+pub mod settings;
 pub mod shape;
 pub mod spool;
 pub mod vehicle;

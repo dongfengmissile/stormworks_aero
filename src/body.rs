@@ -82,8 +82,10 @@ pub struct Flow {
 impl BodyAero {
     /// `no_skin[i]`: grid cell i belongs to a wing panel, whose skin friction the wing
     /// model already counts (2·Cf in its Cd0), so its faces are left out of the wetted area.
-    pub fn build(grid: &Grid, no_skin: &[bool]) -> BodyAero {
-        let mut xs = cross_sections(grid, no_skin);
+    /// `no_skin`: cells whose skin is a wing panel's. `skip`: cells left out altogether (they
+    /// belong to a body with its own model). Both may be empty.
+    pub fn build(grid: &Grid, no_skin: &[bool], skip: &[bool]) -> BodyAero {
+        let mut xs = cross_sections(grid, no_skin, skip);
         let thickness = VOXEL_M;
         let filled: Vec<usize> = (0..xs.len()).filter(|&i| xs[i].area > 0.0).collect();
         let (front, back) = match (filled.first(), filled.last()) {
@@ -448,7 +450,7 @@ impl Section {
     }
 }
 
-fn crossflow_drag(mach: f64, re: f64) -> f64 {
+pub(crate) fn crossflow_drag(mach: f64, re: f64) -> f64 {
     let mach_curve = Curve(vec![
         [0.0, 1.2, 0.0],
         [0.3, 1.2, 0.0],
@@ -493,7 +495,7 @@ fn rotate_from_to(from: V3, to: V3, v: V3) -> V3 {
 }
 
 /// Slices along the main axis (grid Z, nose first) with area, centroid, flatness, exposure.
-fn cross_sections(g: &Grid, no_skin: &[bool]) -> Vec<Xsec> {
+fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
     let [nx, ny, nz] = g.dims;
     let cell_area = VOXEL_M * VOXEL_M;
     let mut out = Vec::with_capacity(nz);
@@ -506,7 +508,7 @@ fn cross_sections(g: &Grid, no_skin: &[bool]) -> Vec<Xsec> {
         for yi in 0..ny {
             for xi in 0..nx {
                 let i = xi + nx * (yi + ny * zi);
-                if g.owner[i] == EMPTY {
+                if g.owner[i] == EMPTY || skip.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 let c = [g.min[0] + xi as i32, g.min[1] + yi as i32, z];
@@ -850,7 +852,7 @@ mod tests {
             }
         }
         let g = Grid::from_cells(&cells);
-        let b = BodyAero::build(&g, &[]);
+        let b = BodyAero::build(&g, &[], &[]);
         assert!(b.length > 19.0 && b.length < 21.0, "len {}", b.length);
         assert!(b.critical_mach > 0.5 && b.critical_mach < 1.0);
         assert!(b.sonic_drag_area > 0.0, "{}", b.sonic_drag_area);

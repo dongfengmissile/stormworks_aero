@@ -39,18 +39,6 @@ Logs go to:
 <Stormworks install>/logs/aero.log
 ```
 
-## Wings
-
-Wings in Stormworks are usually built from blocks, so the plugin has to be told which blocks are wings. Click the **Aero wings** button at the end of the workbench toolbar, then use the shelves on the left:
-
-| tool | what a click on the vehicle does |
-|---|---|
-| Wing blocks | click modes picked on the next shelf: toggle a block, fill a slab (one thin wing panel), fill body (every block of the body, for thick flying wings), remove a slab |
-| Control role | give a control surface or hinged sub-grid a role: pitch, roll, yaw, flap |
-| Aerofoil | give a wing or missile fin an aerofoil: pick Lifting surfaces or Missile fins, then a section (hover the icons for their names) |
-
-Wing blocks are painted on the vehicle by role, or by aerofoil in the aerofoil tool. Vanilla wings and control surfaces are wings automatically. Designations belong to the parts themselves: they are saved with the vehicle, and copying and pasting parts (a missile onto another vehicle, say) or undoing an edit takes them along.
-
 ## Keybindings
 
 | key | |

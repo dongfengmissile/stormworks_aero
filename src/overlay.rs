@@ -17,7 +17,7 @@ use crate::model::{Coeffs, Cond, Designations, Model, Stability};
 use crate::vehicle::Comp;
 use crate::view::{self, Camera, Face, Image};
 use crate::voxel::{EMPTY, INTERIOR};
-use crate::wing::{FoilKind, Role, AEROFOILS};
+use crate::wing::{Role, AEROFOILS};
 
 const VIEW_W: usize = 760;
 const VIEW_H: usize = 460;
@@ -63,13 +63,32 @@ enum Tool {
     Wing,
     Role,
     Foil,
-    /// Mark wing blocks as a separate wing (own panels and wing, e.g. for another aerofoil).
-    Split,
+}
+
+impl Tool {
+    /// What the vehicle's colours show: 0 control roles, 1 aerofoils, 2 which wing (wing block tools).
+    fn colours(self) -> u8 {
+        match self {
+            Tool::Inspect | Tool::Role => 0,
+            Tool::Foil => 1,
+            Tool::Wing => 2,
+        }
+    }
+}
+
+struct PickCache {
+    /// Faces, camera and size it was rendered for.
+    key: (usize, [u64; 16], usize, usize),
+    /// Face index + 1 per pixel, and whether each face shows anywhere.
+    id: Vec<u32>,
+    visible: Vec<bool>,
 }
 
 struct Built {
     model: Model,
     faces: Vec<Face>,
+    /// Workbench snapshot the parts came from.
+    gen: u64,
 }
 
 struct Sweep {
@@ -136,6 +155,19 @@ pub(crate) struct Overlay {
     // Voxel view.
     cam: Camera,
     tool: Tool,
+    /// Wing number the block tools paint into (0: the plain wings).
+    target: u32,
+    /// Drag painting in progress: marking (or unmarking), and the last block it touched.
+    stroke: Option<(bool, u32)>,
+    /// The designations when the press that started the drag came (its undo step).
+    stroke_start: Designations,
+    /// Id render of the vehicle through the workbench camera (`pick_world`).
+    pick: Option<PickCache>,
+    /// The camera last seen, and since when it has not moved.
+    pick_clip: Option<([f64; 16], std::time::Instant)>,
+    /// Hover preview: what it was worked out for, and the faces to light up.
+    hover_key: Option<(usize, Tool, usize, bool, usize, usize)>,
+    hover_faces: Vec<usize>,
     role_pick: usize,
     foil_pick: usize,
     tex: Option<TextureId>,
@@ -154,7 +186,11 @@ pub(crate) struct Overlay {
     /// The game's "Aero wings" toolbar mode is on (picking on the real vehicle).
     bench: bool,
     /// What the published paint was computed from: (model, aerofoil colours, designated wing count).
-    paint_key: Option<(usize, bool, usize)>,
+    paint_key: Option<(usize, u8, usize, u32)>,
+    /// Merge wings: the blocks and body of the wing chosen by the first click.
+    merge_from: Option<(std::collections::HashSet<[i32; 3]>, u32)>,
+    /// Snapshot `faces` were built from.
+    faces_gen: Option<u64>,
     /// Flight data readout (F9).
     flight_data: bool,
 }
@@ -169,6 +205,8 @@ impl Overlay {
             des: Designations::default(),
             model: None,
             faces: Arc::new(Vec::new()),
+            faces_gen: None,
+            merge_from: None,
             model_dirty: false,
             building: Arc::new(AtomicBool::new(false)),
             built: Arc::new(Mutex::new(None)),
@@ -201,6 +239,13 @@ impl Overlay {
             prop_curves: Vec::new(),
             cam: Camera { yaw: 0.6, pitch: 0.45, dist: 25.0, target: V3::ZERO },
             tool: Tool::Inspect,
+            target: 0,
+            stroke: None,
+            stroke_start: Designations::default(),
+            pick: None,
+            pick_clip: None,
+            hover_key: None,
+            hover_faces: Vec::new(),
             role_pick: 1,
             foil_pick: 1,
             tex: None,
@@ -269,13 +314,14 @@ impl Overlay {
             }
         }
         if !on {
+            crate::toolbar::RESET_REQ.store(false, Ordering::Relaxed);
+            crate::toolbar::NEW_WING_REQ.store(false, Ordering::Relaxed);
+            crate::toolbar::DETECT_REQ.store(false, Ordering::Relaxed);
+            self.stroke = None;
             return;
         }
         // Tool, role and aerofoil come from the game-style side shelves.
-        let mut tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
-        if tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 4 {
-            tool = Tool::Split; // the wing shelf's "New wing" button
-        }
+        let tool = [Tool::Wing, Tool::Role, Tool::Foil][crate::toolbar::TOOL.load(Ordering::Relaxed).min(2)];
         if tool != self.tool {
             self.tool = tool;
             self.view_dirty = true;
@@ -290,10 +336,40 @@ impl Overlay {
         for _ in 0..crate::toolbar::REDO_REQ.swap(0, Ordering::Relaxed) {
             self.redo_designation();
         }
-        if let (Some(at), Some(m)) = (crate::toolbar::take_click(), self.model.clone()) {
+        if crate::toolbar::RESET_REQ.swap(false, Ordering::Relaxed) {
+            self.reset_designations();
+        }
+        if crate::toolbar::RESET_ASKING.load(Ordering::Relaxed) {
+            let _ = crate::toolbar::take_click(); // clicks belong to the game's confirm screen
+            return;
+        }
+        let Some(m) = self.model.clone() else {
+            let _ = crate::toolbar::take_click();
+            return;
+        };
+        // The New wing toggle: on starts a separate wing, off goes back to the plain wing.
+        if crate::toolbar::NEW_WING_REQ.swap(false, Ordering::Relaxed) {
+            if self.target == 0 {
+                self.new_wing();
+            } else {
+                self.target = 0;
+                self.view_dirty = true;
+            }
+        }
+        crate::toolbar::NEW_WING_ON.store(self.target != 0, Ordering::Relaxed);
+        if self.tool != Tool::Wing || crate::toolbar::WING_MODE.load(Ordering::Relaxed) != 2 {
+            self.merge_from = None;
+        }
+        if crate::toolbar::DETECT_REQ.swap(false, Ordering::Relaxed) {
+            self.detect(&m);
+        }
+        self.stroke_step(ui, &m);
+        self.hover_preview(ui, &m);
+        if let Some(at) = crate::toolbar::take_click() {
             let io = ui.io();
             let clip = editor::WORLD_CLIP.lock().map(|c| c.is_some()).unwrap_or(false);
-            let pick = self.pick_world(at, io.display_size);
+            self.stroke_start = self.des.clone();
+            let pick = self.pick_world(at, io.display_size, true);
             let (cell, comp) = pick.and_then(|f| self.faces.get(f)).map_or((usize::MAX, u32::MAX), |f| (f.cell, f.comp));
             log_line(&format!(
                 "bench pick at {at:?}: camera {} face {pick:?} cell {cell} comp {comp} tool {:?}",
@@ -301,7 +377,7 @@ impl Overlay {
                 self.tool
             ));
             match pick {
-                Some(face) => self.apply_tool(&m, face),
+                Some(face) => self.apply_tool(&m, face, io.key_ctrl),
                 None => self.status = "no block under the cursor".into(),
             }
         }
@@ -310,7 +386,7 @@ impl Overlay {
     /// Publish the workbench paint (voxel colours per body) when the model or colouring changed.
     fn publish_paint(&mut self) {
         let Some(m) = self.model.clone() else { return };
-        let key = (Arc::as_ptr(&m) as usize, self.tool == Tool::Foil, self.des.wings.len() + self.des.splits.len());
+        let key = (Arc::as_ptr(&m) as usize, self.tool.colours(), self.des.wings.len() + self.des.splits.len(), self.target);
         if self.paint_key == Some(key) {
             return;
         }
@@ -319,7 +395,7 @@ impl Overlay {
         let mut per_body: Vec<crate::paint::VoxelColours> = Vec::new();
         for cell in 0..g.owner.len() {
             let o = g.owner[cell];
-            let Some(col) = self.cell_color(&m, cell) else {
+            let Some(col) = self.cell_color(&m, cell, self.tool.colours()) else {
                 continue;
             };
             let b = if o != EMPTY && o != INTERIOR {
@@ -332,6 +408,16 @@ impl Overlay {
             }
             per_body[b].insert(g.cell(cell), crate::paint::rgba(col));
         }
+        // The other parts' cells of a painted body, as colour 0 (`voxel::colour_runs`).
+        for cell in 0..g.owner.len() {
+            let o = g.owner[cell];
+            if o == EMPTY || o == INTERIOR {
+                continue;
+            }
+            if let Some(v) = per_body.get_mut(m.comps[o as usize].body as usize).filter(|v| !v.is_empty()) {
+                v.entry(g.cell(cell)).or_insert(0);
+            }
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&key, &mut h);
         let key = std::hash::Hasher::finish(&h);
@@ -342,8 +428,8 @@ impl Overlay {
             .enumerate()
             .filter_map(|(i, c)| {
                 let col = match m.fin_of.get(&(i as u32)) {
-                    Some(&(p, _)) => self.panel_color(&m, p),
-                    None => g.index(c.pos).filter(|&k| g.owner[k] == i as u32).and_then(|k| self.cell_color(&m, k))?,
+                    Some(&(p, _)) => self.panel_color(&m, p, self.tool.colours()),
+                    None => g.index(c.pos).filter(|&k| g.owner[k] == i as u32).and_then(|k| self.cell_color(&m, k, self.tool.colours()))?,
                 };
                 Some((c.pos, crate::paint::rgba(col)))
             })
@@ -367,6 +453,10 @@ impl Overlay {
         if d != self.des {
             self.des = d;
             self.model_dirty = true;
+        }
+        // A wing number from another vehicle; one just started (the next free number) stays.
+        if self.target > self.des.splits.values().max().copied().unwrap_or(0) + 1 {
+            self.target = 0;
         }
     }
 
@@ -395,7 +485,12 @@ impl Overlay {
             self.model = Some(Arc::new(b.model));
             self.prop_peaks.clear();
             self.prop_curves.clear();
-            self.faces = Arc::new(b.faces);
+            // Faces follow the parts alone: marking blocks keeps them, and the pick image with them
+            // (rendering it anew per marked block made drag marking stutter).
+            if self.faces_gen != Some(b.gen) || self.faces.len() != b.faces.len() {
+                self.faces = Arc::new(b.faces);
+                self.faces_gen = Some(b.gen);
+            }
             self.view_dirty = true;
             self.sweep = None;
             self.stab = None;
@@ -416,6 +511,7 @@ impl Overlay {
         self.model_dirty = false;
         self.building.store(true, Ordering::Release);
         let (lib, des, building, built) = (self.lib.clone(), self.des.clone(), self.building.clone(), self.built.clone());
+        let gen = self.snapshot.as_ref().map_or(0, |s| s.gen as u64);
         let _ = std::thread::Builder::new().name("aero-build".into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _fault = crate::fault::enter(crate::fault::stage::ANALYSIS);
@@ -432,7 +528,7 @@ impl Overlay {
                     model.grid.missing,
                     t.elapsed().as_millis()
                 ));
-                Built { model, faces }
+                Built { model, faces, gen }
             }));
             match result {
                 Ok(b) => *built.lock().unwrap_or_else(|p| p.into_inner()) = Some(b),
@@ -804,99 +900,49 @@ impl Overlay {
     }
 
     /// Tool choice with its role / aerofoil pickers.
-    fn tool_controls(&mut self, ui: &Ui) {
-        const TOOLS: [(Tool, &str, &str); 5] = [
-            (Tool::Inspect, "Inspect", "Hover a block for its details. Left-drag rotates, right-drag pans, the wheel zooms."),
-            (Tool::Wing, "Wing blocks", "Click a block to apply what the wing shelf picked: toggle, fill slab, fill body or remove slab."),
-            (Tool::Role, "Control role", "Click a vanilla control surface, or any block of a hinged sub-grid, to give it the role."),
-            (Tool::Foil, "Aerofoil", "Click a wing to give it, and the surfaces on it, the aerofoil picked on the side shelf."),
-            (Tool::Split, "Separate wing", "Click a wing panel to make it a separate wing (lighter colour), or back."),
-        ];
-        let tool_before = self.tool;
-        heading(ui, "Tool");
-        for (t, name, tip) in TOOLS {
-            if ui.radio_button_bool(name, self.tool == t) {
-                self.tool = t;
-            }
-            if ui.is_item_hovered() {
-                hover_tip(ui, tip);
-            }
-        }
-        if (tool_before == Tool::Foil) != (self.tool == Tool::Foil) {
-            self.view_dirty = true; // panel colours switch between roles and aerofoils
-        }
-        if self.tool == Tool::Role {
-            field(ui, "Role");
-            ui.combo_simple_string("##role", &mut self.role_pick, &["None", "Pitch", "Roll", "Yaw", "Flap"]);
-        }
-        if self.tool == Tool::Foil {
-            // Defaults per category; the pick itself comes from the side shelves.
-            let of = |k: FoilKind| -> Vec<usize> { (0..AEROFOILS.len()).filter(|&i| AEROFOILS[i].kind == k).collect() };
-            let (wings, fins) = (of(FoilKind::Wing), of(FoilKind::Fin));
-            let names = |l: &[usize]| -> Vec<&str> { l.iter().map(|&i| AEROFOILS[i].name).collect() };
-            heading(ui, "Unmarked wings");
-            field(ui, "Wings");
-            let mut d = wings.iter().position(|&i| i == self.des.default_foil).unwrap_or(0);
-            if ui.combo_simple_string("##foil_default", &mut d, &names(&wings)) && wings[d] != self.des.default_foil {
-                self.push_undo();
-                self.des.default_foil = wings[d];
-                self.designations_changed();
-            }
-            field(ui, "Fins");
-            let fin_now = self.des.default_fin.unwrap_or(crate::wing::FIN_DEFAULT);
-            let mut d = fins.iter().position(|&i| i == fin_now).unwrap_or(0);
-            if ui.combo_simple_string("##fin_default", &mut d, &names(&fins)) && fins[d] != fin_now {
-                self.push_undo();
-                self.des.default_fin = Some(fins[d]);
-                self.designations_changed();
-            }
-            let a = &AEROFOILS[self.foil_pick];
-            heading(ui, "Picked");
-            ui.text(a.name);
-            if ui.is_item_hovered() {
-                hover_tip(ui, a.note);
-            }
-            kv(ui, "Thickness", &format!("{:.0}%", a.t_c * 100.0));
-            kv(ui, "CL at 0°", &format!("{:.2}", a.cl0));
-            kv(ui, "CL max", &format!("{:.2}", a.cl_max));
-            kv(ui, "Drag rise", &format!("Mach {:.2}", a.kappa - a.t_c));
-        }
-    }
-
     /// Face of the workbench vehicle under a view point (normalised, x right, y down, -1..1),
-    /// through the editor camera (CPU id render at half resolution; only run on a click).
-    fn pick_world(&self, at: [f32; 2], display: [f32; 2]) -> Option<usize> {
+    /// through the editor camera: a CPU id render at half resolution, kept while the camera and
+    /// the model stay. Without `now` (the hover preview) a moved camera is not rendered until it
+    /// has stood still for a moment, so moving the view costs nothing. A moment, not a frame: the
+    /// game moves the camera per tick, so frames in between repeat the last view.
+    fn pick_world(&mut self, at: [f32; 2], display: [f32; 2], now: bool) -> Option<usize> {
         let clip = (*editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()))?;
         let (w, h) = (((display[0] / 2.0) as usize).max(16), ((display[1] / 2.0) as usize).max(16));
+        let key = (Arc::as_ptr(&self.faces) as usize, clip.map(f64::to_bits), w, h);
+        if self.pick_clip.is_none_or(|c| c.0 != clip) {
+            self.pick_clip = Some((clip, std::time::Instant::now()));
+        }
+        let settled = self.pick_clip.is_some_and(|c| c.1.elapsed().as_millis() >= 200);
+        if self.pick.as_ref().is_none_or(|p| p.key != key) {
+            if !now && !settled {
+                return None;
+            }
+            let img = view::render_with(&self.faces, &|_| [0, 0, 0], &view::Projection::from_clip(clip, w, h), w, h, [0; 4]);
+            let mut visible = vec![false; self.faces.len()];
+            img.id.iter().filter(|&&id| id != 0).for_each(|&id| visible[id as usize - 1] = true);
+            self.pick = Some(PickCache { key, id: img.id, visible });
+        }
         let (fx, fy) = ((at[0] + 1.0) * 0.5 * w as f32, (at[1] + 1.0) * 0.5 * h as f32);
         if !(0.0..w as f32).contains(&fx) || !(0.0..h as f32).contains(&fy) {
             return None;
         }
-        let (x, y) = (fx as usize, fy as usize);
-        let img = view::render_with(&self.faces, &|_| [0, 0, 0], &view::Projection::from_clip(clip, w, h), w, h, [0; 4]);
-        img.id.get(y * w + x).filter(|&&id| id != 0).map(|&id| id as usize - 1)
+        self.pick.as_ref()?.id.get(fy as usize * w + fx as usize).filter(|&&id| id != 0).map(|&id| id as usize - 1)
     }
 
     fn tab_voxels(&mut self, ui: &Ui, m: &Arc<Model>) {
         if let Some(_c) = left_pane(ui) {
-            self.tool_controls(ui);
+            // A read-only check of the model: wings are marked in the workbench (Aero wings).
             heading(ui, "Colours");
-            if self.tool == Tool::Foil {
-                for (i, a) in AEROFOILS.iter().enumerate() {
-                    swatch(ui, rgb(FOIL_COLORS[i % FOIL_COLORS.len()]), a.name);
-                }
-            } else {
-                for (name, c) in [
-                    ("Body", [150u8, 150, 150]),
-                    ("Wing", [90, 150, 230]),
-                    ("Pitch", [240, 140, 40]),
-                    ("Roll", [220, 70, 220]),
-                    ("Yaw", [70, 210, 90]),
-                    ("Flap", [230, 220, 60]),
-                    ("Marked, no panel", [40, 60, 150]),
-                ] {
-                    swatch(ui, rgb(c), name);
-                }
+            for (name, c) in [
+                ("Body", [150u8, 150, 150]),
+                ("Wing", [90, 150, 230]),
+                ("Pitch", [240, 140, 40]),
+                ("Roll", [220, 70, 220]),
+                ("Yaw", [70, 210, 90]),
+                ("Flap", [230, 220, 60]),
+                ("Marked, no panel", [40, 60, 150]),
+            ] {
+                swatch(ui, rgb(c), name);
             }
             ui.dummy([0.0, 6.0]);
             if ui.button_with_size("Reset view", [-1.0, 0.0]) {
@@ -949,11 +995,6 @@ impl Overlay {
                 self.view_dirty = true;
             }
             if ui.is_mouse_released(MouseButton::Left) {
-                if !self.dragged {
-                    if let Some(f) = self.hover_face {
-                        self.apply_tool(m, f);
-                    }
-                }
                 self.dragged = false;
             }
         } else if self.hover_face.is_some() {
@@ -1002,34 +1043,77 @@ impl Overlay {
         }
     }
 
-    fn apply_tool(&mut self, m: &Arc<Model>, face: usize) {
+    /// A press on `face`. `pick`: Ctrl is held, so it only chooses the wing to paint into.
+    fn apply_tool(&mut self, m: &Arc<Model>, face: usize, pick: bool) {
         let Some(f) = self.faces.get(face) else {
             return;
         };
         let comp = &m.comps[f.comp as usize];
         let before = self.des.clone();
+        self.stroke = None;
         match self.tool {
             Tool::Inspect => return,
+            Tool::Wing if pick => {
+                if !self.des.wings.contains(&comp.pos) && face_panel(m, f).is_none() {
+                    self.status = "that block is not part of a wing".into();
+                    return;
+                }
+                self.target = self.des.splits.get(&comp.pos).copied().unwrap_or(0);
+                self.status = match self.target {
+                    0 => "marking plain wing blocks".into(),
+                    n => format!("marking blocks of wing {n}"),
+                };
+                self.view_dirty = true;
+                return;
+            }
             Tool::Wing => match crate::toolbar::WING_MODE.load(Ordering::Relaxed) {
                 // Fill body: every block of the clicked body, however thick (a flying wing).
-                2 => self.des.wings.extend(m.comps.iter().filter(|c| c.body == comp.body).map(|c| c.pos)),
-                3 => {
-                    let marked = self.des.wings.clone();
-                    for pos in slab(m, f, Some(&marked)) {
-                        self.des.wings.remove(&pos);
-                    }
-                }
+                // Starting on a block of the wing being marked unmarks the body's blocks of it instead.
                 1 => {
-                    let add = slab(m, f, None);
-                    if add.is_empty() {
-                        self.status = "nothing to fill there (too thick, or inside a solid body): use Fill body".into();
+                    let body: Vec<[i32; 3]> = m.comps.iter().filter(|c| c.body == comp.body).map(|c| c.pos).collect();
+                    if self.in_target(&comp.pos) {
+                        for p in body.iter().filter(|p| self.in_target(p)).copied().collect::<Vec<_>>() {
+                            self.des.wings.remove(&p);
+                            self.des.splits.remove(&p);
+                        }
+                    } else {
+                        self.paint_wing(m, &body);
                     }
-                    self.des.wings.extend(add);
                 }
-                _ => {
-                    if !self.des.wings.remove(&comp.pos) {
-                        self.des.wings.insert(comp.pos);
+                // Merge wings: the first click chooses a wing, the second wing clicked joins it.
+                2 => {
+                    let wing = wing_blocks(m, f);
+                    if wing.is_empty() {
+                        self.status = "that block is not part of a wing".into();
+                        return;
                     }
+                    let Some((first, body)) = self.merge_from.take() else {
+                        self.merge_from = Some((wing.into_iter().collect(), comp.body));
+                        return;
+                    };
+                    if first.contains(&comp.pos) {
+                        return; // the chosen wing again: un-chosen
+                    }
+                    let mut n = first.iter().find_map(|p| self.des.splits.get(p).copied()).unwrap_or(0);
+                    // Plain wings on different bodies stay apart (a fixed sub-grid wingtip): only
+                    // a wing number joins them, so both get a new one.
+                    if n == 0 && body != comp.body {
+                        n = self.des.splits.values().max().copied().unwrap_or(0) + 1;
+                        for p in &first {
+                            self.des.wings.insert(*p);
+                            self.des.splits.insert(*p, n);
+                        }
+                    }
+                    let target = std::mem::replace(&mut self.target, n);
+                    self.paint_wing(m, &wing);
+                    self.target = if target == 0 { 0 } else { n };
+                }
+                // Mark blocks: a press on a block of the target wing starts unmarking, any other
+                // starts marking into it; the drag goes on in `stroke_step`.
+                _ => {
+                    let add = !self.in_target(&comp.pos);
+                    self.stroke = Some((add, f.comp));
+                    self.stroke_block(m, comp.pos, add);
                 }
             },
             Tool::Foil => {
@@ -1057,21 +1141,6 @@ impl Overlay {
                     }
                 }
             }
-            Tool::Split => {
-                let Some(&pi) = m.panel_of.get(f.cell).filter(|&&p| p != usize::MAX) else {
-                    self.status = "that block is not part of a wing panel".into();
-                    return;
-                };
-                // The whole panel: unmark it if it is marked, else mark all its blocks.
-                let owners: Vec<[i32; 3]> = m.panels[pi].cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect();
-                if m.separate.get(pi).copied().unwrap_or(false) {
-                    for p in &owners {
-                        self.des.splits.remove(p);
-                    }
-                } else {
-                    self.des.splits.extend(owners);
-                }
-            }
             Tool::Role => {
                 let role = Role::ALL[self.role_pick.min(4)];
                 // One entry per body (or per vanilla control surface): drop older ones first.
@@ -1090,6 +1159,11 @@ impl Overlay {
                 }
             }
         }
+        self.commit(before);
+    }
+
+    /// Keep a change: one undo step (`before`), marks stored on the parts, model rebuilt.
+    fn commit(&mut self, before: Designations) {
         if self.des != before {
             self.redo.clear();
             self.undo.push(before);
@@ -1100,7 +1174,181 @@ impl Overlay {
         }
     }
 
+    /// The block is a wing block of the wing being painted into.
+    fn in_target(&self, pos: &[i32; 3]) -> bool {
+        self.des.wings.contains(pos) && self.des.splits.get(pos).copied().unwrap_or(0) == self.target
+    }
+
+    fn stroke_block(&mut self, m: &Model, pos: [i32; 3], add: bool) {
+        if add {
+            self.paint_wing(m, &[pos]);
+        } else if self.in_target(&pos) {
+            self.des.wings.remove(&pos);
+            self.des.splits.remove(&pos);
+        }
+    }
+
+    /// Drag painting: while the button stays down, each new block under the mouse gets what
+    /// the press started (marking or unmarking). The whole drag is one undo step.
+    fn stroke_step(&mut self, ui: &Ui, m: &Arc<Model>) {
+        let Some((add, last)) = self.stroke else { return };
+        if !ui.io().mouse_down[0] || ui.io().want_capture_mouse || self.tool != Tool::Wing {
+            self.stroke = None;
+            return;
+        }
+        let Some(face) = crate::toolbar::pointer().and_then(|at| self.pick_world(at, ui.io().display_size, true)) else { return };
+        let Some(f) = self.faces.get(face).filter(|f| f.comp != last) else { return };
+        let (comp, pos) = (f.comp, m.comps[f.comp as usize].pos);
+        self.stroke = Some((add, comp));
+        let before = self.des.clone();
+        self.stroke_block(m, pos, add);
+        if self.des != before {
+            // The press already took the undo step, unless it changed nothing.
+            if self.undo.last().is_none_or(|u| *u != self.stroke_start) {
+                self.redo.clear();
+                self.undo.push(self.stroke_start.clone());
+            }
+            self.designations_changed();
+        }
+    }
+
+    /// New wing: the next free wing number becomes the one being painted into.
+    fn new_wing(&mut self) {
+        self.target = self.des.splits.values().max().copied().unwrap_or(0) + 1;
+        self.status = format!("wing {}: mark its blocks", self.target);
+        self.view_dirty = true;
+    }
+
+    /// Detect wings: `Model::detect`'s guesses added to the marks, as one undo step.
+    fn detect(&mut self, m: &Model) {
+        let before = self.des.clone();
+        let found = match self.lib.lock() {
+            Ok(mut lib) => m.detect(&self.des, &mut lib),
+            Err(_) => return,
+        };
+        let (wings, roles) = (found.wings.len() - before.wings.len(), found.roles.len() - before.roles.len());
+        self.des = found;
+        self.commit(before);
+        self.status = format!("detected {wings} wing blocks and {roles} control surface roles");
+    }
+
+    /// Blocks a press at `face` would change (or the wing it would pick), for the hover preview.
+    fn affected(&self, m: &Model, face: usize, pick: bool) -> std::collections::HashSet<[i32; 3]> {
+        let Some(f) = self.faces.get(face) else { return Default::default() };
+        let comp = &m.comps[f.comp as usize];
+        let owners = |cells: &[usize]| cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect::<Vec<_>>();
+        // The whole wing of the block: its panels and the surfaces on it.
+        let wing = || match face_panel(m, f) {
+            Some(pi) => (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).flat_map(|j| owners(&m.panels[j].cells)).collect(),
+            None => Vec::new(),
+        };
+        let body = || m.comps.iter().filter(|c| c.body == comp.body).map(|c| c.pos).collect::<Vec<_>>();
+        let out = match self.tool {
+            Tool::Inspect => Vec::new(),
+            Tool::Wing if pick => wing(),
+            Tool::Wing => match crate::toolbar::WING_MODE.load(Ordering::Relaxed) {
+                1 => body(),
+                2 => wing(),
+                _ => vec![comp.pos],
+            },
+            Tool::Foil => wing(),
+            Tool::Role if self.lib.lock().map(|mut l| l.get(&comp.def).is_some_and(|d| d.is_control_surface())).unwrap_or(false) => vec![comp.pos],
+            Tool::Role => body(),
+        };
+        out.into_iter().collect()
+    }
+
+    /// Hover preview: the faces a press here would change, lit up over the vehicle.
+    fn hover_preview(&mut self, ui: &Ui, m: &Arc<Model>) {
+        let io = ui.io();
+        let pick = io.key_ctrl && self.tool == Tool::Wing;
+        let face = if io.want_capture_mouse { None } else { crate::toolbar::pointer().and_then(|at| self.pick_world(at, io.display_size, false)) };
+        let key = face.map(|f| (f, self.tool, crate::toolbar::WING_MODE.load(Ordering::Relaxed), pick, Arc::as_ptr(m) as usize, self.des.wings.len()));
+        if key != self.hover_key {
+            self.hover_key = key;
+            let blocks = face.map(|f| self.affected(m, f, pick)).unwrap_or_default();
+            let seen = &self.pick.as_ref().map(|p| &p.visible);
+            self.hover_faces = (0..self.faces.len())
+                .filter(|&i| seen.is_some_and(|v| v[i]) && blocks.contains(&m.comps[self.faces[i].comp as usize].pos))
+                .take(6000)
+                .collect();
+        }
+        let Some(clip) = *editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()) else { return };
+        let pr = view::Projection::from_clip(clip, io.display_size[0] as usize, io.display_size[1] as usize);
+        let dl = ui.get_background_draw_list();
+        // Marking shows in the colour of the wing the blocks will join, unmarking dark.
+        let marking = self.tool == Tool::Wing && !pick && crate::toolbar::WING_MODE.load(Ordering::Relaxed) != 2;
+        let wing = wing_color(self.target, 0).map(|v| v as f32 / 255.0);
+        let unmark = marking && crate::toolbar::WING_MODE.load(Ordering::Relaxed) < 2 && face.and_then(|f| self.faces.get(f)).is_some_and(|f| self.in_target(&m.comps[f.comp as usize].pos));
+        let tint = match (marking, unmark) {
+            (true, false) => [wing[0], wing[1], wing[2], 0.6],
+            (true, true) => [0.0, 0.0, 0.0, 0.5],
+            _ => [1.0, 1.0, 1.0, 0.38],
+        };
+        // Merge wings: the wing chosen by the first click stays lit until the second.
+        let seen = self.pick.as_ref().map(|p| &p.visible);
+        let faces = &self.faces;
+        let chosen: Vec<usize> = match &self.merge_from {
+            Some((set, _)) => (0..faces.len()).filter(|&i| seen.is_some_and(|v| v[i]) && set.contains(&m.comps[faces[i].comp as usize].pos)).take(6000).collect(),
+            None => Vec::new(),
+        };
+        for (i, tint) in chosen.into_iter().map(|i| (i, [1.0, 1.0, 1.0, 0.45])).chain(self.hover_faces.iter().map(|&i| (i, tint))) {
+            let pts: Vec<[f32; 2]> = self.faces[i].poly.iter().map(|p| pr.project(*p)).filter(|q| q.2 > 0.05).map(|q| [q.0 as f32, q.1 as f32]).collect();
+            if pts.len() == self.faces[i].poly.len() && pts.len() >= 3 {
+                dl.add_polyline(pts, tint).filled(true).build();
+            }
+        }
+    }
+
+    /// Reset (confirmed on the game's dialog): every wing block, separate wing, role and aerofoil goes.
+    fn reset_designations(&mut self) {
+        let before = self.des.clone();
+        let d = &mut self.des;
+        (d.wings.clear(), d.splits.clear(), d.roles.clear(), d.foils.clear());
+        (d.default_foil, d.default_fin, self.target) = (0, None, 0);
+        if self.des != before {
+            self.redo.clear();
+            self.undo.push(before);
+            self.designations_changed();
+        }
+    }
+
+    /// Mark blocks as wing blocks of the target wing. Blocks taken from another wing leave their
+    /// aerofoil mark on a block that stays there, so that wing keeps its aerofoil.
+    fn paint_wing(&mut self, m: &Model, add: &[[i32; 3]]) {
+        let wing_no = |d: &Designations, p: &[i32; 3]| d.splits.get(p).copied().unwrap_or(0);
+        let moved: std::collections::HashSet<[i32; 3]> =
+            add.iter().copied().filter(|p| self.des.wings.contains(p) && wing_no(&self.des, p) != self.target).collect();
+        for p in add {
+            self.des.wings.insert(*p);
+            if self.target == 0 {
+                self.des.splits.remove(p);
+            } else {
+                self.des.splits.insert(*p, self.target);
+            }
+        }
+        let pos_of = |c: usize| m.comps.get(m.grid.owner[c] as usize).map(|o| o.pos);
+        for p in &moved {
+            let Some(foil) = self.des.foils.remove(p) else { continue };
+            // The old wing: the panels sharing a wing with the moved block's panel.
+            let Some(pi) = (0..m.panels.len()).find(|&j| m.panels[j].cells.iter().any(|&c| pos_of(c) == Some(*p))) else { continue };
+            let stay: Vec<[i32; 3]> = (0..m.panels.len())
+                .filter(|&j| m.wing_of[j] == m.wing_of[pi])
+                .flat_map(|j| m.panels[j].cells.iter().filter_map(|&c| pos_of(c)))
+                .filter(|q| !moved.contains(q))
+                .collect();
+            if let Some(q) = stay.iter().find(|q| !self.des.foils.contains_key(*q)).filter(|_| !stay.iter().any(|q| self.des.foils.contains_key(q))) {
+                self.des.foils.insert(*q, foil);
+            }
+        }
+    }
+
+    /// Propellers and rotors: what the player sets on the left (one group per part, keyed by its
+    /// colour), what each gives at its best pitch on the right.
     fn tab_props(&mut self, ui: &Ui, m: &Arc<Model>) {
+        if !self.des.props.unwrap_or_else(|| crate::flight::PROPS.load(Ordering::Relaxed)) {
+            ui.text_colored(WARN, "This vehicle flies with the game's own propellers and rotors (Settings): these figures do not apply.");
+        }
         let n = m.props.len();
         if self.prop_rps.len() != n {
             // Default: the shaft speed for a 200 m/s blade tip, a typical real one.
@@ -1108,189 +1356,166 @@ impl Overlay {
         }
         self.prop_peaks.resize(n, None);
         self.prop_curves.resize(n, None);
-        let cols = [
-            ("Part", 0.0),
-            ("Shape", 100.0),
-            ("Blades", 52.0),
-            ("Radius", 60.0),
-            ("Shaft speed", 96.0),
-            ("Tip Mach", 64.0),
-            ("Best pitch", 78.0),
-            ("Blade angle", 82.0),
-            ("Thrust", 72.0),
-            ("Power", 72.0),
-        ];
-        let Some(t) = table(ui, "##rotors", &cols) else { return };
-        headers(ui, &cols, 2);
-        for (k, u) in m.props.iter().enumerate() {
-            let c = &m.comps[u.comp];
-            let set = c.prop.as_ref();
-            let blades = set.and_then(|p| p.blades).unwrap_or(4).clamp(2, 8);
-            let length = set.and_then(|p| p.length).unwrap_or(0.5);
-            let setting = set.and_then(|p| p.pitch).unwrap_or(u.def.default_pitch as f64);
-            let input = if u.def.rotor() { "collective" } else { "pitch input" };
-            ui.table_next_row();
-            ui.table_set_column_index(0);
-            ui.align_text_to_frame_padding();
-            ui.text(&c.def);
-            ui.same_line();
-            ui.text_colored(DIM, format!("{}, {}, {}", c.pos[0], c.pos[1], c.pos[2]));
-            ui.table_set_column_index(1);
-            let auto = if u.def.airscrew { "Auto prop" } else { "Auto rotor" };
-            let mut pick = match self.des.shapes.get(&c.pos) {
-                None => 0,
-                Some(true) => 1,
-                Some(false) => 2,
-            };
-            ui.set_next_item_width(-1.0);
-            if ui.combo_simple_string(format!("##shape{k}"), &mut pick, &[auto, "Propeller", "Rotor"]) {
-                match pick {
-                    1 => self.des.shapes.insert(c.pos, true),
-                    2 => self.des.shapes.insert(c.pos, false),
-                    _ => self.des.shapes.remove(&c.pos),
+        let size = |k: usize| {
+            let set = m.comps[m.props[k].comp].prop.as_ref();
+            (set.and_then(|p| p.blades).unwrap_or(4).clamp(2, 8), set.and_then(|p| p.length).unwrap_or(0.5))
+        };
+        let color = |k: usize| CURVE_COLORS[k % CURVE_COLORS.len()];
+        if let Some(_c) = left_pane(ui) {
+            for (k, u) in m.props.iter().enumerate() {
+                let c = &m.comps[u.comp];
+                let (blades, length) = size(k);
+                let geom = m.prop_geom(k, blades, length);
+                ui.dummy([0.0, if k == 0 { 2.0 } else { 10.0 }]);
+                swatch(ui, color(k), &c.def);
+                rule(ui);
+                field(ui, "Shape");
+                let auto = if u.def.airscrew { "Auto prop" } else { "Auto rotor" };
+                let mut pick = match self.des.shapes.get(&c.pos) {
+                    None => 0,
+                    Some(true) => 1,
+                    Some(false) => 2,
                 };
-                self.designations_changed();
-            }
-            if ui.is_item_hovered() {
-                hover_tip(ui, "Blade shape. Propeller: cambered blades with a helical twist, rigid, for aeroplanes. Rotor: symmetric blades with a gentle twist that flap, for helicopters. Auto picks propeller for parts with a single pitch input or \"propeller\" in the name. Saved on the part.");
-            }
-            ui.table_set_column_index(2);
-            right(ui, &blades.to_string(), None);
-            ui.table_set_column_index(3);
-            right(ui, &format!("{:.2} m", m.prop_geom(k, blades, length).radius), None);
-            ui.table_set_column_index(4);
-            ui.set_next_item_width(-1.0);
-            ui.input_float(format!("##rps{k}"), &mut self.prop_rps[k]).display_format("%.1f RPS").build();
-            let rps = self.prop_rps[k];
-            let ratio = u.def.rotation_speed;
-            if ui.is_item_hovered() {
-                hover_tip(ui, format!("Shaft RPS, as the game's sensors read it. This part turns its blades {ratio}x the shaft: {:.1} rev/s.", rps as f64 * ratio));
-            }
-            // Tip Mach from the spin alone (static, sea level), red where propellers start losing
-            // thrust to compressibility (NACA TR 684: mild below tip Mach 0.8).
-            let geom = m.prop_geom(k, blades, length);
-            let tip = rps as f64 * ratio * std::f64::consts::TAU * geom.radius / 340.0;
-            let foil = &AEROFOILS[geom.foil];
-            let rise = foil.kappa - foil.t_c + 0.05;
-            ui.table_set_column_index(5);
-            right(ui, &format!("{tip:.2}"), (tip > rise).then_some(BAD));
-            if ui.is_item_hovered() {
-                hover_tip(ui, format!(
-                    "Blade tip speed from the spin alone, standing still at sea level. Past Mach {rise:.2} the tips hit the drag rise of the speed of sound: they take much more power for little more thrust, and it gets worse as the plane speeds up. Turn the shaft slower or use shorter blades."
-                ));
-            }
-            if self.prop_peaks[k].is_none_or(|(r, _)| r != rps) {
-                self.prop_peaks[k] = Some((rps, m.prop_peak(k, blades, length, rps as f64 * ratio)));
-            }
-            let Some((p, thrust, power, _)) = self.prop_peaks[k].and_then(|p| p.1) else {
-                ui.table_set_column_index(6);
-                right(ui, "-", Some(DIM));
-                if ui.is_item_hovered() {
-                    hover_tip(ui, "No thrust peak at this shaft speed.");
+                if ui.combo_simple_string(format!("##shape{k}"), &mut pick, &[auto, "Propeller", "Rotor"]) {
+                    match pick {
+                        1 => self.des.shapes.insert(c.pos, true),
+                        2 => self.des.shapes.insert(c.pos, false),
+                        _ => self.des.shapes.remove(&c.pos),
+                    };
+                    self.designations_changed();
                 }
-                continue;
-            };
-            if u.airscrew && self.prop_curves[k].as_ref().is_none_or(|c| c.0 != rps || c.1 != p) {
-                let curve = CURVE_SPEEDS.map(|v| m.prop_settled(k, blades, length, rps as f64 * ratio, p, v).thrust / 1000.0);
-                self.prop_curves[k] = Some((rps, p, curve.to_vec()));
-            }
-            let need = p - setting;
-            let out = !(-1.0..=1.0).contains(&need);
-            let vals = [format!("{need:.2}"), format!("{:.1}°", (0.75 * p).to_degrees()), format!("{:.1} kN", thrust / 1000.0), format!("{:.0} kW", power / 1000.0)];
-            for (i, v) in vals.iter().enumerate() {
-                ui.table_set_column_index(6 + i);
-                right(ui, v, if i > 0 { None } else if out { Some(WARN) } else { Some(CL_COLOR) });
-                if i == 0 && ui.is_item_hovered() {
-                    let offset = if setting != 0.0 { format!(" with blade_pitch {setting:+.0}") } else { String::new() };
-                    let range = if out { "\nOutside the input's -1 to 1 range with this blade_pitch setting." } else { "" };
+                if ui.is_item_hovered() {
+                    hover_tip(ui, "Blade shape. Propeller: cambered blades with a helical twist, rigid, for aeroplanes. Rotor: symmetric blades with a gentle twist that flap, for helicopters. Auto picks propeller for parts with a single pitch input or \"propeller\" in the name. Saved on the part.");
+                }
+                field(ui, "Shaft speed");
+                ui.input_float(format!("##rps{k}"), &mut self.prop_rps[k]).display_format("%.1f RPS").build();
+                let rps = self.prop_rps[k] as f64;
+                let ratio = u.def.rotation_speed;
+                if ui.is_item_hovered() {
+                    hover_tip(ui, format!("Shaft RPS, as the game's sensors read it. This part turns its blades {ratio}x the shaft: {:.1} rev/s.", rps * ratio));
+                }
+                // Tip Mach from the spin alone (static, sea level), red where propellers start losing
+                // thrust to compressibility (NACA TR 684: mild below tip Mach 0.8).
+                let tip = rps * ratio * std::f64::consts::TAU * geom.radius / 340.0;
+                let foil = &AEROFOILS[geom.foil];
+                let rise = foil.kappa - foil.t_c + 0.05;
+                kv_col(ui, "Tip Mach", &format!("{tip:.2}"), (tip > rise).then_some(BAD));
+                if ui.is_item_hovered() {
                     hover_tip(ui, format!(
-                        "The {input}{offset} that gives the most static thrust (standing still, sea level). More than this stalls the blades: no more thrust, for much more power.{range}"
+                        "Blade tip speed from the spin alone, standing still at sea level. Past Mach {rise:.2} the tips hit the drag rise of the speed of sound: they take much more power for little more thrust, and it gets worse as the plane speeds up. Turn the shaft slower or use shorter blades."
                     ));
+                }
+                kv(ui, "Blades", &format!("{blades} x {:.2} m", geom.radius));
+                kv(ui, "Position", &format!("{}, {}, {}", c.pos[0], c.pos[1], c.pos[2]));
+            }
+        }
+        let Some(_r) = right_pane(ui) else { return };
+        heading(ui, "Most static thrust");
+        let cols = [("Part", 0.0), ("Best pitch", 82.0), ("Blade angle", 88.0), ("Thrust", 80.0), ("Power", 80.0)];
+        if let Some(_t) = table(ui, "##rotors", &cols) {
+            headers(ui, &cols, 1);
+            for (k, u) in m.props.iter().enumerate() {
+                let c = &m.comps[u.comp];
+                let (blades, length) = size(k);
+                let setting = c.prop.as_ref().and_then(|p| p.pitch).unwrap_or(u.def.default_pitch as f64);
+                let input = if u.def.rotor() { "collective" } else { "pitch input" };
+                let rps = self.prop_rps[k];
+                let ratio = u.def.rotation_speed;
+                ui.table_next_row();
+                ui.table_set_column_index(0);
+                swatch(ui, color(k), &c.def);
+                if self.prop_peaks[k].is_none_or(|(r, _)| r != rps) {
+                    self.prop_peaks[k] = Some((rps, m.prop_peak(k, blades, length, rps as f64 * ratio)));
+                }
+                let Some((p, thrust, power, _)) = self.prop_peaks[k].and_then(|p| p.1) else {
+                    ui.table_set_column_index(1);
+                    right(ui, "-", Some(DIM));
+                    if ui.is_item_hovered() {
+                        hover_tip(ui, "No thrust peak at this shaft speed.");
+                    }
+                    continue;
+                };
+                if u.airscrew && self.prop_curves[k].as_ref().is_none_or(|c| c.0 != rps || c.1 != p) {
+                    let curve = CURVE_SPEEDS.map(|v| m.prop_settled(k, blades, length, rps as f64 * ratio, p, v).thrust / 1000.0);
+                    self.prop_curves[k] = Some((rps, p, curve.to_vec()));
+                }
+                let need = p - setting;
+                let out = !(-1.0..=1.0).contains(&need);
+                let vals = [format!("{need:.2}"), format!("{:.1}°", (0.75 * p).to_degrees()), format!("{:.1} kN", thrust / 1000.0), format!("{:.0} kW", power / 1000.0)];
+                for (i, v) in vals.iter().enumerate() {
+                    ui.table_set_column_index(1 + i);
+                    right(ui, v, if i > 0 { None } else if out { Some(WARN) } else { Some(CL_COLOR) });
+                    if i == 0 && ui.is_item_hovered() {
+                        let offset = if setting != 0.0 { format!(" with blade_pitch {setting:+.0}") } else { String::new() };
+                        let range = if out { "\nOutside the input's -1 to 1 range with this blade_pitch setting." } else { "" };
+                        hover_tip(ui, format!(
+                            "The {input}{offset} that gives the most static thrust (standing still, sea level). More than this stalls the blades: no more thrust, for much more power.{range}"
+                        ));
+                    }
                 }
             }
         }
-        drop(t);
+        ui.dummy([0.0, 6.0]);
+        heading(ui, "Thrust against airspeed");
         // Propellers (not rotors): thrust against airspeed at the best pitch above.
         let curves: Vec<(usize, &Vec<f64>)> =
             self.prop_curves.iter().enumerate().filter(|(k, _)| m.props[*k].airscrew).filter_map(|(k, c)| Some((k, &c.as_ref()?.2))).collect();
-        if !curves.is_empty() && ui.collapsing_header("Thrust against airspeed", imgui::TreeNodeFlags::empty()) {
-            // Up to just past the speed where the last propeller stops pushing.
-            let last = curves.iter().filter_map(|(_, c)| c.iter().rposition(|&t| t > 0.0)).max().unwrap_or(0);
-            let len = (last + 2).clamp(2, CURVE_SPEEDS.len());
-            let x: Vec<f64> = CURVE_SPEEDS[..len].iter().map(|v| v * 3.6).collect();
-            let names: Vec<String> = curves.iter().map(|(k, _)| format!("{} kN", m.comps[m.props[*k].comp].def)).collect();
-            let series: Vec<(&str, [f32; 4], Vec<f64>)> =
-                curves.iter().zip(&names).enumerate().map(|(i, ((_, c), name))| (name.as_str(), CURVE_COLORS[i % CURVE_COLORS.len()], c[..len].to_vec())).collect();
-            plot(ui, "prop_curve", [ui.content_region_avail()[0], 220.0], &x, &series, series.len(), "Airspeed (km/h), sea level, at the best pitch and the shaft speed above");
+        if curves.is_empty() {
+            ui.text_colored(DIM, "Only parts shaped as a propeller have this curve. A rotor's thrust\ndepends on how the helicopter flies, not on airspeed alone.");
+            return;
         }
+        // Up to just past the speed where the last propeller stops pushing.
+        let last = curves.iter().filter_map(|(_, c)| c.iter().rposition(|&t| t > 0.0)).max().unwrap_or(0);
+        let len = (last + 2).clamp(2, CURVE_SPEEDS.len());
+        let x: Vec<f64> = CURVE_SPEEDS[..len].iter().map(|v| v * 3.6).collect();
+        let names: Vec<String> = curves.iter().map(|(k, _)| format!("{} kN", m.comps[m.props[*k].comp].def)).collect();
+        let series: Vec<(&str, [f32; 4], Vec<f64>)> = curves.iter().zip(&names).map(|((k, c), name)| (name.as_str(), color(*k), c[..len].to_vec())).collect();
+        let avail = ui.content_region_avail();
+        plot(ui, "prop_curve", [avail[0], (avail[1] - 4.0).max(180.0)], &x, &series, series.len(), "Airspeed (km/h), sea level, at the best pitch and the shaft speed");
     }
 
-    /// Global settings, and the workbench vehicle's own (stored on its parts like the marks).
+    /// Settings for all vehicles (kept in aero.xml), and the workbench vehicle's own (stored on its
+    /// parts like the marks). A setting that needs another sits under it, and greys out with it.
     fn tab_settings(&mut self, ui: &Ui) {
+        use crate::flight::{ENABLED, GROUND, PROPS, VRS};
         const FLY_TIP: &str = "Replaces the game's air forces with this plugin's model (wings with their aerofoils and designations, fuselage drag and lift, propellers and rotors blade by blade). Water forces are unchanged. Off: the game's own aerodynamics.";
+        const PROPS_TIP: &str = "Propellers and rotors work blade by blade: pitch matters, blades stall, the engine feels the load, and the propwash blows over the wings and tail. Off: the game's own propellers and rotors, with the plugin's wings and fuselage.";
         const VRS_TIP: &str = "Rotors sinking slowly and almost straight down into their own downwash lose lift: the descent speeds up, and more collective makes it worse. Fly out forwards or sideways to recover. Off: rotors stay steady in any descent.";
+        const GROUND_TIP: &str = "Wings within about a wingspan of the ground or water make less induced drag: the aircraft floats along the runway on landing and lifts off sooner. Off: the same lift and drag at any height.";
         const BLUR_TIP: &str = "Fast propeller and rotor blades are drawn as a faint stippled smear over the arc they sweep in about 1/20 s, like a camera or your eye sees them. Off: sharp blades.";
         let hooked = crate::flight::HOOKED.load(Ordering::Relaxed);
+        let props_hooked = crate::flight::PROPS_HOOKED.load(Ordering::Relaxed);
         let vehicle = self.snapshot.is_some() && editor::editor_active();
-        let cols = [("", 180.0), ("All vehicles", 100.0), ("This vehicle", 150.0)];
-        let Some(_t) = table(ui, "##settings", &cols) else { return };
-        headers(ui, &cols, 3);
-        if ui.is_item_hovered() {
-            hover_tip(ui, if vehicle { "Saved in the vehicle's file; travels with copy and paste." } else { "Open a vehicle in the workbench to give it its own settings." });
-        }
-        let row = |ui: &Ui, name: &str, tip: &str| {
-            ui.table_next_row();
-            ui.table_set_column_index(0);
-            ui.align_text_to_frame_padding();
-            ui.text(name);
-            if ui.is_item_hovered() {
-                hover_tip(ui, tip);
-            }
-            ui.table_set_column_index(1);
-        };
-        // Per-vehicle override: Global / On / Off.
-        let pick = |ui: &Ui, id: &str, cur: Option<bool>, global: bool| -> Option<Option<bool>> {
-            ui.table_set_column_index(2);
-            let _d = ui.begin_disabled(!vehicle);
-            let names = [if global { "Global (on)" } else { "Global (off)" }, "On", "Off"];
-            let mut i = match cur {
-                None => 0,
-                Some(true) => 1,
-                Some(false) => 2,
-            };
-            ui.set_next_item_width(-1.0);
-            ui.combo_simple_string(id, &mut i, &names).then_some([None, Some(true), Some(false)][i])
-        };
+        let on = |f: &AtomicBool| f.load(Ordering::Relaxed);
+        // What is in force for all vehicles, and for this one: a setting under one that is off does nothing.
+        let fly = (hooked && on(&ENABLED), hooked && self.des.fly.unwrap_or(on(&ENABLED)));
+        let props = (props_hooked && fly.0 && on(&PROPS), props_hooked && fly.1 && self.des.props.unwrap_or(on(&PROPS)));
+        let mut des = self.des.clone();
+        let mut saved = false;
 
-        row(ui, "Plugin flight model", if hooked { FLY_TIP } else { "Unavailable: the game's flight code could not be hooked, see aero.log." });
-        let mut fly = crate::flight::ENABLED.load(Ordering::Relaxed);
-        {
-            let _d = ui.begin_disabled(!hooked);
-            if ui.checkbox("##fly", &mut fly) {
-                crate::flight::ENABLED.store(fly, Ordering::Relaxed);
-                log_line(&format!("flight model {}", if fly { "on" } else { "off" }));
-            }
+        heading(ui, "Flight");
+        if let Some(_t) = table(ui, "##flight", &SETTING_COLS) {
+            headers(ui, &SETTING_COLS, 3);
+            let fly_tip = if hooked { FLY_TIP } else { "Unavailable: the game's flight code could not be hooked, see aero.log." };
+            let props_tip = if props_hooked { PROPS_TIP } else { "Unavailable: the game's propeller code could not be hooked, see aero.log. The game's own propellers and rotors are in use." };
+            saved |= setting_row(ui, 0, "Plugin flight model", "The plugin's air forces instead of the game's.", fly_tip, &ENABLED, (hooked, hooked && vehicle), Some(&mut des.fly));
+            saved |= setting_row(ui, 1, "Propeller and rotor model", "Blade by blade, with engine load and propwash.", props_tip, &PROPS, (props_hooked && fly.0, props_hooked && fly.1 && vehicle), Some(&mut des.props));
+            saved |= setting_row(ui, 2, "Vortex ring state", "Rotors lose lift sinking into their downwash.", VRS_TIP, &VRS, (props.0, props.1 && vehicle), Some(&mut des.vrs));
+            saved |= setting_row(ui, 1, "Ground effect", "Less drag within a wingspan of the surface.", GROUND_TIP, &GROUND, (fly.0, fly.1 && vehicle), Some(&mut des.ground));
         }
-        let new_fly = pick(ui, "##fly_vehicle", self.des.fly, fly);
-
-        row(ui, "Vortex ring state", VRS_TIP);
-        let mut vrs = crate::flight::VRS.load(Ordering::Relaxed);
-        if ui.checkbox("##vrs", &mut vrs) {
-            crate::flight::VRS.store(vrs, Ordering::Relaxed);
-            log_line(&format!("vortex ring state {}", if vrs { "on" } else { "off" }));
-        }
-        let new_vrs = pick(ui, "##vrs_vehicle", self.des.vrs, vrs);
-
-        row(ui, "Rotor blur", BLUR_TIP);
-        let mut blur = crate::blur::ENABLED.load(Ordering::Relaxed);
-        if ui.checkbox("##blur", &mut blur) {
-            crate::blur::ENABLED.store(blur, Ordering::Relaxed);
+        ui.dummy([0.0, 6.0]);
+        heading(ui, "Display");
+        if let Some(_t) = table(ui, "##display", &SETTING_COLS) {
+            saved |= setting_row(ui, 0, "Rotor blur", "Fast blades drawn as a smear over their sweep.", BLUR_TIP, &crate::blur::ENABLED, (true, false), None);
         }
 
-        if new_fly.is_some_and(|f| f != self.des.fly) || new_vrs.is_some_and(|v| v != self.des.vrs) {
+        if saved {
+            crate::settings::save();
+            log_line(&format!("settings: flight model {}, propellers {}, vortex ring {}, ground effect {}", on(&ENABLED), on(&PROPS), on(&VRS), on(&GROUND)));
+        }
+        if des != self.des {
             self.push_undo();
-            self.des.fly = new_fly.unwrap_or(self.des.fly);
-            self.des.vrs = new_vrs.unwrap_or(self.des.vrs);
+            self.des = des;
             self.designations_changed();
         }
     }
@@ -1324,42 +1549,43 @@ impl Overlay {
     }
 
     /// Wing colour of a grid cell (role, or aerofoil in the aerofoil tool); None for non-wing cells.
-    fn cell_color(&self, m: &Model, cell: usize) -> Option<[u8; 3]> {
+    fn cell_color(&self, m: &Model, cell: usize, colours: u8) -> Option<[u8; 3]> {
         let o = m.grid.owner[cell];
         match m.panel_of[cell] {
             // A missile part: its body is no wing; it stands for its fins only when they are not
             // separate solids (fins in its static mesh).
-            usize::MAX if o != EMPTY && o != INTERIOR && m.fin_of.contains_key(&o) => m.fin_of.get(&o).filter(|f| !f.1).map(|f| self.panel_color(m, f.0)),
+            usize::MAX if o != EMPTY && o != INTERIOR && m.fin_of.contains_key(&o) => m.fin_of.get(&o).filter(|f| !f.1).map(|f| self.panel_color(m, f.0, colours)),
             usize::MAX if o != EMPTY && o != INTERIOR && self.des.wings.contains(&m.comps[o as usize].pos) => Some([40, 60, 150]),
             usize::MAX => None,
-            p => Some(self.panel_color(m, p)),
+            p => Some(self.panel_color(m, p, colours)),
         }
     }
 
-    fn panel_color(&self, m: &Model, p: usize) -> [u8; 3] {
-        let c = match p {
-            p if self.tool == Tool::Foil => FOIL_COLORS[m.panels[p].foil % FOIL_COLORS.len()],
-            p => match m.panels[p].role {
+    /// `colours`: see `Tool::colours`.
+    fn panel_color(&self, m: &Model, p: usize, colours: u8) -> [u8; 3] {
+        match colours {
+            1 => FOIL_COLORS[m.panels[p].foil % FOIL_COLORS.len()],
+            // Wing block tools: one colour per whole wing; the wing being painted into lighter.
+            2 => {
+                let n = m.separate.get(p).copied().unwrap_or(0);
+                let c = wing_color(n, m.wing_rank.get(p).copied().unwrap_or(0));
+                if n != 0 && n == self.target { c.map(|v| 255 - (255 - v) / 2) } else { c }
+            }
+            _ => match m.panels[p].role {
                 Role::None => [90, 150, 230],
                 Role::Pitch => [240, 140, 40],
                 Role::Roll => [220, 70, 220],
                 Role::Yaw => [70, 210, 90],
                 Role::Flap => [230, 220, 60],
             },
-        };
-        // Separate wings in a lighter shade, so the split shows.
-        if m.separate.get(p).copied().unwrap_or(false) {
-            c.map(|v| v + (255 - v) / 2)
-        } else {
-            c
         }
     }
 
     fn face_color(&self, m: &Model, face: usize, hover_comp: Option<u32>) -> [u8; 3] {
         let cell = self.faces[face].cell;
         let o = self.faces[face].comp;
-        let fin = self.faces.get(face).and_then(|f| m.fin_of.get(&f.comp).filter(|&&(_, moving)| f.moving || !moving)).map(|&(p, _)| self.panel_color(m, p));
-        let mut c = fin.or_else(|| self.cell_color(m, cell)).unwrap_or_else(|| {
+        let fin = self.faces.get(face).and_then(|f| m.fin_of.get(&f.comp).filter(|&&(_, moving)| f.moving || !moving)).map(|&(p, _)| self.panel_color(m, p, 0));
+        let mut c = fin.or_else(|| self.cell_color(m, cell, 0)).unwrap_or_else(|| {
             let b = if o != EMPTY && o != INTERIOR { m.comps[o as usize].body } else { 0 };
             if b == 0 {
                 [150, 150, 150]
@@ -1389,25 +1615,11 @@ impl Overlay {
     }
 }
 
-/// Grid positions of the components in the wing slab around a clicked face (see
-/// `voxel::slab_cells`). Adding (`marked` None): thin columns of the clicked body, not buried
-/// inside a solid one.
-/// Removing: the marked blocks of that body in the clicked plane, however thick.
-fn slab(m: &Model, f: &Face, marked: Option<&std::collections::HashSet<[i32; 3]>>) -> Vec<[i32; 3]> {
-    let g = &m.grid;
-    let n = f.normal;
-    // Body-frame normal -> its dominant grid axis.
-    let gnf = [n.y, -n.z, n.x];
-    let axis = (0..3).max_by(|&i, &j| gnf[i].abs().total_cmp(&gnf[j].abs())).unwrap_or(1);
-    let owner_ok = |i: usize| g.owner[i] != EMPTY && g.owner[i] != INTERIOR;
-    if !owner_ok(f.cell) {
-        return Vec::new();
-    }
-    let body = m.comps[f.comp as usize].body;
-    let member = |i: usize| owner_ok(i) && m.comps[g.owner[i] as usize].body == body && marked.is_none_or(|s| s.contains(&m.comps[g.owner[i] as usize].pos));
-    let cells = crate::voxel::slab_cells(g, f.cell, axis, &member, marked.is_none());
-    let out: std::collections::HashSet<[i32; 3]> = cells.iter().map(|&i| m.comps[g.owner[i] as usize].pos).collect();
-    out.into_iter().collect()
+/// Blocks of the whole wing a face belongs to: its panels and the surfaces on it.
+fn wing_blocks(m: &Model, f: &Face) -> Vec<[i32; 3]> {
+    let Some(pi) = face_panel(m, f) else { return Vec::new() };
+    let owners = |j: usize| m.panels[j].cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos);
+    (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).flat_map(owners).collect()
 }
 
 /// F9 table: every table the same width, columns split by weight.
@@ -1521,11 +1733,75 @@ fn flight_vehicle(ui: &Ui, n: usize, v: &crate::flight::VehicleDebug) {
 fn heading(ui: &Ui, title: &str) {
     ui.dummy([0.0, 2.0]);
     ui.text(title);
+    rule(ui);
+}
+
+/// Settings tab columns: the setting, its value for all vehicles, the workbench vehicle's own.
+const SETTING_COLS: [(&str, f32); 3] = [("", 360.0), ("All vehicles", 100.0), ("This vehicle", 150.0)];
+
+/// One setting: its name with a line on what it does (the full story on hover), the box for all
+/// vehicles and, with `own`, the vehicle's Global / On / Off choice. `depth` indents a setting
+/// under the one it needs; `enabled`: (the box, the vehicle's choice). True when the box changed.
+#[allow(clippy::too_many_arguments)]
+fn setting_row(ui: &Ui, depth: u8, name: &str, line: &str, tip: &str, flag: &AtomicBool, enabled: (bool, bool), own: Option<&mut Option<bool>>) -> bool {
+    ui.table_next_row();
+    ui.table_set_column_index(0);
+    let x = ui.cursor_pos()[0] + 14.0 * depth as f32;
+    ui.set_cursor_pos([x, ui.cursor_pos()[1]]);
+    ui.align_text_to_frame_padding();
+    if enabled.0 || enabled.1 {
+        ui.text(name);
+    } else {
+        ui.text_colored(DIM, name);
+    }
+    let hovered = ui.is_item_hovered();
+    ui.set_cursor_pos([x, ui.cursor_pos()[1] - 3.0]);
+    ui.text_colored(DIM, line);
+    if hovered || ui.is_item_hovered() {
+        hover_tip(ui, tip);
+    }
+    ui.dummy([0.0, 1.0]);
+    ui.table_set_column_index(1);
+    let mut v = flag.load(Ordering::Relaxed);
+    let changed = {
+        let _d = ui.begin_disabled(!enabled.0);
+        ui.checkbox(format!("##{name}"), &mut v)
+    };
+    if changed {
+        flag.store(v, Ordering::Relaxed);
+    }
+    if let Some(own) = own {
+        ui.table_set_column_index(2);
+        let _d = ui.begin_disabled(!enabled.1);
+        let names = [if v { "Global (on)" } else { "Global (off)" }, "On", "Off"];
+        let mut i = match *own {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        ui.set_next_item_width(-1.0);
+        if ui.combo_simple_string(format!("##own {name}"), &mut i, &names) {
+            *own = [None, Some(true), Some(false)][i];
+        }
+    }
+    changed
+}
+
+/// Hairline from the last item to the pane's right edge.
+fn rule(ui: &Ui) {
     let (l, r) = (ui.item_rect_min(), ui.item_rect_max());
     let right = ui.window_pos()[0] + ui.window_content_region_max()[0];
     let y = (l[1] + r[1]) * 0.5;
     ui.get_window_draw_list().add_line([r[0] + 8.0, y], [right, y], [0.35, 0.37, 0.42, 1.0]).build();
 }
+
+/// Label on the left, value right-aligned in a colour.
+fn kv_col(ui: &Ui, k: &str, v: &str, col: Option<[f32; 4]>) {
+    ui.text_colored(DIM, k);
+    ui.same_line_with_pos(ui.window_content_region_max()[0] - ui.calc_text_size(v)[0]);
+    ui.text_colored(col.unwrap_or(ui.style_color(imgui::StyleColor::Text)), v);
+}
+
 
 /// Small colour square, then the label.
 fn swatch(ui: &Ui, col: [f32; 4], label: &str) {
@@ -1556,9 +1832,7 @@ fn input_f(ui: &Ui, label: &str, v: &mut f32, fmt: &str) -> bool {
 
 /// Label on the left, value right-aligned.
 fn kv(ui: &Ui, k: &str, v: &str) {
-    ui.text_colored(DIM, k);
-    ui.same_line_with_pos(ui.window_content_region_max()[0] - ui.calc_text_size(v)[0]);
-    ui.text(v);
+    kv_col(ui, k, v, None);
 }
 
 fn sci(v: f64) -> String {
@@ -1949,6 +2223,17 @@ fn face_panel(m: &Model, f: &view::Face) -> Option<usize> {
 }
 
 /// Panel colour per aerofoil (index into `AEROFOILS`) in the aerofoil tool.
+/// Colour of a wing: a wing the player started (number `n` > 0) keeps one of the warm colours;
+/// the plain ones (wings by not touching another) take blue shades in the model's order (`rank`).
+fn wing_color(n: u32, rank: usize) -> [u8; 3] {
+    const MADE: [[u8; 3]; 8] = [[240, 140, 40], [220, 70, 220], [230, 220, 60], [240, 80, 90], [120, 210, 70], [170, 120, 70], [250, 150, 190], [200, 200, 200]];
+    const PLAIN: [[u8; 3]; 6] = [[90, 150, 230], [70, 200, 200], [130, 120, 235], [60, 110, 170], [140, 190, 240], [90, 170, 140]];
+    match n {
+        0 => PLAIN[rank % PLAIN.len()],
+        n => MADE[(n as usize - 1) % MADE.len()],
+    }
+}
+
 const FOIL_COLORS: [[u8; 3]; 9] =
     [[90, 150, 230], [230, 120, 40], [80, 200, 90], [200, 80, 200], [230, 220, 60], [60, 210, 210], [255, 255, 255], [240, 90, 110], [170, 170, 255]];
 
@@ -2046,10 +2331,47 @@ fn draw_force_arrows(ui: &Ui) {
         if let Some((p, t)) = v.thrust_at {
             arrow(place(p), scaled(t, 4.8), [1.0, 0.3, 1.0, 1.0], 6.0);
         }
+        for p in &v.props {
+            // Point and direction on the propeller's body as the game drew it (world fallback, as above).
+            let mat = smoothed_matrix(p.body, frame).filter(|m| {
+                let h = p.hub.1;
+                (V3 { x: h.x * m[0] + h.y * m[4] + h.z * m[8] + m[12], y: h.x * m[1] + h.y * m[5] + h.z * m[9] + m[13], z: h.x * m[2] + h.y * m[6] + h.z * m[10] + m[14] } - p.hub.0).len() < 100.0
+            });
+            let dir = |(world, d): (V3, V3)| mat.map_or(world, |m| V3 { x: d.x * m[0] + d.y * m[4] + d.z * m[8], y: d.x * m[1] + d.y * m[5] + d.z * m[9], z: d.x * m[2] + d.y * m[6] + d.z * m[10] });
+            let hub = place_on(p.body, p.hub.1, p.hub.0);
+            // Each propeller's own force: red when it drags (windmilling, braking); its thrust only
+            // when there are several, since one propeller's is the centre-of-thrust arrow.
+            if p.thrust < 0.0 || v.props.len() > 1 {
+                arrow(hub, scaled(dir(p.force), 4.0), if p.thrust < 0.0 { [1.0, 0.25, 0.2, 1.0] } else { [1.0, 0.3, 1.0, 1.0] }, 4.0);
+            }
+            if let Some((axis, [radius, v0, vi, circ])) = p.wash {
+                draw_propwash(ui, &vp, size, crate::model::Slipstream { hub, axis: dir(axis).norm(), radius, v0, vi }, circ);
+            }
+        }
         let lift = v.arrows.iter().fold(V3::ZERO, |s, a| s + a.lift);
         let drag = v.arrows.iter().fold(V3::ZERO, |s, a| s + a.drag);
         arrow(v.com + com_shift, scaled(lift, 4.8), [1.0, 1.0, 0.2, 1.0], 6.0);
         arrow(v.com + com_shift, scaled(drag, 4.8), [1.0, 0.6, 0.1, 1.0], 6.0);
+    }
+}
+
+/// A propeller's slipstream (`Slipstream::wash_lines`) through the main camera.
+fn draw_propwash(ui: &Ui, vp: &[f64; 16], size: [f32; 2], sl: crate::model::Slipstream, circ: f64) {
+    let dl = ui.get_background_draw_list();
+    let (mut drawn, mut total) = (0u32, 0u32);
+    for (a, b, alpha, thick) in sl.wash_lines(circ, ui.time()) {
+        total += 1;
+        if let (Some(a), Some(b)) = (view::project(vp, a, size), view::project(vp, b, size)) {
+            drawn += 1;
+            // Dark under-stroke: pale lines alone vanish against the sky.
+            dl.add_line(a, b, [0.0, 0.1, 0.2, 0.8 * alpha]).thickness(thick + 2.0).build();
+            dl.add_line(a, b, [0.85, 0.97, 1.0, alpha]).thickness(thick).build();
+        }
+    }
+    // One line per ~10 s of drawing: tells "not drawn" from "drawn but hard to see".
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if cfg!(feature = "logging") && CALLS.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
+        log_line(&format!("propwash: {drawn} of {total} segments in view, radius {:.2} m, speeds {:.1} + {:.1} m/s", sl.radius, sl.v0, sl.vi));
     }
 }
 

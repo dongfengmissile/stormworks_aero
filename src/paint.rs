@@ -22,7 +22,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
 use crate::logging::log_line;
 use crate::memory::{read_u32_at, read_usize_at, readable, PTR_MIN};
-use crate::voxel::{colour_runs, triangle_voxels};
+use crate::voxel::{colour_runs, groups, triangle_voxels, Group};
 
 pub(crate) type ChunkDraw = unsafe extern "system" fn(
     usize,      // bindset (renderer+0x920)
@@ -62,7 +62,8 @@ const MESH_ICOUNT: usize = 0x5C;
 const BODY_CHUNK_TABLES: [usize; 2] = [0x540, 0x588];
 const MAX_CHUNK_ITEMS: u32 = 8192;
 /// Extra draws per frame at most (each stalled run is one).
-const MAX_RUNS_PER_FRAME: u32 = 4000;
+/// Grid lines left unpainted split the runs, roughly one per painted block.
+const MAX_RUNS_PER_FRAME: u32 = 12000;
 
 /// One paint source: mesh IBO id -> voxel colours of its body, with a version that bumps on change,
 /// and the last published (body -> colours key, IBO -> body) to skip unchanged ticks.
@@ -160,24 +161,58 @@ thread_local! {
     /// Inside the main-view draw (sim render slot 7).
     static MAIN: Cell<bool> = const { Cell::new(false) };
     static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
+    /// Runs (first indices, index counts, how many) the next `glDrawElements` draws instead of its
+    /// own range; they point into the `Group` `paint` holds across that draw.
+    static MULTI: Cell<(*const u32, *const i32, usize)> = const { Cell::new(NO_MULTI) };
+}
+
+const NO_MULTI: (*const u32, *const i32, usize) = (std::ptr::null(), std::ptr::null(), 0);
+/// Per source (workbench, flight): bit `ibo & 4095` set for every mesh IBO it paints, so a draw of
+/// any other mesh costs two loads (the workbench makes about 2000 chunk draws a frame).
+static IBO_BITS: [[AtomicU64; 64]; 2] = [const { [const { AtomicU64::new(0) }; 64] }; 2];
+
+type DrawElements = unsafe extern "system" fn(u32, i32, u32, *const c_void);
+type MultiDrawElements = unsafe extern "system" fn(u32, *const i32, u32, *const *const c_void, i32);
+pub(crate) static ORIGINAL_DRAW_ELEMENTS: OnceLock<DrawElements> = OnceLock::new();
+/// Off once a batched draw did not reach `glDrawElements`: each run is then drawn on its own.
+static BATCH_OK: AtomicBool = AtomicBool::new(true);
+
+/// `glDrawElements` (opengl32 export, render thread). With runs queued by `paint`, the game's own
+/// draw call (its state and uniforms set) draws all of them in one `glMultiDrawElements`, from
+/// the same base offset the game used for its own first index.
+pub(crate) unsafe extern "system" fn draw_elements_detour(mode: u32, count: i32, ty: u32, indices: *const c_void) {
+    let Some(&orig) = ORIGINAL_DRAW_ELEMENTS.get() else { return };
+    let (firsts, counts, n) = MULTI.with(|m| m.get());
+    let multi = if n == 0 { None } else { gl().and_then(|g| g.multi_draw_elements) };
+    let Some(multi) = multi else {
+        return orig(mode, count, ty, indices);
+    };
+    MULTI.with(|m| m.set(NO_MULTI));
+    let size = match ty {
+        GL_UNSIGNED_SHORT => 2,
+        GL_UNSIGNED_INT => 4,
+        _ => 1,
+    };
+    // The game asked for the first run: its offset gives the buffer base for the others.
+    let firsts = std::slice::from_raw_parts(firsts, n);
+    let base = (indices as usize).wrapping_sub(firsts[0] as usize * size);
+    let offs: Vec<*const c_void> = firsts.iter().map(|&f| (base + f as usize * size) as *const c_void).collect();
+    multi(mode, counts, ty, offs.as_ptr(), n as i32);
 }
 
 /// Diagnostics (render thread): chunk draws, in the main view, IBO hits, readback failures.
-static N_DRAWS: AtomicU64 = AtomicU64::new(0);
-static N_MAIN: AtomicU64 = AtomicU64::new(0);
 static N_HIT: AtomicU64 = AtomicU64::new(0);
 static N_NO_TRIS: AtomicU64 = AtomicU64::new(0);
 static N_PAINTED: AtomicU64 = AtomicU64::new(0);
+
 static LAST_DIAG: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Cache {
-    /// IBO ids drawn in the main view since the last diagnostics line.
-    seen: HashSet<u32>,
     /// mesh -> (IBO, index count, voxel per triangle).
-    tris: HashMap<usize, (u32, u32, Arc<Vec<[i32; 3]>>)>,
-    /// (mesh, first, count) -> (version, runs of painted triangles as (first index, index count, colour)).
-    runs: HashMap<(usize, u32, u32), (u64, Arc<Vec<(u32, u32, u32)>>)>,
+    tris: HashMap<usize, (u32, u32, Arc<Vec<crate::voxel::TriVoxels>>)>,
+    /// (mesh, first, count) -> (version, runs of painted triangles by colour).
+    runs: HashMap<(usize, u32, u32), (u64, Arc<Vec<Group>>)>,
     logged: HashSet<u32>,
 }
 
@@ -191,6 +226,9 @@ pub(crate) fn main_view(on: bool) {
 /// Once per presented frame (overlay render, before SwapBuffers).
 pub(crate) fn new_frame() {
     FRAME_RUNS.store(0, Ordering::Relaxed);
+    if WORKBENCH_ACTIVE.load(Ordering::Relaxed) || FLIGHT_ACTIVE.load(Ordering::Relaxed) {
+        let _ = std::panic::catch_unwind(diag);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -241,7 +279,7 @@ unsafe fn body_ibos(body: usize) -> Vec<u32> {
 
 /// Publish `colours` (body pointer -> voxel colours; `key` changes whenever the colours do) into a
 /// source. Game thread only: it walks the bodies' chunk containers.
-fn publish_into(src: &Mutex<Source>, active: &AtomicBool, key: u64, colours: &HashMap<usize, Arc<VoxelColours>>) {
+fn publish_into(src: &Mutex<Source>, active: &AtomicBool, bits: &[AtomicU64; 64], key: u64, colours: &HashMap<usize, Arc<VoxelColours>>) {
     let mut ibo_body: HashMap<u32, usize> = HashMap::new();
     for &body in colours.keys() {
         if body >= PTR_MIN {
@@ -261,6 +299,14 @@ fn publish_into(src: &Mutex<Source>, active: &AtomicBool, key: u64, colours: &Ha
         log_line(&format!("paint: publish {} bodies [{}]", colours.len(), per.join("; ")));
     }
     let map: HashMap<u32, Arc<VoxelColours>> = ibo_body.iter().filter_map(|(&ibo, b)| Some((ibo, colours.get(b)?.clone()))).collect();
+    let mut words = [0u64; 64];
+    for &ibo in map.keys() {
+        words[(ibo as usize >> 6) & 63] |= 1 << (ibo & 63);
+    }
+    // Word by word, so an IBO painted before and after never reads as unpainted in between.
+    for (w, v) in bits.iter().zip(words) {
+        w.store(v, Ordering::Relaxed);
+    }
     active.store(!map.is_empty(), Ordering::Relaxed);
     s.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
     s.map = Some(map);
@@ -278,12 +324,12 @@ pub(crate) fn publish(stalled: HashMap<usize, HashSet<[i32; 3]>>) {
         }
     }
     let colours: HashMap<usize, Arc<VoxelColours>> = stalled.into_iter().map(|(b, v)| (b, Arc::new(v.into_iter().map(|c| (c, rgba(RED))).collect()))).collect();
-    publish_into(&FLIGHT, &FLIGHT_ACTIVE, key, &colours);
+    publish_into(&FLIGHT, &FLIGHT_ACTIVE, &IBO_BITS[1], key, &colours);
 }
 
 /// Editor tick (game thread): the workbench vehicle's voxel colours per body (empty = off).
 pub(crate) fn publish_workbench(key: u64, colours: &HashMap<usize, Arc<VoxelColours>>) {
-    publish_into(&WORKBENCH, &WORKBENCH_ACTIVE, key, colours);
+    publish_into(&WORKBENCH, &WORKBENCH_ACTIVE, &IBO_BITS[0], key, colours);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -294,6 +340,7 @@ pub(crate) struct Gl {
     pub(crate) bind_buffer: unsafe extern "system" fn(u32, u32),
     get_buffer_sub_data: unsafe extern "system" fn(u32, isize, isize, *mut c_void),
     pub(crate) get_integerv: unsafe extern "system" fn(u32, *mut i32),
+    multi_draw_elements: Option<MultiDrawElements>,
     depth_func: unsafe extern "system" fn(u32),
     pub(crate) bind_texture: unsafe extern "system" fn(u32, u32),
     pub(crate) compressed_tex_sub_image_2d: unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, i32, *const c_void),
@@ -319,6 +366,7 @@ pub(crate) fn gl() -> Option<&'static Gl> {
             bind_buffer: std::mem::transmute::<usize, _>(sym(c"glBindBuffer")?),
             get_buffer_sub_data: std::mem::transmute::<usize, _>(sym(c"glGetBufferSubData")?),
             get_integerv: std::mem::transmute::<usize, _>(sym(c"glGetIntegerv")?),
+            multi_draw_elements: sym(c"glMultiDrawElements").map(|p| std::mem::transmute::<usize, MultiDrawElements>(p)),
             depth_func: std::mem::transmute::<usize, _>(sym(c"glDepthFunc")?),
             bind_texture: std::mem::transmute::<usize, _>(sym(c"glBindTexture")?),
             compressed_tex_sub_image_2d: std::mem::transmute::<usize, _>(sym(c"glCompressedTexSubImage2D")?),
@@ -330,10 +378,13 @@ pub(crate) fn gl() -> Option<&'static Gl> {
 
 const GL_COPY_READ_BUFFER: u32 = 0x8F36;
 const GL_DEPTH_FUNC: u32 = 0x0B74;
+const GL_UNSIGNED_SHORT: u32 = 0x1403;
+const GL_UNSIGNED_INT: u32 = 0x1405;
+
 const GL_LEQUAL: u32 = 0x0203;
 
 /// Why a mesh's triangles could not be read (first few logged with the mesh's raw fields).
-fn readback_fail(mesh: usize, why: &str) -> Option<Arc<Vec<[i32; 3]>>> {
+fn readback_fail(mesh: usize, why: &str) -> Option<Arc<Vec<crate::voxel::TriVoxels>>> {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 6 {
         let raw: Vec<String> = if readable(mesh + 0x20, 0x50) {
@@ -348,10 +399,7 @@ fn readback_fail(mesh: usize, why: &str) -> Option<Arc<Vec<[i32; 3]>>> {
 
 /// Reads the mesh's vertices and indices (CPU copy if the game kept one, else from GL, once per
 /// mesh) and maps triangles to voxels.
-unsafe fn mesh_tris(gl: Option<&Gl>, mesh: usize, ibo: u32) -> Option<Arc<Vec<[i32; 3]>>> {
-    if !readable(mesh + 0x28, 0x40) {
-        return readback_fail(mesh, "fields unreadable");
-    }
+unsafe fn mesh_tris(gl: Option<&Gl>, mesh: usize, ibo: u32) -> Option<Arc<Vec<crate::voxel::TriVoxels>>> {
     let u = |o: usize| read_u32_at(mesh + o);
     let icount_now = u(MESH_ICOUNT);
     if let Some((i, n, t)) = CACHE.with(|c| c.borrow().tris.get(&mesh).cloned()) {
@@ -416,26 +464,28 @@ pub(crate) unsafe extern "system" fn chunk_draw_detour(
     // `wire` != 0 (the workbench block grid on): this call draws the triangles, then the same
     // triangles again as black lines. The paint below passes it on, so the lines stay on top.
     orig(a1, mesh, first, count, m, mp, mn, light, c1, c2, c3, preview, force, no_replace, a15, wire);
-    // Workbench: any view of the editor vehicle's meshes. Flight: main view only, F9 open.
-    // The editor must still be ticking: its meshes' GL ids are recycled once it closes.
-    let bench = WORKBENCH_ACTIVE.load(Ordering::Relaxed) && crate::editor::editor_active();
-    let flight = FLIGHT_ACTIVE.load(Ordering::Relaxed) && crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) && crate::flight::ENABLED.load(Ordering::Relaxed);
-    if !bench && !flight {
-        return;
-    }
-    N_DRAWS.fetch_add(1, Ordering::Relaxed);
-    let _ = std::panic::catch_unwind(diag);
     if mesh < PTR_MIN {
         return;
     }
-    let flight = flight && MAIN.with(|v| v.get());
-    if flight {
-        N_MAIN.fetch_add(1, Ordering::Relaxed);
+    // The game just drew from this mesh, so its fields are readable.
+    let ibo = read_u32_at(mesh + MESH_IBO);
+    let (w, b) = ((ibo as usize >> 6) & 63, 1u64 << (ibo & 63));
+    let (in_bench, in_flight) = (IBO_BITS[0][w].load(Ordering::Relaxed) & b != 0, IBO_BITS[1][w].load(Ordering::Relaxed) & b != 0);
+    if !in_bench && !in_flight {
+        return;
     }
+    // Workbench: any view of the editor vehicle's meshes. Flight: main view only, F9 open.
+    // The editor must still be ticking: its meshes' GL ids are recycled once it closes.
+    let bench = in_bench && WORKBENCH_ACTIVE.load(Ordering::Relaxed) && crate::editor::editor_active();
+    let flight = in_flight
+        && FLIGHT_ACTIVE.load(Ordering::Relaxed)
+        && crate::flight::DEBUG_WANTED.load(Ordering::Relaxed)
+        && crate::flight::ENABLED.load(Ordering::Relaxed)
+        && MAIN.with(|v| v.get());
     if !bench && !flight {
         return;
     }
-    let _ = std::panic::catch_unwind(|| paint(orig, bench, flight, a1, mesh, first, count, m, mp, mn, light, c2, c3, preview, no_replace, a15, wire));
+    let _ = std::panic::catch_unwind(|| paint(orig, bench, flight, a1, mesh, first, count, m, mp, mn, light, c1, c2, c3, preview, force, no_replace, a15, wire));
 }
 
 fn log_once_gl() {
@@ -450,20 +500,11 @@ fn diag() {
     if now.saturating_sub(last) < 5000 || LAST_DIAG.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let seen = CACHE.with(|c| std::mem::take(&mut c.borrow_mut().seen));
-    let keys = |src: &Mutex<Source>| src.lock().ok().and_then(|s| s.map.as_ref().map(|m| m.keys().copied().collect::<Vec<u32>>())).unwrap_or_default();
-    let targets: Vec<u32> = [keys(&FLIGHT), keys(&WORKBENCH)].concat();
-    let common = targets.iter().filter(|i| seen.contains(i)).count();
-    let mut sample: Vec<u32> = seen.iter().copied().collect();
-    sample.sort_unstable();
-    sample.truncate(12);
-    let mut tsample = targets.clone();
-    tsample.sort_unstable();
-    tsample.truncate(12);
     log_line(&format!(
-        "paint: draws {} main-view {} target hits {} no-readback {} painted {} | main-view ibos {} (e.g. {sample:?}), target ibos {} (e.g. {tsample:?}), common {common}",
-        N_DRAWS.swap(0, Ordering::Relaxed), N_MAIN.swap(0, Ordering::Relaxed), N_HIT.swap(0, Ordering::Relaxed),
-        N_NO_TRIS.swap(0, Ordering::Relaxed), N_PAINTED.swap(0, Ordering::Relaxed), seen.len(), targets.len()
+        "paint: target hits {} no-readback {} painted {}",
+        N_HIT.swap(0, Ordering::Relaxed),
+        N_NO_TRIS.swap(0, Ordering::Relaxed),
+        N_PAINTED.swap(0, Ordering::Relaxed)
     ));
 }
 
@@ -480,25 +521,21 @@ unsafe fn paint(
     mp: *const f32,
     mn: *const f32,
     light: f32,
+    c1: u32,
     c2: u32,
     c3: u32,
     preview: u8,
+    force: u8,
     no_replace: u8,
     a15: usize,
     wire: u8,
 ) {
-    if !readable(mesh + MESH_IBO, 4) {
-        return;
-    }
     let ibo = read_u32_at(mesh + MESH_IBO);
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.seen.len() < 4096 {
-            c.seen.insert(ibo);
-        }
-    });
     let look = |src: &Mutex<Source>| src.lock().ok().and_then(|s| Some((s.version, s.map.as_ref()?.get(&ibo)?.clone())));
-    let Some((version, set)) = bench.then(|| look(&WORKBENCH)).flatten().or_else(|| flight.then(|| look(&FLIGHT)).flatten()) else {
+    // The workbench colours list the unpainted parts' cells too (colour 0), so corners may fill in.
+    let Some((version, set, corners)) =
+        bench.then(|| look(&WORKBENCH)).flatten().map(|(v, s)| (v, s, true)).or_else(|| flight.then(|| look(&FLIGHT)).flatten().map(|(v, s)| (v, s, false)))
+    else {
         return;
     };
     N_HIT.fetch_add(1, Ordering::Relaxed);
@@ -515,7 +552,7 @@ unsafe fn paint(
     let runs = match CACHE.with(|c| c.borrow().runs.get(&key).cloned()) {
         Some((v, r)) if v == version => r,
         _ => {
-            let r = Arc::new(colour_runs(&tris, first, count, &set));
+            let r = Arc::new(groups(colour_runs(&tris, first, count, &set, corners)));
             CACHE.with(|c| {
                 let mut c = c.borrow_mut();
                 if c.runs.len() > 4096 {
@@ -527,20 +564,20 @@ unsafe fn paint(
                 c.runs.insert(key, (version, r.clone()));
                 if c.logged.insert(ibo) && c.logged.len() <= 16 {
                     // Frame check: the stalled voxels should fall inside this mesh's voxel box.
-                    let ok = tris.iter().filter(|v| v[0] != i32::MIN);
+                    let ok = tris.iter().map(|t| &t[0]).filter(|v| v[0] != i32::MIN);
                     let (lo, hi) = ok.fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| {
                         (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k])))
                     });
                     let (slo, shi) = set.keys().fold(([i32::MAX; 3], [i32::MIN; 3]), |(lo, hi), v| {
                         (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k])))
                     });
-                    let hit: HashSet<[i32; 3]> = tris.iter().filter(|v| set.contains_key(*v)).copied().collect();
+                    let hit: HashSet<[i32; 3]> = tris.iter().map(|t| t[0]).filter(|v| set.get(v).is_some_and(|&c| c != 0)).collect();
                     log_line(&format!(
                         "paint: ibo {ibo}: {} tris, voxels {lo:?}..{hi:?}; body painted {} voxels {slo:?}..{shi:?}; {} found in this mesh, {} runs",
                         tris.len(),
                         set.len(),
                         hit.len(),
-                        r.len()
+                        r.iter().map(|g| g.firsts.len()).sum::<usize>()
                     ));
                 }
             });
@@ -550,8 +587,11 @@ unsafe fn paint(
     if runs.is_empty() {
         return;
     }
-    let budget = MAX_RUNS_PER_FRAME.saturating_sub(FRAME_RUNS.fetch_add(runs.len() as u32, Ordering::Relaxed)) as usize;
-    if budget == 0 {
+    // Batched, a mesh costs a draw per colour whatever its run count; one by one, runs are rationed.
+    // `wire` makes the game draw twice per call, and only the first would take the batch.
+    let batched = wire == 0 && ORIGINAL_DRAW_ELEMENTS.get().is_some();
+    let total: usize = runs.iter().map(|g| g.firsts.len()).sum();
+    if !(batched && BATCH_OK.load(Ordering::Relaxed)) && FRAME_RUNS.fetch_add(total as u32, Ordering::Relaxed) >= MAX_RUNS_PER_FRAME {
         return;
     }
     let Some(gl) = gl else { return };
@@ -560,8 +600,30 @@ unsafe fn paint(
     // Same program and inputs give identical depth: LEQUAL lets the red pass over the game's own draw.
     (gl.depth_func)(GL_LEQUAL);
     N_PAINTED.fetch_add(1, Ordering::Relaxed);
-    for &(f, n, col) in runs.iter().take(budget) {
-        orig(a1, mesh, f, n, m, mp, mn, light, col, c2, c3, preview, 1, no_replace, a15, wire);
+    for g in runs.iter() {
+        let draw = |f: u32, n: i32| {
+            if g.col == 0 {
+                // Grid lines: drawn as the game did, over the paint.
+                orig(a1, mesh, f, n as u32, m, mp, mn, light, c1, c2, c3, preview, force, no_replace, a15, wire);
+            } else {
+                orig(a1, mesh, f, n as u32, m, mp, mn, light, g.col, c2, c3, preview, 1, no_replace, a15, wire);
+            }
+        };
+        let mut from = 0;
+        if batched && g.firsts.len() > 1 && BATCH_OK.load(Ordering::Relaxed) {
+            MULTI.with(|q| q.set((g.firsts.as_ptr(), g.counts.as_ptr(), g.firsts.len())));
+            draw(g.firsts[0], g.counts[0]);
+            if MULTI.with(|q| q.replace(NO_MULTI)).2 == 0 {
+                continue;
+            }
+            // The game's draw did not go through glDrawElements: only the first run was drawn.
+            BATCH_OK.store(false, Ordering::Relaxed);
+            log_line("paint: batched draw did not reach glDrawElements; drawing runs one by one");
+            from = 1;
+        }
+        for i in from..g.firsts.len() {
+            draw(g.firsts[i], g.counts[i]);
+        }
     }
     (gl.depth_func)(prev as u32);
 }

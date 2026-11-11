@@ -152,8 +152,8 @@ pub enum Key {
     Comp(u32),
     /// A sub-grid body with a control role.
     Body(u32),
-    /// Wing blocks of this body marked as a separate wing (their own panels and wing).
-    Split(u32),
+    /// Wing blocks of this body marked as separate wing number .1 (their own panels and wing).
+    Split(u32, u32),
 }
 
 /// Build panels. `key_of(component index)` says whether a component's cells are wing cells.
@@ -201,7 +201,7 @@ pub fn build_panels(grid: &Grid, key_of: &dyn Fn(u32) -> Option<(Key, Role)>, co
         let ys: Vec<f64> = cells.iter().map(|&i| aero_pos(grid.cell(i)).y - mid_y).collect();
         let left = ys.iter().filter(|y| **y < -0.01).count();
         let right = ys.iter().filter(|y| **y > 0.01).count();
-        if matches!(k, Key::Wing(_) | Key::Split(_)) && left > 4 && right > 4 {
+        if matches!(k, Key::Wing(_) | Key::Split(..)) && left > 4 && right > 4 {
             let (l, r) = cells.iter().zip(&ys).fold((vec![], vec![]), |(mut l, mut r), (&c, &y)| {
                 if y < 0.0 {
                     l.push(c)

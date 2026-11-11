@@ -51,6 +51,88 @@ pub struct Def {
     pub hinge: V3,
     /// Air propeller or rotor with its own blade mesh (the plugin's blade-element model).
     pub prop: Option<PropDef>,
+    /// A wheel's tyre (`Grid::build` adds `tyre_voxels` per part, for its size setting).
+    pub wheel: Option<Wheel>,
+}
+
+/// A wheel's tyre as a cylinder in the part's frame. The game marks the cells a tyre sweeps as
+/// reserved, not solid, and draws the wheel mesh with its own transform, so neither puts the
+/// tyre in the air: this does, from the reserved cells (where) and the wheel's size
+/// (knowledge/vehicle-model.md "Wheel draw").
+#[derive(Clone, Debug)]
+pub struct Wheel {
+    /// Metres. Advanced wheels (type 41): `wheel_radius` / `wheel_width`. Simple wheels (type 4):
+    /// their wheel mesh's size (their `wheel_radius` is about 1.5x the drawn wheel).
+    pub radius: f64,
+    pub width: f64,
+    /// Middle of the reserved cells, voxel units.
+    pub centre: V3,
+    /// Part axis the axle lies along (`constraint_axis`).
+    pub axle: usize,
+    /// Advanced wheel with suspension travel (not a fixed or track wheel).
+    pub sprung: bool,
+    mesh: String,
+}
+
+impl Wheel {
+    /// The tyres of one part: an advanced wheel's `wheel_size` setting adds 0.125 m of radius per
+    /// step above 1 and scales the tyre with it; off the ground a sprung wheel hangs half a
+    /// radius down its part +z; a double wheel has a second tyre one width further out the axle.
+    pub fn tyres(&self, set: Option<(f64, bool)>) -> Vec<Wheel> {
+        let mut w = self.clone();
+        if let Some((s, _)) = set {
+            w.radius = (self.radius + 0.125 * (s.clamp(0.0, 4.0) - 1.0)).max(0.05);
+            w.width *= w.radius / self.radius;
+        }
+        if self.sprung {
+            w.centre.z += 2.0 * w.radius;
+        }
+        let mut outer = w.clone();
+        match w.axle {
+            0 => outer.centre.x += 4.0 * w.width,
+            1 => outer.centre.y += 4.0 * w.width,
+            _ => outer.centre.z += 4.0 * w.width,
+        }
+        if set.is_some_and(|s| s.1) { vec![w, outer] } else { vec![w] }
+    }
+}
+const TYPE_WHEEL: i32 = 4;
+const TYPE_WHEEL_ADVANCED: i32 = 41;
+
+/// The tyre's cells: each bounded by the cylinder (an octagon of the circle's area), so the grid
+/// gets a wheel-shaped solid. Cells in `taken` (the part's own solid voxels) stay as they are.
+pub fn tyre_voxels(w: &Wheel, taken: &std::collections::HashSet<[i32; 3]>) -> Vec<DefVoxel> {
+    let (a, b, c) = (w.axle, (w.axle + 1) % 3, (w.axle + 2) % 3);
+    let unit = |i: usize, s: f64| v3(if i == 0 { s } else { 0.0 }, if i == 1 { s } else { 0.0 }, if i == 2 { s } else { 0.0 });
+    let (r, half) = (w.radius * 4.0, w.width * 2.0);
+    let apothem = r * (std::f64::consts::PI / (8.0 * (std::f64::consts::PI / 8.0).tan())).sqrt();
+    let mut planes = vec![Plane { n: unit(a, 1.0), d: half }, Plane { n: unit(a, -1.0), d: half }];
+    planes.extend((0..8).map(|k| {
+        let (sin, cos) = (std::f64::consts::TAU * k as f64 / 8.0).sin_cos();
+        Plane { n: unit(b, cos) + unit(c, sin), d: apothem }
+    }));
+    let reach = |i: usize| if i == a { half } else { r };
+    let range = |i: usize| ((w.centre.get(i) - reach(i)).round() as i32)..=((w.centre.get(i) + reach(i)).round() as i32);
+    let mut out = Vec::new();
+    for x in range(0) {
+        for y in range(1) {
+            for z in range(2) {
+                let pos = [x, y, z];
+                if taken.contains(&pos) {
+                    continue;
+                }
+                let rel = v3(x as f64, y as f64, z as f64) - w.centre;
+                let local: Vec<Plane> = planes.iter().map(|p| Plane { n: p.n, d: p.d - p.n.dot(rel) }).collect();
+                // The cell's share inside the tyre on a 4x4x4 lattice: under a tenth is no cell.
+                let at = |i: usize| -0.375 + 0.25 * i as f64;
+                let inside = (0..64).filter(|i| local.iter().all(|p| p.n.dot(v3(at(i % 4), at(i / 4 % 4), at(i / 16))) <= p.d)).count();
+                if inside >= 6 {
+                    out.push(DefVoxel { pos, shape: 0, rot: crate::vehicle::IDENTITY, bounds: Some(local), moving: false });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Type-2 air force emitter with a blade mesh (`mesh_1`): aircraft propeller, tail rotor,
@@ -109,6 +191,8 @@ impl PropDef {
     }
 }
 
+/// Joint halves of a pivot, hinge, suspension or turret (`multibody_*`, both halves).
+pub const TYPE_MULTIBODY: i32 = 7;
 pub const TYPE_RUDDER: i32 = 18;
 const TYPE_FORCE_EMITTER: i32 = 2;
 pub const TYPE_ROCKET: i32 = 47;
@@ -179,7 +263,10 @@ pub fn parse_def(text: &str) -> Def {
         logic: false,
         hinge: V3::ZERO,
         prop: None,
+        wheel: None,
     };
+    // Reserved (not solid) voxels, and the wheel's size attributes.
+    let (mut reserved, mut open_reserved, mut wheel_size, mut axle) = (Vec::<[i32; 3]>::new(), false, (0.0f64, None::<f64>), 0);
     let mut prop = PropDef::default();
     let mut names: [String; 3] = Default::default();
     let mut editor_only = false;
@@ -209,6 +296,8 @@ pub fn parse_def(text: &str) -> Def {
                 prop.blade_height = tag.num("force_emitter_blade_height").unwrap_or(0.0);
                 prop.default_pitch = tag.int0("force_emitter_default_pitch");
                 prop.max_force = tag.num("force_emitter_max_force").unwrap_or(1000.0);
+                wheel_size = (tag.num("wheel_radius").unwrap_or(0.0), tag.num("wheel_width"));
+                axle = tag.int0("constraint_axis").clamp(0, 2) as usize;
             }
             ("force_dir", false) => prop.axis = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0)),
             ("dynamic_rotation_axes", false) => def.hinge = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0)),
@@ -233,8 +322,17 @@ pub fn parse_def(text: &str) -> Def {
                     def.voxels.push(DefVoxel { pos: [0; 3], shape: tag.int0("physics_shape"), rot: crate::vehicle::IDENTITY, bounds: None, moving: false });
                 }
                 open = solid && !tag.empty;
+                if !solid {
+                    reserved.push([0; 3]);
+                }
+                open_reserved = !solid && !tag.empty;
             }
-            ("voxel", true) => open = false,
+            ("voxel", true) => (open, open_reserved) = (false, false),
+            ("position", false) if open_reserved => {
+                if let Some(v) = reserved.last_mut() {
+                    *v = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
+                }
+            }
             ("position", false) if open => {
                 if let Some(v) = def.voxels.last_mut() {
                     v.pos = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
@@ -265,6 +363,13 @@ pub fn parse_def(text: &str) -> Def {
     // shortcut: other animated types, and fins resting off-centre (none installed), keep the
     // physics voxels; add their pose from the type's draw function when one matters.
     let [m0, m1, m2] = names;
+    if matches!(def.type_, TYPE_WHEEL | TYPE_WHEEL_ADVANCED) && !reserved.is_empty() && wheel_size.0 > 0.0 {
+        let n = reserved.len() as f64;
+        let centre = reserved.iter().fold(V3::ZERO, |a, p| a + v3(p[0] as f64, p[1] as f64, p[2] as f64)) * (1.0 / n);
+        // No width given: the advanced wheels' own proportion (0.25 m wide at 0.35 m radius).
+        let sprung = def.type_ == TYPE_WHEEL_ADVANCED && prop.flags & 0x800000 == 0;
+        def.wheel = Some(Wheel { radius: wheel_size.0, width: wheel_size.1.filter(|w| *w > 0.0).unwrap_or(0.7 * wheel_size.0), centre, axle, sprung, mesh: m0.clone() });
+    }
     if !(m0.is_empty() && m1.is_empty() && m2.is_empty()) {
         // Air props and rotors with a blade mesh: the hub is drawn at rest, the blades per part
         // (their count, length and pitch are the part's settings): `PropDef::blade`.
@@ -635,6 +740,20 @@ impl Library {
             if tris.is_some() || !moving.is_empty() {
                 apply_mesh(&mut def, &tris.unwrap_or_default(), &moving, &self.shapes);
             }
+            if let Some(mut w) = def.wheel.take() {
+                // A simple wheel's drawn size: its mesh is the tyre alone, thinnest along the axle.
+                if let Some(t) = get(&w.mesh).filter(|_| def.type_ == TYPE_WHEEL) {
+                    let mut ext = [0, 1, 2].map(|a| {
+                        let (lo, hi) = t.iter().flat_map(|t| t.0).fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.get(a)), hi.max(p.get(a))));
+                        hi - lo
+                    });
+                    ext.sort_by(f64::total_cmp);
+                    if ext[0] > 0.0 {
+                        (w.width, w.radius) = (ext[0], 0.5 * ext[2]);
+                    }
+                }
+                def.wheel = Some(w);
+            }
             def
         };
         if let Ok(text) = std::fs::read_to_string(self.rom.join(format!("{name}.xml"))) {
@@ -802,5 +921,26 @@ mod tests {
         assert_eq!(bin_xml(&b), Some("<a/>x"));
         b[0] = 4;
         assert_eq!(bin_xml(&b), Some("<a/>"));
+    }
+
+    #[test]
+    fn wheel_tyre_fills_its_reserved_cells_as_a_disc() {
+        // An advanced 3x3 wheel: one solid hub cell, eight reserved around it in the x-z plane.
+        let ring: String = (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).filter(|p| *p != (0, 0)).map(|(x, z)| format!(r#"<voxel flags="2"><position x="{x}" z="{z}"/></voxel>"#)).collect();
+        let d = parse_def(&format!(r#"<definition type="41" flags="8388609" constraint_axis="1" wheel_radius="0.35" wheel_width="0.25" mesh_data_name=""><voxels><voxel flags="1"/>{ring}</voxels></definition>"#));
+        let w = d.wheel.clone().unwrap();
+        assert_eq!((w.axle, w.radius, w.width), (1, 0.35, 0.25));
+        assert!(w.centre.len() < 1e-9);
+        let cells = tyre_voxels(&w, &d.voxels.iter().map(|v| v.pos).collect());
+        let mut at: Vec<[i32; 3]> = cells.iter().map(|v| v.pos).collect();
+        at.sort();
+        // The eight cells around the hub, one layer thick; the hub cell itself is left alone.
+        assert_eq!(at.len(), 8);
+        assert!(at.iter().all(|p| p[1] == 0 && p[0].abs() <= 1 && p[2].abs() <= 1 && *p != [0, 0, 0]));
+        // A double wheel: the same disc again, one layer further out the axle.
+        let two: Vec<[i32; 3]> = w.tyres(Some((1.0, true))).iter().flat_map(|t| tyre_voxels(t, &Default::default())).map(|v| v.pos).collect();
+        assert_eq!((two.len(), two.iter().filter(|p| p[1] == 1).count()), (18, 9));
+        // A block is not a wheel, whatever its wheel_radius attribute says.
+        assert!(parse_def(r#"<definition type="0" wheel_radius="0.25"><voxels><voxel flags="1"/><voxel flags="2"><position x="1"/></voxel></voxels></definition>"#).wheel.is_none());
     }
 }

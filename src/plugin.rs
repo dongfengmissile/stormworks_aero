@@ -87,6 +87,7 @@ fn bootstrap() {
         let game = exe_dir().unwrap_or_else(|| plugin_dir.clone());
         let appdata = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Stormworks")).unwrap_or_default();
         let _ = crate::flight::PATHS.set((game, appdata));
+        crate::settings::load();
     }
     if disabled(&plugin_dir, "aero_disable_flight", "AERO_NO_FLIGHT") {
         log_line("in-game flight forces disabled by request (aero_disable_flight / AERO_NO_FLIGHT)");

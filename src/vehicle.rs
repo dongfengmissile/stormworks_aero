@@ -20,7 +20,17 @@ pub struct Comp {
     /// Propeller / rotor settings (`<o blade_count blade_pitch blade_length>`); None for other
     /// parts, and fields the vehicle leaves at the part's default.
     pub prop: Option<PropSet>,
+    /// A microcontroller's width and length in voxels (`<microprocessor_definition width length>`):
+    /// it takes width x 1 x length cells, along the part's +x and +z from `pos`. None for other parts.
+    pub size: Option<[i32; 2]>,
+    /// An advanced wheel's size setting (`<o wheel_size>`, 1 when unset) and whether it is a
+    /// double wheel (`<o double_wheel>`): `defs::Wheel::tyres`.
+    pub wheel_size: Option<(f64, bool)>,
 }
+
+/// The transform of a part saved without an `r` attribute. Not the identity, which the game
+/// writes out: every multi-voxel stock part saved without `r` fits its vehicle only this way.
+pub const DEFAULT_ROT: [i32; 9] = [0, 0, 1, -1, 0, 0, 0, -1, 0];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PropSet {
@@ -112,10 +122,10 @@ pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
                 cur = Some(Comp {
                     def: tag.get("d").unwrap_or("01_block").to_string(),
                     pos: [0; 3],
-                    rot: IDENTITY,
+                    rot: DEFAULT_ROT,
                     body: body.max(0) as u32,
                     mirror: 0,
-                    prop: None,
+                    prop: None, size: None, wheel_size: None,
                 });
                 flip = tag.int0("t");
                 aero.push(tag.get("aero").unwrap_or("").to_string());
@@ -127,6 +137,8 @@ pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
                 if let Some(c) = cur.as_mut() {
                     let p = PropSet { blades: tag.num("blade_count"), pitch: tag.num("blade_pitch"), length: tag.num("blade_length") };
                     c.prop = (p != PropSet::default()).then_some(p);
+                    let double = tag.get("double_wheel") == Some("true");
+                    c.wheel_size = (tag.get("wheel_size").is_some() || double).then(|| (tag.num("wheel_size").unwrap_or(1.0), double));
                 }
                 if let (Some(c), Some(r)) = (cur.as_mut(), tag.get("r")) {
                     let v: Vec<i32> = r.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -135,6 +147,11 @@ pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
                             c.rot = rot;
                         }
                     }
+                }
+            }
+            "microprocessor_definition" if ends(&stack, &["body", "components", "c", "o"]) => {
+                if let Some(c) = cur.as_mut() {
+                    c.size = Some([tag.num("width").unwrap_or(1), tag.num("length").unwrap_or(1)]);
                 }
             }
             "vp" if ends(&stack, &["c", "o"]) => {
@@ -159,8 +176,8 @@ mod tests {
     fn parses_bodies_and_skips_mc_internals() {
         let s = r#"<vehicle><bodies><body unique_id="1"><components>
             <c><o r="0,0,-1,-1,0,0,0,1,0"><vp x="-2" z="3"/></o></c>
-            <c d="02_wedge" t="5"><o><vp x="1"/></o></c>
-            <c d="microprocessor"><o><vp y="1"/><microprocessor_definition><group><components><c><object/></c></components></group></microprocessor_definition></o></c>
+            <c d="02_wedge" t="5"><o r="1,0,0,0,1,0,0,0,1"><vp x="1"/></o></c>
+            <c d="microprocessor"><o><vp y="1"/><microprocessor_definition width="3" length="2"><group><components><c><object/></c></components></group></microprocessor_definition></o></c>
             </components></body><body unique_id="2"><components><c d="02_wedge"><o/></c></components></body></bodies></vehicle>"#;
         let mut v = parse_vehicle_xml(s);
         let w = v.remove(1);
@@ -171,6 +188,8 @@ mod tests {
         assert_eq!(v[0].rot, [0, 0, -1, -1, 0, 0, 0, 1, 0]);
         assert_eq!(v[1].def, "microprocessor");
         assert_eq!(v[1].pos, [0, 1, 0]);
+        assert_eq!((v[1].size, v[0].size), (Some([3, 2]), None));
+        assert_eq!(v[1].rot, DEFAULT_ROT, "no r attribute");
         assert_eq!((v[2].def.as_str(), v[2].body, v[2].pos), ("02_wedge", 1, [0, 0, 0]));
         // row vector times rot: x offset 1 -> (0,0,-1)
         assert_eq!(v[0].cell([1, 0, 0]), [-2, 0, 2]);

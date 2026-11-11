@@ -3,7 +3,14 @@ name: Build Windows packages
 on:
   push:
     branches: ['**']
+    # Text-only pushes change no binary: keep the last build.
+    paths-ignore: ['**.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'docs/**']
   workflow_dispatch:
+
+# A newer push to the same branch replaces a build still running.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -36,9 +43,15 @@ jobs:
 
       - name: Install Windows cross compiler and Rust
         run: |
+          # Only the posix-thread compilers (the meta packages also pull the win32-thread set); zip is on the runner.
           sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 zip
+          sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+
+      # Keeps the downloaded crates and their compiled output between runs (Dear ImGui's C++ included).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
 
       - name: Build DLL and injector
         env:

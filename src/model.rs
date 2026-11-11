@@ -28,12 +28,15 @@ pub struct Designations {
     pub default_foil: usize,
     /// Aerofoil of every other missile fin panel (None: `wing::FIN_DEFAULT`).
     pub default_fin: Option<usize>,
-    /// Wing blocks marked as a separate wing: they form their own panels and wing (for another
-    /// aerofoil on part of a wing).
-    pub splits: HashSet<[i32; 3]>,
+    /// Wing blocks marked as a separate wing, by wing number (1, 2, ...): each number forms its
+    /// own panels and wing (for another aerofoil on part of a wing). Unmarked blocks are wing 0.
+    pub splits: HashMap<[i32; 3], u32>,
     /// Per-vehicle settings (None: the global one): plugin flight model, vortex ring state.
     pub fly: Option<bool>,
     pub vrs: Option<bool>,
+    /// Plugin propellers and rotors (off: the game's own thrust and shaft load).
+    pub props: Option<bool>,
+    pub ground: Option<bool>,
     /// Propeller/rotor blade width by component position, x the part's own.
     pub widths: HashMap<[i32; 3], f64>,
     /// Propeller/rotor blade shape chosen by position: true propeller, false rotor (else auto).
@@ -41,8 +44,9 @@ pub struct Designations {
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
-/// Panels on different bodies join only through a control surface, so a static sub-grid (a wingtip
-/// built as its own grid) is a wing of its own, while ailerons and flaps stay with their wing.
+/// Panels on different bodies join only through a control surface or a shared wing number, so a
+/// static sub-grid (a wingtip built as its own grid) is a wing of its own, while ailerons and
+/// flaps stay with their wing.
 fn wing_groups(grid: &Grid, panel_of: &[usize], n: usize, joins: &dyn Fn(usize, usize) -> bool) -> Vec<usize> {
     let mut parent: Vec<usize> = (0..n).collect();
     fn root(p: &mut [usize], mut i: usize) -> usize {
@@ -300,8 +304,10 @@ pub struct Model {
     pub panel_of: Vec<usize>,
     /// Whole-wing id per panel: panels whose cells touch belong to one wing (wing + its ailerons/flaps).
     pub wing_of: Vec<usize>,
-    /// Panel marked as a separate wing (`Designations::splits`).
-    pub separate: Vec<bool>,
+    /// Panel's wing number (`Designations::splits`; 0 unmarked).
+    pub separate: Vec<u32>,
+    /// Panel's wing counted among the unnumbered wings in panel order (0, 1, ...): a colour index.
+    pub wing_rank: Vec<usize>,
     /// Per panel: the rocket fin it is, deflected live by the game (`flight::fin_angle`).
     pub fin_live: Vec<Option<FinLive>>,
     /// Per panel: the component of a missile fin made from its mesh (default section
@@ -320,7 +326,43 @@ pub struct Model {
     pub b_ref: f64,
     /// Air propellers and rotors the plugin flies (`prop.rs`).
     pub props: Vec<PropUnit>,
+    /// Bodies without lifting panels, each its own small fuselage (`bluff_forces`).
+    pub bluff: Vec<Bluff>,
+    /// The main body (the one with the most parts) and its head-on silhouette: per grid (x, y)
+    /// column, whether its hull fills any cell along the length.
+    pub main_body: usize,
+    pub silhouette: Vec<bool>,
 }
+
+/// A body without lifting panels (a landing gear leg, a door, anything on a pivot) as its own
+/// small fuselage: the main body's section model (`BodyAero`), sliced along its longest side.
+pub struct Bluff {
+    pub body: usize,
+    /// Its cells in the vehicle grid.
+    pub cells: Vec<usize>,
+    /// Grid axis the slices run along.
+    axis: usize,
+    aero: BodyAero,
+    /// Middle of its cells in the slicing frame, m.
+    mid: V3,
+    /// Solid volume, m³: a body too short to slice drags as a lump of this size.
+    volume: f64,
+}
+
+impl Bluff {
+    pub fn debug(&self) -> String {
+        format!("axis {} length {:.2} max_area {:.3} fineness {:.2} sections {} xs areas {:?}", self.axis, self.aero.length, self.aero.max_area, self.aero.fineness, self.aero.sections.len(), self.aero.xs.iter().map(|x| (x.area * 1000.0).round() / 1000.0).collect::<Vec<_>>())
+    }
+}
+
+/// Grid vector or cell turned so that axis `a` becomes the grid's forward axis (a rotation: `unturn` undoes it).
+fn turn<T: Copy>(c: [T; 3], a: usize) -> [T; 3] {
+    [c[(a + 1) % 3], c[(a + 2) % 3], c[a]]
+}
+fn unturn<T: Copy>(c: [T; 3], a: usize) -> [T; 3] {
+    turn(turn(c, a), a)
+}
+
 
 /// One propeller or rotor part.
 #[derive(Clone, Debug)]
@@ -381,6 +423,7 @@ pub struct PropOut {
 
 /// Shaft inertia per unit of the game's slot mass, kg·m². The shaft network conserves slot
 /// mass × speed (`vehicle_shaft_network_step` 0x4C02A0), so a torque removes `Q·dt / (2π·I)`.
+<<<<<<< HEAD
 /// The game has no torque unit, so this is a choice: set so an aircraft propeller at its best static
 /// pitch drains about half of what the game's own model takes for the same thrust (`T/1500` momentum
 /// per tick). Matching the game there (2.4) stalled engines at coarse pitch on take-off, where stalled
@@ -403,6 +446,59 @@ pub struct Slipstream {
 }
 
 impl Slipstream {
+    /// The air's speed along the tube and the tube's radius, `x` m behind the disc.
+    pub fn section(&self, x: f64) -> (f64, f64) {
+        let speed = self.v0 + self.vi * (1.0 + x / (x * x + self.radius * self.radius).sqrt());
+        (speed, self.radius * ((self.v0 + self.vi) / speed).sqrt())
+    }
+
+    /// The slipstream as line segments for the F9 view: (from, to, opacity 0..1, thickness px).
+    /// Rings along the narrowing tube and streamlines that twist with the swirl (`circ` = r·vθ, m²/s,
+    /// signed about the thrust axis), with bright bands drifting downstream over `time` (s).
+    /// Brightest at the disc, fading to nothing 8 radii behind (the wash itself has no end).
+    pub fn wash_lines(&self, circ: f64, time: f64) -> Vec<(V3, V3, f32, f32)> {
+        use std::f64::consts::TAU;
+        const RINGS: usize = 8;
+        const AROUND: usize = 24;
+        const LINES: usize = 6;
+        const STEPS: usize = 32;
+        let len = 8.0 * self.radius;
+        // A weak wash (idling) is fainter: full strength from 30 m/s over the free stream.
+        let strength = (2.0 * self.vi / 30.0).clamp(0.15, 1.0);
+        let side = if self.axis.y.abs() < 0.9 { v3(0.0, 1.0, 0.0) } else { v3(1.0, 0.0, 0.0) };
+        let e1 = self.axis.cross(side).norm();
+        let e2 = self.axis.cross(e1);
+        let at = |x: f64, r: f64, th: f64| self.hub - self.axis * x + (e1 * th.cos() + e2 * th.sin()) * r;
+        let fade = |x: f64| (1.0 - x / len).max(0.0).powi(2);
+        let mut out = Vec::with_capacity(RINGS * AROUND + LINES * STEPS);
+        for i in 0..RINGS {
+            let x = len * i as f64 / RINGS as f64;
+            let r = self.section(x).1;
+            for k in 0..AROUND {
+                out.push((at(x, r, TAU * k as f64 / AROUND as f64), at(x, r, TAU * (k + 1) as f64 / AROUND as f64), (0.7 * strength * fade(x)) as f32, 2.0));
+            }
+        }
+        let dx = len / STEPS as f64;
+        // Bands a radius and a half apart, drifting at a quarter of the wash's speed (readable, not a flicker).
+        let drift = 0.25 * (self.v0 + 2.0 * self.vi) * time;
+        for j in 0..LINES {
+            let mut th = TAU * j as f64 / LINES as f64;
+            let mut prev = at(0.0, 0.75 * self.radius, th);
+            for i in 1..=STEPS {
+                let x = dx * i as f64;
+                let (speed, tube) = self.section(x);
+                let r = 0.75 * tube;
+                // The air turns vθ/r = circ/r² while it moves `speed` along the tube.
+                th += circ / (r * r * speed) * dx;
+                let p = at(x, r, th);
+                let band = 0.5 + 0.5 * (TAU * (x - drift) / (1.5 * self.radius)).cos();
+                out.push((prev, p, (0.9 * strength * fade(x - 0.5 * dx) * (0.3 + 0.7 * band)) as f32, 2.0));
+                prev = p;
+            }
+        }
+        out
+    }
+
     /// Inside the tube at world point `p`: the air's speed along it there and the radial vector from the axis.
     pub fn at(&self, p: V3) -> Option<(f64, V3)> {
         let d = p - self.hub;
@@ -411,15 +507,173 @@ impl Slipstream {
             return None; // ahead of the disc
         }
         let rv = d + self.axis * x;
-        let speed = self.v0 + self.vi * (1.0 + x / (x * x + self.radius * self.radius).sqrt());
-        (rv.len() <= self.radius * ((self.v0 + self.vi) / speed).sqrt()).then_some((speed, rv))
+        let (speed, tube) = self.section(x);
+        (rv.len() <= tube).then_some((speed, rv))
     }
 }
+=======
+/// Set so a propeller or rotor at its best static pitch drains about what the game's own model
+/// takes for the same thrust (`T/1500` momentum per tick): aircraft propellers and the large
+/// coaxial rotor match; smaller rotors load the shaft less than in the game (0.25..0.75x).
+/// shortcut: one factor for all parts (the game's load follows thrust, ours power); retune from players' readings.
+const SHAFT_INERTIA: f64 = 2.4;
+>>>>>>> parent of 7bf3816 (added propwash, surfaces behind the wash get additional lift; propeller slipstream swirl cancels out part of the torque generated by the propeller; lightened propeller load on engines)
 
 /// Cyclic blade angle per unit input, rad.
 const CYCLIC_RAD: f64 = 0.2;
 
 impl Model {
+    /// Guess what nobody marked yet (the Detect button): wing blocks, and the roles of vanilla
+    /// control surfaces without one. Existing marks stay.
+    ///
+    /// Wing blocks: slabs at most 4 cells thick standing in open air (`voxel::slab_cells`'s
+    /// rule), of at least half a square metre, at least twice as wide as thick both ways (so no
+    /// thin tail boom), and with nothing of the vehicle above and below most of them (so no
+    /// wall or floor of a hollow hull, which faces the opposite wall).
+    /// Roles: a surface standing upright is a rudder; a flat one on the widest wing is an aileron
+    /// on its outer half and a flap on its inner half; any other flat one is an elevator. With no
+    /// elevator found, the flaps are elevons.
+    pub fn detect(&self, des: &Designations, lib: &mut Library) -> Designations {
+        let g = &self.grid;
+        let n = g.owner.len();
+        let is_cs: Vec<bool> = self.comps.iter().map(|c| lib.get(&c.def).is_some_and(|d| d.is_control_surface())).collect();
+        let solid = |i: usize| g.owner[i] != EMPTY && g.owner[i] != INTERIOR;
+        let plain = |i: usize| solid(i) && !is_cs[g.owner[i] as usize];
+        let body = |i: usize| self.comps[g.owner[i] as usize].body;
+        let step = |i: usize, axis: usize, s: i32| {
+            let mut c = g.cell(i);
+            c[axis] += s;
+            g.index(c)
+        };
+        let mut out = des.clone();
+        for axis in 0..3 {
+            let mut seen = vec![false; n];
+            for start in 0..n {
+                if seen[start] || !plain(start) {
+                    continue;
+                }
+                let b = body(start);
+                let member = |i: usize| plain(i) && body(i) == b;
+                let (mut cells, mut cols, mut clear) = (Vec::new(), 0usize, 0usize);
+                let mut queue = std::collections::VecDeque::from([start]);
+                while let Some(i) = queue.pop_front() {
+                    if seen[i] || !member(i) {
+                        continue;
+                    }
+                    let mut col = vec![i];
+                    let mut ends = [None; 2];
+                    for (k, s) in [1, -1].into_iter().enumerate() {
+                        let mut j = step(i, axis, s);
+                        while let Some(x) = j.filter(|&x| member(x)) {
+                            col.push(x);
+                            j = step(x, axis, s);
+                        }
+                        ends[k] = j;
+                    }
+                    col.iter().for_each(|&c| seen[c] = true);
+                    if col.len() > 4 || ends.iter().any(|e| e.is_some_and(|j| g.owner[j] == INTERIOR)) {
+                        continue;
+                    }
+                    // Nothing of the vehicle further out along the axis, either way.
+                    let open = |k: usize, s: i32| {
+                        let mut j = ends[k];
+                        while let Some(x) = j {
+                            if g.owner[x] != EMPTY {
+                                return false;
+                            }
+                            j = step(x, axis, s);
+                        }
+                        true
+                    };
+                    cols += 1;
+                    clear += (open(0, 1) && open(1, -1)) as usize;
+                    for &c in &col {
+                        cells.push((c, col.len() as i32));
+                        let at = g.cell(c);
+                        for d in crate::voxel::DIRS.iter().filter(|d| d[axis] == 0) {
+                            if let Some(j) = g.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]) {
+                                if !seen[j] {
+                                    queue.push_back(j);
+                                }
+                            }
+                        }
+                    }
+                }
+                if cols < 8 || clear * 2 < cols {
+                    continue;
+                }
+                // Each cell: the slab runs at least twice its thickness through it, both ways.
+                let inside: HashSet<usize> = cells.iter().map(|c| c.0).collect();
+                let run = |c: usize, a: usize| {
+                    let reach = |s: i32| std::iter::successors(step(c, a, s), |&j| step(j, a, s)).take_while(|j| inside.contains(j)).count() as i32;
+                    1 + reach(1) + reach(-1)
+                };
+                let wide = cells.iter().filter(|&&(c, thick)| (0..3).filter(|&a| a != axis).all(|a| run(c, a) >= 2 * thick));
+                out.wings.extend(wide.map(|&(c, _)| self.comps[g.owner[c] as usize].pos));
+            }
+        }
+        // Whole wings of the marked blocks: the width they span (body y), lying flat, and the
+        // length and height they span (body x and z).
+        let wing = |i: usize| plain(i) && out.wings.contains(&self.comps[g.owner[i] as usize].pos);
+        let mut group_of = vec![usize::MAX; n];
+        let mut groups: Vec<((f64, f64), bool, (f64, f64), (f64, f64))> = Vec::new();
+        for start in 0..n {
+            if group_of[start] != usize::MAX || !wing(start) {
+                continue;
+            }
+            let (mut x, mut y, mut z) = ((f64::MAX, f64::MIN), (f64::MAX, f64::MIN), (f64::MAX, f64::MIN));
+            let mut queue = vec![start];
+            group_of[start] = groups.len();
+            while let Some(i) = queue.pop() {
+                let p = aero_pos(g.cell(i));
+                (x, y, z) = ((x.0.min(p.x), x.1.max(p.x)), (y.0.min(p.y), y.1.max(p.y)), (z.0.min(p.z), z.1.max(p.z)));
+                let at = g.cell(i);
+                for d in crate::voxel::DIRS {
+                    if let Some(j) = g.index([at[0] + d[0], at[1] + d[1], at[2] + d[2]]).filter(|&j| group_of[j] == usize::MAX && wing(j)) {
+                        group_of[j] = groups.len();
+                        queue.push(j);
+                    }
+                }
+            }
+            groups.push((y, z.1 - z.0 < 0.5 * (y.1 - y.0), x, z));
+        }
+        // The flat wings' middle and half width; the widest reach at least 80% of it.
+        let (y0, y1) = groups.iter().filter(|w| w.1).fold((f64::MAX, f64::MIN), |a, w| (a.0.min(w.0 .0), a.1.max(w.0 .1)));
+        let (mid, span) = if y1 > y0 { (0.5 * (y0 + y1), 0.5 * (y1 - y0)) } else { (self.com.y, 0.0) };
+        let reach = |y: (f64, f64)| (y.0 - mid).abs().max((y.1 - mid).abs());
+        // On the widest wings (a left and a right half are two): beside or just behind one. Not
+        // by touching cells: a surface's hinge leaves a gap to the wing.
+        let on_main = |c: V3| {
+            let within = |v: f64, r: (f64, f64), pad: f64| v >= r.0 - pad && v <= r.1 + pad;
+            groups.iter().any(|w| w.1 && reach(w.0) >= 0.8 * span && within(c.x, w.2, 0.75) && within(c.z, w.3, 0.5))
+        };
+        let mut guessed: Vec<([i32; 3], Role)> = Vec::new();
+        for p in &self.panels {
+            let Some(&o) = p.cells.first().map(|&c| &g.owner[c]).filter(|&&o| (o as usize) < is_cs.len() && is_cs[o as usize]) else {
+                continue;
+            };
+            let pos = self.comps[o as usize].pos;
+            if des.roles.contains_key(&pos) {
+                continue;
+            }
+            let role = if p.n.y.abs() > 0.7 {
+                Role::Yaw
+            } else if !on_main(p.centroid) {
+                Role::Pitch
+            } else if (p.centroid.y - mid).abs() > 0.5 * span {
+                Role::Roll
+            } else {
+                Role::Flap
+            };
+            guessed.push((pos, role));
+        }
+        let pitch = des.roles.values().chain(guessed.iter().map(|g| &g.1)).any(|r| *r == Role::Pitch);
+        for (pos, role) in guessed {
+            out.roles.insert(pos, if role == Role::Flap && !pitch { Role::Pitch } else { role });
+        }
+        out
+    }
+
     /// Shaft speed drop per tick per N·m of our blades' torque: the part's slot mass is
     /// `max_force/1000 · blades/8` (blade parts), shaft torque = blade torque × `rotation_speed`.
     pub fn prop_load(&self, k: usize, blades: u32) -> f64 {
@@ -547,63 +801,6 @@ impl Model {
         }
     }
 
-    /// The slipstream of propeller `k` (None for rotors, and when it is stopped or windmilling).
-    /// `v`: induced speed at the disc, m/s.
-    pub fn slipstream(&self, k: usize, lb: &LiveBody, s: &PropLive, v: f64) -> Option<Slipstream> {
-        let u = &self.props[k];
-        let axis = lb.dir_to_world(u.axis).norm() * if s.reversed { -1.0 } else { 1.0 };
-        let hub = lb.to_world(u.hub);
-        let v0 = (lb.vel + lb.omega.cross(hub - lb.com) - lb.wind).dot(axis).max(0.0);
-        let radius = self.prop_geom(k, s.blades, s.length).radius;
-        (u.airscrew && v > 0.5 && radius > 0.0).then_some(Slipstream { hub, axis, radius, v0, vi: v })
-    }
-
-    /// Rolling moment (world, N·m) the propeller's rotating slipstream puts on the wing and tail
-    /// cells inside it: it opposes the torque reaction. Momentum theory, constant circulation: the
-    /// wake carries the torque as swirl, r·vθ = Q / (ρ·V_disc·πR²). A cell meets the swirl as a
-    /// change of angle of attack at the wake's speed; its lift slope is that of a wing as wide as
-    /// the tube, and it stalls at cl 1.2. Never more than Q: that is all the swirl there is.
-    /// NACA TN 1146 measured 40-50 % cancelled by wing + fuselage on a low-wing single without its tail.
-    pub fn swirl_recovery(&self, slip: &Slipstream, bodies: &[LiveBody], out: &PropOut) -> V3 {
-        if !(out.torque > 1.0) || bodies.is_empty() {
-            return V3::ZERO;
-        }
-        let (axis, radius) = (slip.axis, slip.radius);
-        let rho = atmosphere(slip.hub.y).rho;
-        let circ = out.torque / (rho * (slip.v0 + slip.vi) * PI * radius * radius);
-        // Per panel: how far behind the disc it sits, and the moment the full swirl would give it.
-        let mut parts: Vec<(f64, f64)> = Vec::new();
-        for p in self.panels.iter().filter(|p| !p.cells.is_empty()) {
-            let b = &bodies[self.panel_body(p).min(bodies.len() - 1)];
-            let n = b.dir_to_world(p.n);
-            let cell_area = p.area / p.cells.len() as f64;
-            let ar = 2.0 * radius / p.mac.max(0.05);
-            let slope = 2.0 * PI * ar / (ar + 2.0);
-            let mut m = 0.0;
-            for &c in &p.cells {
-                let Some((speed, rv)) = slip.at(b.to_world(crate::body::aero_pos(self.grid.cell(c)))) else { continue };
-                let r = rv.len().max(1e-6);
-                // The air turns the way the blades do: along spin·(axis × r).
-                let swirl = axis.cross(rv) * (out.spin * circ / (r * r.max(0.2 * radius)));
-                let cl = (slope * swirl.dot(n) / speed).clamp(-1.2, 1.2);
-                let f = n * (0.5 * rho * speed * speed * cl * cell_area);
-                m += rv.cross(f).dot(axis) * out.spin;
-            }
-            if m != 0.0 {
-                parts.push((-(b.to_world(p.centroid) - slip.hub).dot(axis), m));
-            }
-        }
-        // Front to back: each surface meets only the swirl the ones ahead of it left.
-        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut left = out.torque;
-        for (_, m) in parts {
-            left -= (m * left / out.torque).clamp(-left, left);
-        }
-        // Against the torque reaction (−spin·Q about the axis) only; `left` never passes zero, so at
-        // most all of it: a design with enough surface in the slipstream straightens it completely.
-        axis * ((out.torque - left).clamp(0.0, out.torque) * out.spin)
-    }
-
     pub fn build(comps: Vec<Comp>, lib: &mut Library, des: &Designations) -> Model {
         let grid = Grid::build(&comps, lib);
         let (mass, com, inertia) = mass_properties(&comps, &grid, lib);
@@ -621,7 +818,9 @@ impl Model {
             if let Some(d) = lib.get(&c.def) {
                 is_cs[i] = d.is_control_surface();
                 is_wing[i] = d.is_wing();
-                let marked = des.wings.contains(&c.pos) && d.type_ != crate::defs::TYPE_RUDDER && !d.block;
+                // A marked joint half (the pivot head on a flap) is a wing block like its neighbours,
+                // not its own fins.
+                let marked = des.wings.contains(&c.pos) && ![crate::defs::TYPE_RUDDER, crate::defs::TYPE_MULTIBODY].contains(&d.type_) && !d.block;
                 if !d.plates.is_empty() && (d.fins || marked) {
                     plates.push((i, d.clone()));
                     continue;
@@ -649,18 +848,16 @@ impl Model {
             if !is_wing[o as usize] {
                 return None;
             }
-            Some((if des.splits.contains(&c.pos) { Key::Split(c.body) } else { Key::Wing(c.body) }, Role::None))
+            Some((des.splits.get(&c.pos).map_or(Key::Wing(c.body), |&g| Key::Split(c.body, g)), Role::None))
         };
         let mut panels = build_panels(&grid, &key_of, com);
-        // Section per panel: the aerofoil set on any of its components, else the default.
-        for p in &mut panels {
-            p.foil = p
-                .cells
-                .iter()
-                .map(|&c| grid.owner[c])
-                .filter(|&o| (o as usize) < comps.len())
-                .find_map(|o| des.foils.get(&comps[o as usize].pos).copied())
-                .unwrap_or(des.default_foil);
+        // Section per panel: the aerofoil set on any of its components, else its wing's (below),
+        // else the default.
+        let mut marked_foil = vec![false; panels.len()];
+        for (p, marked) in panels.iter_mut().zip(&mut marked_foil) {
+            let mark = p.cells.iter().map(|&c| grid.owner[c]).filter(|&o| (o as usize) < comps.len()).find_map(|o| des.foils.get(&comps[o as usize].pos).copied());
+            *marked = mark.is_some();
+            p.foil = mark.unwrap_or(des.default_foil);
         }
         // Voxel panels replace the skin of their cells; plate panels share cells with the body.
         let mut no_skin = vec![false; grid.fill.len()];
@@ -712,7 +909,49 @@ impl Model {
                 }
             }
         }
-        let body = BodyAero::build(&grid, &no_skin);
+        let body_of: Vec<usize> = panels
+            .iter()
+            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).find(|&o| (o as usize) < comps.len()).map_or(0, |o| comps[o as usize].body as usize))
+            .collect();
+        // Same rule as the flight loop's main body: most parts, lowest index on a tie.
+        let mut count: HashMap<usize, usize> = HashMap::new();
+        comps.iter().for_each(|c| *count.entry(c.body as usize).or_default() += 1);
+        let main_body = count.into_iter().max_by_key(|&(b, n)| (n, std::cmp::Reverse(b))).map_or(0, |(b, _)| b);
+        let column = grid.dims[0] * grid.dims[1];
+        let mut silhouette = vec![false; column];
+        for (c, &o) in grid.owner.iter().enumerate() {
+            if o == INTERIOR || comps.get(o as usize).is_some_and(|k| k.body as usize == main_body) {
+                silhouette[c % column] = true;
+            }
+        }
+        // Bodies with no lifting panel get their own model. Their cells that stick out of the main
+        // body's outline as built leave the main fuselage, so they are not counted twice.
+        let mut by_body: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (c, &o) in grid.owner.iter().enumerate().filter(|(c, &o)| (o as usize) < comps.len() && grid.fill[*c] > 0.0) {
+            by_body.entry(comps[o as usize].body as usize).or_default().push(c);
+        }
+        let lifting: std::collections::HashSet<usize> = body_of.iter().copied().collect();
+        let mut skip = vec![false; grid.fill.len()];
+        let mut bluff: Vec<Bluff> = by_body
+            .into_iter()
+            .filter(|(b, _)| *b != main_body && !lifting.contains(b))
+            .map(|(body, cells)| {
+                let at: Vec<[i32; 3]> = cells.iter().map(|&c| grid.cell(c)).collect();
+                let extent = |a: usize| at.iter().map(|p| p[a]).max().unwrap_or(0) - at.iter().map(|p| p[a]).min().unwrap_or(0);
+                // Longest side; on a tie the one nearest the vehicle's own axis.
+                let axis = [0, 1, 2].into_iter().max_by_key(|&a| (extent(a), a)).unwrap_or(2);
+                let local: Vec<([i32; 3], f32, u32)> = cells.iter().zip(&at).map(|(&c, &p)| (turn(p, axis), grid.fill[c], 0)).collect();
+                let aero = BodyAero::build(&Grid::from_cells(&local), &[], &[]);
+                let mid = local.iter().fold(V3::ZERO, |a, l| a + aero_pos(l.0)) * (1.0 / local.len() as f64);
+                let volume = cells.iter().map(|&c| grid.fill[c] as f64).sum::<f64>() * VOXEL_M.powi(3);
+                for &c in &cells {
+                    skip[c] = !silhouette[c % column];
+                }
+                Bluff { body, cells, axis, aero, mid, volume }
+            })
+            .collect();
+        bluff.sort_by_key(|b| b.body);
+        let body = BodyAero::build(&grid, &no_skin, &skip);
 
         let s: f64 = panels.iter().map(|p| p.area).sum();
         let (s_ref, mac_ref, b_ref) = if s > 1e-6 {
@@ -724,17 +963,13 @@ impl Model {
         } else {
             (body.max_area.max(0.0625), body.length.max(0.25), 1.0)
         };
-        let body_of: Vec<usize> = panels
+        // Separate-wing marks: a panel joins only panels of the same wing number.
+        let separate: Vec<u32> = panels
             .iter()
-            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).find(|&o| (o as usize) < comps.len()).map_or(0, |o| comps[o as usize].body as usize))
-            .collect();
-        // Separate-wing marks: a marked panel joins only marked panels (its own wing).
-        let separate: Vec<bool> = panels
-            .iter()
-            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).any(|o| (o as usize) < comps.len() && des.splits.contains(&comps[o as usize].pos)))
+            .map(|p| p.cells.iter().map(|&c| grid.owner[c]).filter(|&o| (o as usize) < comps.len()).find_map(|o| des.splits.get(&comps[o as usize].pos).copied()).unwrap_or(0))
             .collect();
         let joins =
-            |a: usize, b: usize| separate[a] == separate[b] && (body_of[a] == body_of[b] || panels[a].role != Role::None || panels[b].role != Role::None);
+            |a: usize, b: usize| separate[a] == separate[b] && (body_of[a] == body_of[b] || separate[a] != 0 || panels[a].role != Role::None || panels[b].role != Role::None);
         let mut wing_of = wing_groups(&grid, &panel_of, panels.len(), &joins);
         // One part's fins are one wing (one click sets them all).
         let mut fin_of: HashMap<u32, (usize, bool)> = HashMap::new();
@@ -742,6 +977,19 @@ impl Model {
             if let Some(c) = *c {
                 let first = fin_of.entry(c).or_insert((j, false)).0;
                 wing_of[j] = wing_of[first];
+            }
+        }
+        // A wing's panels without an aerofoil mark take the one set on the wing (a panel painted
+        // onto a wing later gets the wing's aerofoil).
+        let mut wing_foil: HashMap<usize, usize> = HashMap::new();
+        for (j, p) in panels.iter().enumerate() {
+            if fin_comp[j].is_none() && marked_foil[j] {
+                wing_foil.entry(wing_of[j]).or_insert(p.foil);
+            }
+        }
+        for (j, p) in panels.iter_mut().enumerate() {
+            if fin_comp[j].is_none() && !marked_foil[j] {
+                p.foil = wing_foil.get(&wing_of[j]).copied().unwrap_or(p.foil);
             }
         }
         for &k in &grid.moving {
@@ -773,7 +1021,17 @@ impl Model {
                 })
             })
             .collect();
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props }
+        let mut seen: Vec<usize> = Vec::new();
+        let wing_rank = (0..wing_of.len())
+            .map(|j| match separate[j] {
+                0 => seen.iter().position(|s| *s == wing_of[j]).unwrap_or_else(|| {
+                    seen.push(wing_of[j]);
+                    seen.len() - 1
+                }),
+                _ => 0,
+            })
+            .collect();
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -794,7 +1052,16 @@ impl Model {
         let len = self.body.length.max(0.25);
         let re = re_m * len;
         let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
-        let (fb, mb) = self.body.forces(&flow, -vel, omega, self.com, at.rho);
+        let (mut fb, mut mb) = self.body.forces(&flow, -vel, omega, self.com, at.rho);
+        // Bodies without wings (landing gear) as built: counted with the fuselage.
+        let frame = LiveBody { origin: V3::ZERO, rot: [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)], trans: V3::ZERO, com: V3::ZERO, vel: V3::ZERO, omega: V3::ZERO, wind: V3::ZERO };
+        let frame = LiveBody { com: frame.to_world(self.com), vel: frame.dir_to_world(vel), omega: frame.axial_to_world(omega), ..frame };
+        let nb = self.comps.iter().map(|k| k.body as usize).max().map_or(1, |b| b + 1);
+        for (_, f, p) in self.bluff_forces(&vec![frame; nb], self.main_body, &at) {
+            let f = frame.dir_to_aero(f);
+            fb += f;
+            mb += (grid_to_aero(frame.world_to_grid(p)) - self.com).cross(f);
+        }
 
         let deflect: Vec<f64> = self
             .panels
@@ -845,9 +1112,7 @@ impl Model {
     /// metres, y up. Returns forces at world points and torques, per body.
     /// `ground[i]`: ground-effect factor φ of panel i (1 = none, see `ground_effect`); empty = no ground effect.
     /// `deflect`: live control deflection per panel, radians (empty = none).
-    /// `slips`: propeller slipstreams. A panel's cells inside one meet its faster air (strip theory by
-    /// the share of cells inside), so a tail in the propwash steers before the aeroplane moves.
-    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64], deflect: &[f64], slips: &[Slipstream]) -> Vec<LiveForce> {
+    pub fn live_forces(&self, bodies: &[LiveBody], main: usize, stall: &mut [f64], ground: &[f64], deflect: &[f64]) -> Vec<LiveForce> {
         let Some(mb) = bodies.get(main) else {
             return Vec::new();
         };
@@ -857,34 +1122,10 @@ impl Model {
         let at = atmosphere(alt);
         let v_main = air(mb, com_w);
         let speed = v_main.len();
-        let owner: Vec<usize> = self.panels.iter().map(|p| self.panel_body(p).min(bodies.len().saturating_sub(1))).collect();
-        // Per panel: the extra speed along each propeller's axis that gives its mix of free and
-        // slipstream air the right dynamic pressure, q = (1 − φ)·q_free + φ·q_slip.
-        let mut wash = vec![V3::ZERO; self.panels.len()];
-        for sl in slips {
-            for ((p, &b), w) in self.panels.iter().zip(&owner).zip(&mut wash).filter(|((p, _), _)| !p.cells.is_empty()) {
-                let lb = &bodies[b];
-                let (mut n, mut q) = (0usize, 0.0);
-                for &c in &p.cells {
-                    if let Some((v, _)) = sl.at(lb.to_world(crate::body::aero_pos(self.grid.cell(c)))) {
-                        n += 1;
-                        q += v * v;
-                    }
-                }
-                if n > 0 {
-                    let phi = n as f64 / p.cells.len() as f64;
-                    let free = air(lb, lb.to_world(p.centroid)).dot(sl.axis).max(0.0);
-                    *w += sl.axis * ((((1.0 - phi) * free * free + q / p.cells.len() as f64).sqrt() - free).max(0.0));
-                }
-            }
-        }
-        let washed = wash.iter().map(|w| w.len()).fold(0.0, f64::max);
-        if speed.max(washed) < 1.0 || !speed.is_finite() {
+        if speed < 1.0 || !speed.is_finite() {
             stall.iter_mut().for_each(|s| *s = 0.0);
             return Vec::new();
         }
-        // Standing still in the propwash: the panels' Mach and Reynolds numbers come from the wash.
-        let speed = speed.max(washed);
         let mach = speed / at.a;
         let re_m = reynolds_per_m(&at, mach);
         let mut out = Vec::new();
@@ -893,14 +1134,11 @@ impl Model {
         let len = self.body.length.max(0.25);
         let re = re_m * len;
         let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
-        let (fb, mbm) = if v_main.len() >= 1.0 {
-            self.body.forces(&flow, -mb.dir_to_aero(v_main), mb.axial_to_aero(mb.omega), self.com, at.rho)
-        } else {
-            (V3::ZERO, V3::ZERO)
-        };
+        let (fb, mbm) = self.body.forces(&flow, -mb.dir_to_aero(v_main), mb.axial_to_aero(mb.omega), self.com, at.rho);
         out.push(LiveForce { body: main, force: mb.dir_to_world(fb), at: com_w, torque: mb.axial_to_world(mbm) });
 
         // Lifting panels where their body is now: a deflected sub-grid is a tilted panel.
+        let owner: Vec<usize> = self.panels.iter().map(|p| self.panel_body(p).min(bodies.len().saturating_sub(1))).collect();
         let world: Vec<Panel> = self
             .panels
             .iter()
@@ -922,9 +1160,59 @@ impl Model {
         let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m, gamma: at.gamma };
         let zero = vec![0.0; world.len()];
         let deflect = if deflect.len() == world.len() { deflect } else { &zero };
-        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p) + wash[i], deflect, stall);
+        let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p), deflect, stall);
         for (f, &b) in pf.iter().zip(&owner) {
             out.push(LiveForce { body: b, force: f.force, at: f.at, torque: V3::ZERO });
+        }
+        // After the panels (the flight data reads force 1 + i as panel i): each gets its own drag arrow.
+        for (b, force, point) in self.bluff_forces(bodies, main, &at) {
+            out.push(LiveForce { body: b, force, at: point, torque: V3::ZERO });
+        }
+        out
+    }
+
+    /// Air forces on the bodies without lifting panels, where they are now (a retracting leg
+    /// swings with its pivot). Each is its own small fuselage in its own flow: skin friction with
+    /// the form factor of its fineness along it, crossflow drag across it (FAR's section model).
+    /// Only the share of its cells outside the main body's head-on outline counts: inside it a
+    /// cell is part of the streamlined shape (a leg in its well, a body continuing the fuselage).
+    /// Returns (body, force, point), world frame.
+    pub fn bluff_forces(&self, bodies: &[LiveBody], main: usize, at: &Atmo) -> Vec<(usize, V3, V3)> {
+        let Some(mb) = bodies.get(main).filter(|_| main == self.main_body) else { return Vec::new() };
+        let shielded = |w: V3| {
+            let g = mb.world_to_grid(w);
+            let (x, y) = ((g.x / VOXEL_M).round() as i32 - self.grid.min[0], (g.y / VOXEL_M).round() as i32 - self.grid.min[1]);
+            x >= 0 && y >= 0 && (x as usize) < self.grid.dims[0] && (y as usize) < self.grid.dims[1] && self.silhouette[y as usize * self.grid.dims[0] + x as usize]
+        };
+        let mut out = Vec::new();
+        for bl in &self.bluff {
+            let Some(lb) = bodies.get(bl.body) else { continue };
+            let open: Vec<V3> = bl.cells.iter().map(|&c| lb.to_world(aero_pos(self.grid.cell(c)))).filter(|&w| !shielded(w)).collect();
+            if open.is_empty() {
+                continue;
+            }
+            let point = open.iter().fold(V3::ZERO, |a, &w| a + w) * (1.0 / open.len() as f64);
+            let v = lb.vel + lb.omega.cross(point - lb.com) - lb.wind;
+            let speed = v.len();
+            if !(speed >= 1.0) || !speed.is_finite() {
+                continue;
+            }
+            let mach = (speed / at.a).max(0.001);
+            let re_m = reynolds_per_m(at, mach);
+            let force = if bl.aero.sections.is_empty() {
+                // One or two cells long: a lump, drag across it on a face of its size.
+                let size = bl.volume.cbrt();
+                v * (-0.5 * at.rho * speed * crate::body::crossflow_drag(mach, re_m * size) * size * size)
+            } else {
+                let g = lb.world_dir_to_grid(v);
+                let [x, y, z] = turn([g.x, g.y, g.z], bl.axis);
+                let re = re_m * bl.aero.length.max(VOXEL_M);
+                let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
+                let f = aero_to_grid(bl.aero.forces(&flow, -grid_to_aero(v3(x, y, z)), V3::ZERO, bl.mid, at.rho).0);
+                let [x, y, z] = unturn([f.x, f.y, f.z], bl.axis);
+                lb.dir_to_world(grid_to_aero(v3(x, y, z)))
+            };
+            out.push((bl.body, force * (open.len() as f64 / bl.cells.len() as f64), point));
         }
         out
     }
@@ -1181,7 +1469,8 @@ fn mass_properties(comps: &[Comp], grid: &Grid, lib: &mut Library) -> (f64, V3, 
     }
     let mut pts: Vec<(V3, f64)> = Vec::new();
     for (i, c) in comps.iter().enumerate() {
-        let m = lib.get(&c.def).map(|d| d.mass as f64).unwrap_or(1.0);
+        // A microcontroller weighs its width x length (the game's one mass override).
+        let m = c.size.map(|s| (s[0] * s[1]) as f64).or_else(|| lib.get(&c.def).map(|d| d.mass as f64)).unwrap_or(1.0);
         if cells[i].is_empty() {
             pts.push((aero_pos(c.pos), m));
         } else {
@@ -1225,7 +1514,7 @@ mod tests {
             return;
         }
         // Rocket axis (part y) pointing forward: grid z, aero x.
-        let comp = Comp { def: name.into(), pos: [0, 0, 0], rot: [1, 0, 0, 0, 0, 1, 0, -1, 0], body: 0, mirror: 0, prop: None };
+        let comp = Comp { def: name.into(), pos: [0, 0, 0], rot: [1, 0, 0, 0, 0, 1, 0, -1, 0], body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
         let m = Model::build(vec![comp], &mut lib, &Designations::default());
         let axis = v3(1.0, 0.0, 0.0);
         let fins: Vec<(&Panel, &FinLive)> = m.panels.iter().zip(&m.fin_live).filter_map(|(p, f)| Some((p, f.as_ref()?))).collect();
@@ -1318,6 +1607,73 @@ mod tests {
     }
 
     #[test]
+    fn numbered_separate_wings_stay_apart_and_share_their_aerofoil() {
+        // A flat slab: wing 1 across the middle (split into left and right panels at the
+        // symmetry plane), wing 2 touching its tip, plain wing beyond. One aerofoil mark on
+        // wing 1's left half sets its right half too.
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
+        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let mut lib = crate::defs::Library::new(&game, &appdata);
+        if lib.get("01_block").is_none() {
+            return;
+        }
+        let block = |x: i32, z: i32| Comp { def: "01_block".into(), pos: [x, 0, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+        let comps: Vec<Comp> = (-12..=12).flat_map(|x| (0..8).map(move |z| block(x, z))).collect();
+        let mut des = Designations::default();
+        des.wings.extend(comps.iter().map(|c| c.pos));
+        for c in &comps {
+            match c.pos[0] {
+                -8..=8 => des.splits.insert(c.pos, 1),
+                9..=10 => des.splits.insert(c.pos, 2),
+                _ => None,
+            };
+        }
+        des.foils.insert([-5, 0, 3], 3);
+        let m = Model::build(comps, &mut lib, &des);
+        let wing_no = |j: usize| m.separate[j];
+        let of = |n: u32| (0..m.panels.len()).filter(|&j| wing_no(j) == n).collect::<Vec<_>>();
+        let (one, two) = (of(1), of(2));
+        assert_eq!(one.len(), 2, "wing 1 split at the symmetry plane");
+        assert!(one.iter().all(|&j| m.panels[j].foil == 3 && m.wing_of[j] == m.wing_of[one[0]]));
+        assert!(!two.is_empty() && two.iter().all(|&j| m.wing_of[j] != m.wing_of[one[0]] && m.panels[j].foil == des.default_foil));
+    }
+
+    #[test]
+    fn detect_marks_free_slabs_but_no_hull_and_guesses_roles() {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
+        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let mut lib = crate::defs::Library::new(&game, &appdata);
+        if lib.get("01_block").is_none() {
+            return;
+        }
+        let block = |x: i32, y: i32, z: i32| Comp { def: "01_block".into(), pos: [x, y, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+        let mut comps = Vec::new();
+        // A hollow open-ended hull 5 x 5 x 30 (walls one block thick), a thin 2 x 2 tail boom,
+        // a wing through the hull, a tailplane on the boom and a fin on top of it.
+        for z in 0..30 {
+            for (x, y) in (-2..=2).flat_map(|x| (-2..=2).map(move |y| (x, y))).filter(|(x, y): &(i32, i32)| x.abs() == 2 || y.abs() == 2) {
+                comps.push(block(x, y, z));
+            }
+        }
+        comps.extend((-20..0).flat_map(|z| [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| block(x, y, z))));
+        let wing: Vec<[i32; 3]> = (-16..=16).filter(|x: &i32| x.abs() > 2).flat_map(|x| (12..18).map(move |z| [x, 0, z])).collect();
+        let tail: Vec<[i32; 3]> = (-6..=7).filter(|x| !(0..=1).contains(x)).flat_map(|x| (-19..-15).map(move |z| [x, 0, z])).collect();
+        let fin: Vec<[i32; 3]> = (2..8).flat_map(|y| (-19..-15).map(move |z| [0, y, z])).collect();
+        comps.extend(wing.iter().chain(&tail).chain(&fin).map(|p| block(p[0], p[1], p[2])));
+        let m = Model::build(comps, &mut lib, &Designations::default());
+        let d = m.detect(&Designations::default(), &mut lib);
+        let want: HashSet<[i32; 3]> = wing.iter().chain(&tail).chain(&fin).copied().collect();
+        let missed: Vec<&[i32; 3]> = want.difference(&d.wings).collect();
+        // Nothing else but boom blocks where the tailplane and fin cross it (their centre section).
+        let extra: Vec<&[i32; 3]> = d.wings.difference(&want).filter(|p| !(-19..-15).contains(&p[2])).collect();
+        assert!(extra.is_empty() && missed.is_empty(), "extra {extra:?} missed {missed:?}");
+        // Marks already there stay, and a second pass adds nothing.
+        assert_eq!(m.detect(&d, &mut lib), d);
+    }
+
+    #[test]
     fn step_from_motion() {
         let v = v3(100.0, -5.0, 20.0);
         let mut dt = 1.0 / 60.0;
@@ -1330,6 +1686,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn slipstream_tube_speeds_up_and_narrows_behind_the_disc() {
         let sl = Slipstream { hub: V3::ZERO, axis: v3(1.0, 0.0, 0.0), radius: 1.5, v0: 20.0, vi: 10.0 };
         assert!(sl.at(v3(1.0, 0.0, 0.0)).is_none(), "ahead of the disc");
@@ -1338,9 +1695,17 @@ mod tests {
         assert!((near - 30.0).abs() < 0.2 && (far - 40.0).abs() < 0.2 && (rv - v3(0.0, 1.0, 0.0)).len() < 1e-9, "{near} {far}");
         // Far behind the tube is R·√(30/40) = 1.30 m.
         assert!(sl.at(v3(-30.0, 1.25, 0.0)).is_some() && sl.at(v3(-30.0, 1.35, 0.0)).is_none());
+        // The drawing starts at the disc, fades out by 8 radii, and never leaves the tube.
+        let lines = sl.wash_lines(10.0, 0.3);
+        assert!(lines.iter().all(|l| l.2 >= 0.0 && l.2 <= 1.0 && l.0.x <= 1e-9 && l.0.x >= -12.0 - 1e-9 && (l.0.y * l.0.y + l.0.z * l.0.z).sqrt() <= 1.5 + 1e-9));
+        let far = lines.iter().filter(|l| l.0.x < -11.0).map(|l| l.2).fold(0.0, f32::max);
+        let near = lines.iter().filter(|l| l.0.x > -1.0).map(|l| l.2).fold(0.0, f32::max);
+        assert!(far < 0.01 && near > 0.2, "near {near} far {far}");
     }
 
     #[test]
+=======
+>>>>>>> parent of 7bf3816 (added propwash, surfaces behind the wash get additional lift; propeller slipstream swirl cancels out part of the torque generated by the propeller; lightened propeller load on engines)
     fn pose_motion_recovers_velocity_and_spin() {
         // 0.02 rad about +y in 0.1 s while moving 3 m along x.
         let (c, sn) = (0.02f64.cos(), 0.02f64.sin());

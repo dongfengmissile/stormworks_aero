@@ -25,6 +25,8 @@ const OFF_UI_CTX: usize = 0x448;
 const OFF_UI_PRESSED: usize = 0x5D8;
 const OFF_INTERFACE: usize = 0x8A8;
 const OFF_TOP_TOOLBAR: usize = 0x60;
+/// `c_ui_element_background` of the interface: the dark screen behind its dialogs.
+const OFF_IFACE_BACKGROUND: usize = 0x98;
 const RVA_TOOLBAR_VTABLE: usize = 0x00b6_bc58;
 const TOOLBAR_SHELF: usize = 0x130;
 const TOOLBAR_GROUP: usize = 0x88;
@@ -61,6 +63,8 @@ struct Fns {
     icon_find: unsafe extern "system" fn(usize, *mut GStr) -> usize,
     make_action: unsafe extern "system" fn(usize, f32, f32, usize, *mut GStr, i32) -> usize,
     icon_add_region: unsafe extern "system" fn(usize, *mut GStr, i32, u32, u32, u32, u32),
+    /// `ui_confirm_cancel_dialog_basic_ctor(obj, title, body, show_cancel, show_confirm, confirm_id, cancel_id)`.
+    dialog_ctor: unsafe extern "system" fn(usize, *mut GStr, *mut GStr, u8, u8, i32, i32) -> usize,
 }
 
 /// Game functions, each gated on the prologue recorded for this build.
@@ -152,6 +156,10 @@ fn fns() -> Option<&'static Fns> {
                     0xf1,
                 ],
             )?),
+            dialog_ctor: std::mem::transmute::<usize, _>(at(
+                0x25_b1c0,
+                &[0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x20, 0x41, 0x0f, 0xb6, 0xe9],
+            )?),
             group_select: std::mem::transmute::<usize, _>(at(
                 0x24_d2c0,
                 &[0x48, 0x89, 0x5c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x6c, 0x24, 0x30, 0x4d, 0x8b, 0xf0, 0x8b, 0x69, 0x10],
@@ -186,6 +194,30 @@ pub(crate) static WING_MODE: AtomicUsize = AtomicUsize::new(0);
 const ID_WING: i32 = 231;
 const ID_UNDO: i32 = 241;
 const ID_REDO: i32 = 242;
+const ID_RESET: i32 = 243;
+const ID_RESET_YES: i32 = 244;
+const ID_RESET_NO: i32 = 245;
+const ID_NEW_WING: i32 = 246;
+const ID_DETECT: i32 = 247;
+/// Clicks on New wing / Detect wings the overlay has not applied yet.
+pub(crate) static NEW_WING_REQ: AtomicBool = AtomicBool::new(false);
+/// New wing is a standalone toggle (no group): lit while the marks go to a separate wing.
+pub(crate) static NEW_WING_ON: AtomicBool = AtomicBool::new(false);
+static NEW_BTN: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DETECT_REQ: AtomicBool = AtomicBool::new(false);
+/// Mouse over the 3D view (no UI element under it) while the mode is on: normalised view
+/// position as `CLICK`. For the hover preview and drag painting.
+static POINTER: Mutex<Option<[f32; 2]>> = Mutex::new(None);
+
+pub(crate) fn pointer() -> Option<[f32; 2]> {
+    *POINTER.lock().ok()?
+}
+/// A confirmed Reset the overlay has not applied yet.
+pub(crate) static RESET_REQ: AtomicBool = AtomicBool::new(false);
+/// The game's confirm dialog with our Reset text (built with the shelves, child of the interface),
+/// and whether it is up (clicks then belong to it, not to the vehicle).
+static RESET_DIALOG: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static RESET_ASKING: AtomicBool = AtomicBool::new(false);
 /// Undo / redo clicks not yet applied by the overlay.
 pub(crate) static UNDO_REQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The Undo / Redo buttons of the first shelf, so their enabled state can follow the history.
@@ -259,7 +291,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
     set(shelf + 0x58, end);
     set(shelf + 0x10, end);
     set(shelf + 0x14, f32_at(shelf + 0x14).max(f32_at(btn + 0x14)));
-    tooltip(f, btn, ctx, "Aero wings", "Paint wings by role or aerofoil and designate them by clicking the vehicle (aero plugin).", false);
+    tooltip(f, btn, ctx, "Aero wings", "Paint wings by role or aerofoil and designate them by clicking the vehicle.", false);
     BUTTON.store(btn, Ordering::SeqCst);
     APPENDED_TOOLBAR.store(toolbar, Ordering::SeqCst);
     log_line(&format!("toolbar: Aero wings button added ({btn:#x}, toolbar {toolbar:#x})"));
@@ -267,7 +299,7 @@ unsafe fn append(toolbar: usize, ctx: usize) {
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
 /// icon atlas (1024², DXT5, 11 mips) on a 64-aligned grid so every mip stays block aligned.
-const ICONS: [(&str, &[u8]); 23] = [
+const ICONS: [(&str, &[u8]); 24] = [
     ("aero_foil", include_bytes!("../assets/icons/aero_foil.bc3")),
     ("aero_x1", include_bytes!("../assets/icons/aero_x1.bc3")),
     ("aero_twinotter", include_bytes!("../assets/icons/aero_twinotter.bc3")),
@@ -285,6 +317,7 @@ const ICONS: [(&str, &[u8]); 23] = [
     ("aero_flap", include_bytes!("../assets/icons/aero_flap.bc3")),
     ("aero_wingblocks", include_bytes!("../assets/icons/aero_wingblocks.bc3")),
     ("aero_split", include_bytes!("../assets/icons/aero_split.bc3")),
+    ("aero_detect", include_bytes!("../assets/icons/aero_detect.bc3")),
     ("aero_missile", include_bytes!("../assets/icons/aero_missile.bc3")),
     ("aero_m_sparrow", include_bytes!("../assets/icons/aero_m_sparrow.bc3")),
     ("aero_m_amraam", include_bytes!("../assets/icons/aero_m_amraam.bc3")),
@@ -474,13 +507,16 @@ unsafe fn build_shelf(
     }
     for (j, (icon, title, desc, id)) in actions.iter().enumerate() {
         let mut name = gstr(f, icon);
-        let btn = (f.make_action)(0, 0.0, -0.14 * (items.len() + j) as f32, 0, &mut name, *id);
+        let y = -0.14 * (items.len() + j) as f32;
+        // Group 0: the game flips the toggle itself on a click, then sends the id.
+        let btn = if *id == ID_NEW_WING { (f.make_toggle)(0, 0.0, y, 0, &mut name, *id, 2, 0) } else { (f.make_action)(0, 0.0, y, 0, &mut name, *id) };
         if btn >= PTR_MIN {
             (f.add_child)(s, ctx, btn);
             tooltip(f, btn, ctx, title, desc, true);
             match *id {
                 ID_UNDO => UNDO_BTN.store(btn, Ordering::SeqCst),
                 ID_REDO => REDO_BTN.store(btn, Ordering::SeqCst),
+                ID_NEW_WING => NEW_BTN.store(btn, Ordering::SeqCst),
                 _ => {}
             };
         }
@@ -501,26 +537,25 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
     // Old buttons die with the old interface: never call into them if this build fails.
     UNDO_BTN.store(0, Ordering::SeqCst);
     REDO_BTN.store(0, Ordering::SeqCst);
+    NEW_BTN.store(0, Ordering::SeqCst);
     let own = register_icons(f, ctx);
     let tools = [
-        (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings; pick how a click works on the next shelf."),
+        (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings."),
         ("vehicle_control", "Control role", "Click a control surface or a hinged sub-grid to give it the role picked on the next shelf."),
         (
             if own { "aero_foil" } else { "mechanics" },
             "Aerofoil",
-            "Click a wing to give it the aerofoil picked on the next shelf. One click sets the whole wing; use New wing to split it first.",
+            "Click a wing to give it the aerofoil picked on the next shelf.",
         ),
     ];
     let wing_items = [
-        ("paint_mode", "Toggle a block", "Click a block to make it a wing block, or click it again to unmark it."),
-        ("paint_add", "Fill slab", "Click a block to mark the whole thin slab around it as wing (a wing panel in one click)."),
-        ("paint_fill", "Fill body", "Click a block to mark every block of its body as wing, however thick (a flying wing)."),
-        ("erase", "Remove a slab", "Click a block to unmark the whole thin slab around it."),
-        (
-            if own { "aero_split" } else { "new" },
-            "New wing",
-            "Click a wing panel to make it a wing of its own (lighter colour), e.g. to give part of a wing another aerofoil. Click it again to join it back.",
-        ),
+        ("paint_mode", "Mark blocks", "Click or drag over blocks to make them wing blocks. Start on a block of the wing to unmark."),
+        ("paint_fill", "Fill body", "Click a block to mark every block of its body as wing, however thick. Click a marked block to unmark them."),
+        ("component", "Merge wings", "Click a wing, then the wing that should join it."),
+    ];
+    let wing_actions = [
+        (if own { "aero_split" } else { "new" }, "New wing", "On: the blocks you mark form a separate wing. Off: they join the plain wing. Ctrl + click a wing to continue that one.", ID_NEW_WING),
+        (if own { "aero_detect" } else { "mechanics" }, "Detect wings", "Mark the vehicle's thin slabs as wings and give its control surfaces a role.", ID_DETECT),
     ];
     let icons =
         if own { ["aero_role_none", "aero_pitch", "aero_roll", "aero_yaw", "aero_flap"] } else { ["action_cross", "arrows", "rotate", "orbit", "resize"] };
@@ -561,9 +596,9 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
             &tools,
             ID_TOOL,
             TOOL.load(Ordering::Relaxed),
-            &[("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO), ("redo", "Redo", "Redo the last undone change.", ID_REDO)],
+            &[("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO), ("redo", "Redo", "Redo the last undone change.", ID_REDO), ("action_cross", "Reset", "Remove every wing block, control role, aerofoil and separate wing from this vehicle.", ID_RESET)],
         ),
-        build_shelf(f, iface, ctx, 0.17, &wing_items, ID_WING, WING_MODE.load(Ordering::Relaxed), &[]),
+        build_shelf(f, iface, ctx, 0.17, &wing_items, ID_WING, WING_MODE.load(Ordering::Relaxed).min(2), &wing_actions),
         build_shelf(f, iface, ctx, 0.17, &role_items, ID_ROLE, ROLE.load(Ordering::Relaxed), &[]),
         build_shelf(f, iface, ctx, 0.17, &cats, ID_FOIL_CAT, FOIL_CAT.load(Ordering::Relaxed), &[]),
         build_shelf(f, iface, ctx, 0.34, &foil_items(0), ID_FOIL + foil_range(0).start as i32, pick(0), &[]),
@@ -611,7 +646,16 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
         if CAN_REDO.load(Ordering::Relaxed) {
             REDO_REQ.fetch_add(1, Ordering::Relaxed);
         }
-    } else if (ID_WING..ID_WING + 5).contains(&i) {
+    } else if i == ID_RESET {
+        set_shown(RESET_DIALOG.load(Ordering::SeqCst), true, false);
+    } else if i == ID_RESET_YES || i == ID_RESET_NO {
+        set_shown(RESET_DIALOG.load(Ordering::SeqCst), false, false);
+        RESET_REQ.store(i == ID_RESET_YES, Ordering::Relaxed);
+    } else if i == ID_NEW_WING {
+        NEW_WING_REQ.store(true, Ordering::Relaxed);
+    } else if i == ID_DETECT {
+        DETECT_REQ.store(true, Ordering::Relaxed);
+    } else if (ID_WING..ID_WING + 3).contains(&i) {
         WING_MODE.store((i - ID_WING) as usize, Ordering::Relaxed);
     } else if (ID_FOIL_CAT..ID_FOIL_CAT + 2).contains(&i) {
         FOIL_CAT.store((i - ID_FOIL_CAT) as usize, Ordering::Relaxed);
@@ -718,21 +762,57 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         if let Some(f) = fns() {
             sh.1 = build_shelves(f, iface, editor + OFF_UI_CTX);
             sh.0 = toolbar;
+            // The game's own confirm screen (as Clear vehicle's), with our text and button ids.
+            let (mut title, mut body) = (gstr(f, "RESET WINGS"), gstr(f, "Are you sure you want to remove every wing block, control role and aerofoil from this vehicle?"));
+            let dlg = (f.op_new)(0xE8);
+            if dlg >= PTR_MIN {
+                (f.dialog_ctor)(dlg, &mut title, &mut body, 1, 1, ID_RESET_YES, ID_RESET_NO);
+                (f.add_child)(iface, editor + OFF_UI_CTX, dlg);
+            }
+            RESET_DIALOG.store(dlg, Ordering::SeqCst);
             log_line(&format!("toolbar: side shelves built {:x?}", sh.1));
+        }
+    }
+    let dlg = RESET_DIALOG.load(Ordering::SeqCst);
+    let mut asking = dlg >= PTR_MIN && readable(dlg + 0x81, 1) && *((dlg + 0x81) as *const u8) != 0;
+    if asking && !on {
+        set_shown(dlg, false, true);
+        asking = false;
+    }
+    // The dark screen behind a dialog is the interface's own background element (the game fades
+    // it in for its dialog states): held on while ours is up, as any state change turns it off.
+    let bg = if readable(iface + OFF_IFACE_BACKGROUND, 8) { read_usize_at(iface + OFF_IFACE_BACKGROUND) } else { 0 };
+    let was = RESET_ASKING.swap(asking, Ordering::Relaxed);
+    if bg >= PTR_MIN && readable(bg, 0x70) {
+        if asking {
+            *((bg + 0x1C) as *mut u8) = 1; // visible, so its fade runs
+            *((bg + 0x6C) as *mut u8) = 1; // fade in
+        } else if was {
+            *((bg + 0x6C) as *mut u8) = 0; // fades out and hides itself
         }
     }
     let tool = TOOL.load(Ordering::Relaxed);
     let cat = FOIL_CAT.load(Ordering::Relaxed);
     for (k, &shelf) in sh.1.iter().enumerate() {
-        // Aerofoil: its category shelf, then the picked category's sections beside it.
-        let want = on && (k == 0 || k == tool + 1 || (tool == 2 && k == 4 + cat));
+        // Aerofoil: its category shelf, then the picked category's sections beside it. The
+        // shelves draw over the dialog's background, so they go while it asks.
+        let want = on && !asking && (k == 0 || k == tool + 1 || (tool == 2 && k == 4 + cat));
         if shelf >= PTR_MIN && readable(shelf + 0x81, 1) && (*((shelf + 0x81) as *const u8) != 0) != want {
             set_shown(shelf, want, false);
         }
     }
     drop(sh);
+    let hovered = editor + OFF_UI_CTX + 0x188; // the UI element under the mouse
+    let over_view = on && !asking && readable(hovered, 8) && read_usize_at(hovered) == 0 && readable(editor + OFF_MOUSE_X, 8);
+    let at = if over_view { ((editor + OFF_MOUSE_X) as *const [f32; 2]).read_unaligned() } else { [f32::NAN; 2] };
+    *POINTER.lock().unwrap_or_else(|p| p.into_inner()) = (at[0].is_finite() && at[1].is_finite()).then_some(at);
     set_enabled(UNDO_BTN.load(Ordering::SeqCst), editor + OFF_UI_CTX, CAN_UNDO.load(Ordering::Relaxed));
     set_enabled(REDO_BTN.load(Ordering::SeqCst), editor + OFF_UI_CTX, CAN_REDO.load(Ordering::Relaxed));
+    // The lit state follows the overlay (knowledge/editor-ui.md: the byte alone drives the draw).
+    let new = NEW_BTN.load(Ordering::SeqCst);
+    if new >= PTR_MIN && readable(new + BTN_SELECTED, 1) {
+        *((new + BTN_SELECTED) as *mut u8) = NEW_WING_ON.load(Ordering::Relaxed) as u8;
+    }
     if ACTIVE.swap(on, Ordering::Relaxed) != on {
         log_line(&format!("toolbar: Aero wings mode {}", if on { "on" } else { "off" }));
     }

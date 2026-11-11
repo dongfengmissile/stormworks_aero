@@ -81,9 +81,12 @@ impl Grid {
         for (i, c) in comps.iter().enumerate() {
             match lib.get(&c.def) {
                 Some(def) => {
-                    for v in &def.voxels {
+                    // A resized microcontroller repeats its one voxel over width x length cells.
+                    let [w, l] = c.size.map_or([1, 1], |s| s.map(|n| n.clamp(1, 16)));
+                    let tyre = def.wheel.iter().flat_map(|t| t.tyres(c.wheel_size)).flat_map(|t| crate::defs::tyre_voxels(&t, &def.voxels.iter().map(|v| v.pos).collect())).collect::<Vec<_>>();
+                    for (v, tile) in def.voxels.iter().chain(&tyre).flat_map(|v| (0..w).flat_map(move |x| (0..l).map(move |z| (v, [x, z])))) {
                         let plane = lib.shapes.plane(v.shape).map(|p| rotate(p, &v.rot));
-                        let o = v3(v.pos[0] as f64, v.pos[1] as f64, v.pos[2] as f64);
+                        let o = v3((v.pos[0] + tile[0]) as f64, v.pos[1] as f64, (v.pos[2] + tile[1]) as f64);
                         let mut cell = voxel_solid(plane.as_ref());
                         for p in v.bounds.iter().flatten() {
                             cell = clip_solid(&cell, p);
@@ -203,7 +206,7 @@ impl Grid {
                 g.fill[i] = f;
                 g.owner[i] = o;
             }
-            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0, mirror: 0, prop: None };
+            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
             g.solids.push((o, place(&voxel_solid(None), &c)));
         }
         g
@@ -434,51 +437,119 @@ mod slab_tests {
 
 // Chunk-mesh triangles -> voxels, for painting stalled voxels in the game render (paint.rs).
 
-/// Voxel of each triangle: its centroid moved 1/16 m into the block along the face normal, then
-/// rounded to the voxel·0.25 grid. Pure so it can be tested.
-pub fn triangle_voxels(verts: &[u8], stride: usize, indices: &[u16]) -> Vec<[i32; 3]> {
+/// Voxels of each triangle: its centroid moved 4 mm into the block, the centroid moved 1/16 m (a
+/// mesh reaching a little past its cell), then points halfway to each corner moved 1/16 m, each
+/// rounded to the voxel·0.25 grid (`colour_runs` says when which counts). 4 mm first: a thin wedge
+/// tip's slope lies just above the cell floor, and 1/16 m pushed it into the block below.
+/// "Into the block" uses the triangle's own plane, turned to agree with the vertex normals: those
+/// can be smoothed across an edge. The workbench block grid's lines (thin triangles in the grid
+/// colour, built into the mesh while the grid is on) get no voxel, so paint leaves them. Pure so
+/// it can be tested.
+pub type TriVoxels = [[i32; 3]; 5];
+
+/// Vertex colour of the workbench grid's lines (u8 RGBA as read little-endian; logged in game,
+/// c38c03ff756b: present only while the grid is on).
+pub const GRID_LINE_RGBA: u32 = 0xff28_2828;
+/// `triangle_voxels` of a grid line triangle.
+pub const GRID_TRI: [i32; 3] = [i32::MIN, 1, 0];
+
+pub fn triangle_voxels(verts: &[u8], stride: usize, indices: &[u16]) -> Vec<TriVoxels> {
     let vcount = verts.len() / stride;
     let f = |v: usize, o: usize| f32::from_le_bytes(verts[v * stride + o..v * stride + o + 4].try_into().unwrap()) as f64;
     indices
         .chunks_exact(3)
         .map(|t| {
             if t.iter().any(|&i| i as usize >= vcount) {
-                return [i32::MIN; 3];
+                return [[i32::MIN; 3]; 5];
             }
-            let mut c = [0.0; 3];
-            let mut n = [0.0; 3];
-            for &i in t {
-                for k in 0..3 {
-                    c[k] += f(i as usize, 4 * k) / 3.0;
-                    n[k] += f(i as usize, 0x10 + 4 * k);
-                }
+            let p: [V3; 3] = std::array::from_fn(|k| v3(f(t[k] as usize, 0), f(t[k] as usize, 4), f(t[k] as usize, 8)));
+            let vn = t.iter().fold(V3::ZERO, |a, &i| a + v3(f(i as usize, 0x10), f(i as usize, 0x14), f(i as usize, 0x18)));
+            let mut n = (p[1] - p[0]).cross(p[2] - p[0]).norm();
+            if n == V3::ZERO || n.dot(vn) < 0.0 {
+                n = if n == V3::ZERO { vn.norm() } else { -n };
             }
-            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
-            std::array::from_fn(|k| ((c[k] - n[k] / len * 0.0625) / 0.25).round() as i32)
+            let rgba = u32::from_le_bytes(verts[t[0] as usize * stride + 12..t[0] as usize * stride + 16].try_into().unwrap());
+            let longest = (0..3).map(|k| (p[(k + 1) % 3] - p[k]).len()).fold(0.0, f64::max);
+            if rgba == GRID_LINE_RGBA && (p[1] - p[0]).cross(p[2] - p[0]).len() / longest.max(1e-9) < 0.04 {
+                return [GRID_TRI; 5];
+            }
+            let c = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+            let at = |q: V3, d: f64| {
+                let q = q - n * d;
+                [(q.x / 0.25).round() as i32, (q.y / 0.25).round() as i32, (q.z / 0.25).round() as i32]
+            };
+            [at(c, 0.004), at(c, 0.0625), at((c + p[0]) * 0.5, 0.0625), at((c + p[1]) * 0.5, 0.0625), at((c + p[2]) * 0.5, 0.0625)]
         })
         .collect()
 }
 
 /// Runs (first index, index count, colour) of consecutive triangles in `[first, first+count)` whose
-/// voxel has a colour in `colours`, split where the colour changes.
-pub fn colour_runs(tri: &[[i32; 3]], first: u32, count: u32, colours: &std::collections::HashMap<[i32; 3], u32>) -> Vec<(u32, u32, u32)> {
+/// voxel has a colour in `colours`, split where the colour changes. Colour 0 marks a cell some
+/// unpainted part fills. With `corners`, a triangle whose centre lands in no listed cell (air: a
+/// wedge tip's half face) takes the colour of a painted cell under one of its corners; a centre in
+/// an unpainted part's cell never does (a part's mesh can reach over a painted neighbour).
+/// When anything is painted, the grid line triangles follow as colour-0 runs: the paint drawn at
+/// equal depth covers them, so they are drawn again on top.
+pub fn colour_runs(tri: &[TriVoxels], first: u32, count: u32, colours: &std::collections::HashMap<[i32; 3], u32>, corners: bool) -> Vec<(u32, u32, u32)> {
     let (t0, t1) = ((first / 3) as usize, (((first + count) / 3) as usize).min(tri.len()));
     let mut runs: Vec<(u32, u32, u32)> = Vec::new();
     for t in t0..t1 {
-        let Some(&col) = colours.get(&tri[t]) else {
-            continue;
+        let col = match colours.get(&tri[t][0]).or_else(|| colours.get(&tri[t][1])) {
+            Some(&c) => c,
+            None if corners => tri[t][2..].iter().find_map(|v| colours.get(v).copied().filter(|&c| c != 0)).unwrap_or(0),
+            None => 0,
         };
+        if col == 0 {
+            continue;
+        }
         match runs.last_mut() {
             Some(r) if r.0 + r.1 == t as u32 * 3 && r.2 == col => r.1 += 3,
             _ => runs.push((t as u32 * 3, 3, col)),
         }
     }
+    if !runs.is_empty() {
+        for t in (t0..t1).filter(|&t| tri[t][0] == GRID_TRI) {
+            match runs.last_mut() {
+                Some(r) if r.0 + r.1 == t as u32 * 3 && r.2 == 0 => r.1 += 3,
+                _ => runs.push((t as u32 * 3, 3, 0)),
+            }
+        }
+    }
     runs
+}
+
+/// One colour's runs in a mesh range (colour 0 = grid lines), in the form the batched draw takes.
+pub struct Group {
+    pub col: u32,
+    pub firsts: Vec<u32>,
+    pub counts: Vec<i32>,
+}
+
+/// `colour_runs` by colour, grid lines (colour 0) last so they land on top of the paint.
+pub fn groups(runs: Vec<(u32, u32, u32)>) -> Vec<Group> {
+    let mut g: Vec<Group> = Vec::new();
+    for (f, n, col) in runs {
+        let i = g.iter().position(|x| x.col == col).unwrap_or_else(|| {
+            g.push(Group { col, firsts: Vec::new(), counts: Vec::new() });
+            g.len() - 1
+        });
+        g[i].firsts.push(f);
+        g[i].counts.push(n as i32);
+    }
+    g.sort_by_key(|x| (x.col == 0, x.col));
+    g
 }
 
 #[cfg(test)]
 mod paint_tests {
     use super::*;
+
+    #[test]
+    fn runs_group_by_colour_with_grid_lines_last() {
+        let g = groups(vec![(0, 3, 7), (6, 6, 0), (12, 3, 7), (15, 3, 5)]);
+        let got: Vec<(u32, &[u32], &[i32])> = g.iter().map(|x| (x.col, &x.firsts[..], &x.counts[..])).collect();
+        assert_eq!(got, [(5, &[15][..], &[3][..]), (7, &[0, 12][..], &[3, 3][..]), (0, &[6][..], &[6][..])]);
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -501,13 +572,75 @@ mod paint_tests {
             push([-0.5 - 0.125, 0.75 + dy * 0.125, 1.0 + dz * 0.125], [-1.0, 0.0, 0.0]);
         }
         let tri = triangle_voxels(&verts, 28, &[0, 1, 2, 3, 4, 5, 0, 1, 2]);
-        assert_eq!(tri, vec![[1, 0, 0], [-2, 3, 4], [1, 0, 0]]);
+        assert_eq!(tri.iter().map(|t| t[0]).collect::<Vec<_>>(), vec![[1, 0, 0], [-2, 3, 4], [1, 0, 0]]);
         let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7)].into();
-        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 3, 7), (6, 3, 7)]);
+        assert_eq!(colour_runs(&tri, 0, 9, &set, false), vec![(0, 3, 7), (6, 3, 7)]);
         let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7), ([-2, 3, 4], 7)].into();
-        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 9, 7)]);
-        assert_eq!(colour_runs(&tri, 3, 6, &set), vec![(3, 6, 7)]);
+        assert_eq!(colour_runs(&tri, 0, 9, &set, false), vec![(0, 9, 7)]);
+        assert_eq!(colour_runs(&tri, 3, 6, &set, false), vec![(3, 6, 7)]);
         let set: HashMap<[i32; 3], u32> = [([1, 0, 0], 7), ([-2, 3, 4], 9)].into();
-        assert_eq!(colour_runs(&tri, 0, 9, &set), vec![(0, 3, 7), (3, 3, 9), (6, 3, 7)]);
+        assert_eq!(colour_runs(&tri, 0, 9, &set, false), vec![(0, 3, 7), (3, 3, 9), (6, 3, 7)]);
+    }
+
+    #[test]
+    fn smoothed_normals_still_find_their_voxel() {
+        // +x side face of voxel (0,0,0), vertex normals tilted 60° toward +y (smoothed with a slope).
+        let mut verts = Vec::new();
+        for p in [[0.125f32, -0.125, -0.125], [0.125, 0.125, -0.125], [0.125, -0.125, 0.125]] {
+            for x in p.into_iter().chain([0.0]).chain([0.5, 0.87, 0.0]) {
+                verts.extend(x.to_le_bytes());
+            }
+        }
+        assert_eq!(triangle_voxels(&verts, 28, &[0, 1, 2])[0], [[0, 0, 0]; 5]);
+    }
+
+    #[test]
+    fn thin_wedge_tip_slope_stays_in_its_cell() {
+        // A 1x16 wedge's last cell: slope from y -0.125 (front) up to -0.109 (back), normal ~ +y.
+        let mut verts = Vec::new();
+        for p in [[-0.125f32, -0.125, -0.125], [0.125, -0.125, -0.125], [0.125, -0.109, 0.125]] {
+            for x in p.into_iter().chain([0.0]).chain([0.0, 1.0, 0.0]) {
+                verts.extend(x.to_le_bytes());
+            }
+        }
+        let t = triangle_voxels(&verts, 28, &[0, 1, 2])[0];
+        assert_eq!(t[0], [0, 0, 0]);
+        // The block below is an unpainted part: the tip still takes its own cell's colour.
+        let set: HashMap<[i32; 3], u32> = [([0, 0, 0], 7), ([0, -1, 0], 0)].into();
+        assert_eq!(colour_runs(&[t], 0, 3, &set, true), vec![(0, 3, 7)]);
+    }
+
+    #[test]
+    fn grid_lines_stay_unpainted() {
+        let tri = |p: [[f32; 3]; 3], c: u32| {
+            let mut verts = Vec::new();
+            for q in p {
+                verts.extend(q.into_iter().flat_map(f32::to_le_bytes));
+                verts.extend(c.to_le_bytes());
+                verts.extend([0.0f32, 1.0, 0.0].into_iter().flat_map(f32::to_le_bytes));
+            }
+            triangle_voxels(&verts, 28, &[0, 1, 2])[0][0]
+        };
+        let line = [[-0.125, 0.125, -0.125], [0.125, 0.125, -0.125], [0.125, 0.125, -0.11]];
+        let face = [[-0.125, 0.125, -0.125], [0.125, 0.125, -0.125], [0.125, 0.125, 0.125]];
+        assert_eq!(tri(line, GRID_LINE_RGBA), GRID_TRI);
+        // Drawn again after the paint, only where something is painted.
+        let set: HashMap<[i32; 3], u32> = [([0, 0, 0], 7)].into();
+        let t = [[[0, 0, 0]; 5], [GRID_TRI; 5], [GRID_TRI; 5], [[0, 0, 0]; 5]];
+        assert_eq!(colour_runs(&t, 0, 12, &set, true), vec![(0, 3, 7), (9, 3, 7), (3, 6, 0)]);
+        assert_eq!(colour_runs(&t[1..3], 0, 6, &set, true), vec![]);
+        assert_eq!(tri(face, GRID_LINE_RGBA), [0, 0, 0], "a block painted that grey still paints");
+        assert_eq!(tri(line, 0xff7a_3d33), [0, 0, 0], "thin triangles of other colours still paint");
+    }
+
+    #[test]
+    fn corners_paint_from_air_but_not_from_an_unpainted_part() {
+        // Centre in (0,0,0), one corner point in (0,0,1).
+        let t: TriVoxels = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 1], [0, 0, 0]];
+        let air: HashMap<[i32; 3], u32> = [([0, 0, 1], 7)].into();
+        assert_eq!(colour_runs(&[t], 0, 3, &air, true), vec![(0, 3, 7)]);
+        assert_eq!(colour_runs(&[t], 0, 3, &air, false), vec![]);
+        let unpainted: HashMap<[i32; 3], u32> = [([0, 0, 1], 7), ([0, 0, 0], 0)].into();
+        assert_eq!(colour_runs(&[t], 0, 3, &unpainted, true), vec![]);
     }
 }

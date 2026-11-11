@@ -102,9 +102,23 @@ pub(crate) unsafe fn vehicle_comps(vehicle: usize) -> Option<(Vec<Comp>, Vec<usi
                 n
             }
         };
-        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def) });
+        let (size, wheel_size) = part_size(ptr, def);
+        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size });
     }
     Some((comps, bodies, ptrs))
+}
+
+/// Live microcontroller width x length and advanced-wheel size setting (knowledge/vehicle-model.md
+/// "Per-component size settings").
+pub(crate) unsafe fn part_size(comp: usize, def: usize) -> (Option<[i32; 2]>, Option<(f64, bool)>) {
+    if !ptr_ok(def, OFF_DEF_CLASS + 4) || !ptr_ok(comp, OFF_WHEEL_SIZE + 4) {
+        return (None, None);
+    }
+    match read_u32_at(def + OFF_DEF_CLASS) {
+        37 => (Some([read_u32_at(comp + OFF_MC_WIDTH) as i32, read_u32_at(comp + OFF_MC_WIDTH + 4) as i32]), None),
+        41 => (None, Some(f32::from_bits(read_u32_at(comp + OFF_WHEEL_SIZE)) as f64).filter(|s| s.is_finite()).map(|s| (s, read_u32_at(comp + OFF_WHEEL_DOUBLE) & 0xFF != 0))),
+        _ => (None, None),
+    }
 }
 
 /// Live propeller / rotor settings of a type-2 part (knowledge/vehicle-model.md "Type 2 force
@@ -250,6 +264,9 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         if let Some(p) = prop_set(ptr, *def) {
             [p.blades.unwrap_or(0) as u64, p.pitch.unwrap_or(0.0).to_bits(), p.length.unwrap_or(0.0).to_bits()].into_iter().for_each(&mut mix);
         }
+        let (size, wheel) = part_size(ptr, *def);
+        size.into_iter().flatten().for_each(|v| mix(v as u64));
+        wheel.into_iter().for_each(|(s, d)| mix(s.to_bits() ^ d as u64));
         mix(*def as u64);
         pos.iter().chain(rot.iter()).for_each(|v| mix(*v as u32 as u64));
         mix(*body as u64);
@@ -285,7 +302,8 @@ pub(crate) unsafe fn on_tick(editor: usize) {
                 n
             }
         };
-        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def) });
+        let (size, wheel_size) = part_size(ptr, def);
+        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size });
     }
     game.last_hash = h;
     drop(game);

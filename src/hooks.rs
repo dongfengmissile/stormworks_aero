@@ -215,6 +215,20 @@ unsafe fn install_paint_hook() {
         log_line(&format!("opaque_chunk_draw_item prologue mismatch at {at:#x}; stalled blocks not painted"));
         return;
     }
+    // Batches the paint's draws (`paint::draw_elements_detour`); without it each run is its own draw.
+    let gl32 = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(c"opengl32.dll".as_ptr().cast());
+    let de = if gl32.is_null() { None } else { windows_sys::Win32::System::LibraryLoader::GetProcAddress(gl32, c"glDrawElements".as_ptr().cast()) };
+    if let Some(de) = de {
+        match MinHook::create_hook(de as *mut c_void, crate::paint::draw_elements_detour as *mut c_void) {
+            Ok(o) => {
+                let _ = crate::paint::ORIGINAL_DRAW_ELEMENTS.set(std::mem::transmute::<*mut c_void, _>(o));
+                if let Err(e) = MinHook::enable_hook(de as *mut c_void) {
+                    log_line(&format!("enable glDrawElements hook: {e:?}"));
+                }
+            }
+            Err(e) => log_line(&format!("create glDrawElements hook: {e:?}")),
+        }
+    }
     match MinHook::create_hook(at as *mut c_void, crate::paint::chunk_draw_detour as *mut c_void) {
         Ok(o) => {
             let _ = crate::paint::ORIGINAL.set(std::mem::transmute::<*mut c_void, crate::paint::ChunkDraw>(o));
@@ -383,7 +397,7 @@ unsafe extern "system" fn clamped_detour(a1: usize, a2: usize, a3: usize, a4: us
         return 0;
     }
     // Coaxial rotors' anti-torque couple: the plugin's two counter-rotating discs replace it.
-    if PROP_COUPLE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::any_prop_modeled() && crate::flight::flies_obj(a2) {
+    if PROP_COUPLE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::any_prop_modeled() && crate::flight::props_obj(a2) {
         return 0;
     }
     note_thrust(ret, &CLAMPED_THRUST_RETURNS, a2, a3, a5, a6, a7);

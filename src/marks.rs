@@ -14,13 +14,16 @@ use crate::wing::{aerofoil_index, Role, AEROFOILS};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mark {
     pub wing: bool,
-    pub split: bool,
+    /// Separate wing number (`s` is wing 1, `s:<n>` wing n).
+    pub split: Option<u32>,
     pub role: Option<Role>,
     pub foil: Option<usize>,
     pub default_foil: Option<usize>,
     pub default_fin: Option<usize>,
     pub fly: Option<bool>,
     pub vrs: Option<bool>,
+    pub props: Option<bool>,
+    pub ground: Option<bool>,
     /// Propeller/rotor blade width, x the part's own (`BLADE_WIDTH_RANGE`).
     pub blade_width: Option<f32>,
     /// Blade shape chosen for a propeller/rotor: true propeller, false rotor (None: auto).
@@ -39,15 +42,17 @@ impl Mark {
         *self == Mark::default()
     }
 
-    /// Attribute value: space-separated `w`, `s`, `r:<role>`, `f:<foil>`, `fd:<foil>`, `ff:<foil>`,
-    /// `fm:on|off`, `vrs:on|off`, `bw:<width>`, `sh:prop|rotor`.
+    /// Attribute value: space-separated `w`, `s` / `s:<n>`, `r:<role>`, `f:<foil>`, `fd:<foil>`, `ff:<foil>`,
+    /// `fm:on|off`, `vrs:on|off`, `pm:on|off`, `ge:on|off`, `bw:<width>`, `sh:prop|rotor`.
     pub fn encode(&self) -> String {
         let mut t: Vec<String> = Vec::new();
         if self.wing {
             t.push("w".into());
         }
-        if self.split {
-            t.push("s".into());
+        match self.split {
+            Some(1) => t.push("s".into()),
+            Some(n) => t.push(format!("s:{n}")),
+            None => {}
         }
         t.extend(self.role.map(|r| format!("r:{}", r.name())));
         t.extend(self.foil.map(|f| format!("f:{}", foil_id(f))));
@@ -56,6 +61,8 @@ impl Mark {
         let on_off = |b: bool| if b { "on" } else { "off" };
         t.extend(self.fly.map(|b| format!("fm:{}", on_off(b))));
         t.extend(self.vrs.map(|b| format!("vrs:{}", on_off(b))));
+        t.extend(self.props.map(|b| format!("pm:{}", on_off(b))));
+        t.extend(self.ground.map(|b| format!("ge:{}", on_off(b))));
         t.extend(self.blade_width.map(|w| format!("bw:{w:.2}")));
         t.extend(self.airscrew.map(|a| format!("sh:{}", if a { "prop" } else { "rotor" })));
         t.join(" ")
@@ -67,13 +74,16 @@ impl Mark {
         for tok in s.split_whitespace() {
             match tok.split_once(':') {
                 None if tok == "w" => m.wing = true,
-                None if tok == "s" => m.split = true,
+                None if tok == "s" => m.split = Some(1),
+                Some(("s", v)) => m.split = v.parse().ok().filter(|n| *n > 0),
                 Some(("r", v)) => m.role = Role::parse(v).filter(|r| *r != Role::None),
                 Some(("f", v)) => m.foil = aerofoil_index(v),
                 Some(("fd", v)) => m.default_foil = aerofoil_index(v),
                 Some(("ff", v)) => m.default_fin = aerofoil_index(v),
                 Some(("fm", v)) => m.fly = on_off(v),
                 Some(("vrs", v)) => m.vrs = on_off(v),
+                Some(("pm", v)) => m.props = on_off(v),
+                Some(("ge", v)) => m.ground = on_off(v),
                 Some(("sh", "prop")) => m.airscrew = Some(true),
                 Some(("sh", "rotor")) => m.airscrew = Some(false),
                 Some(("bw", v)) => m.blade_width = v.parse::<f32>().ok().filter(|w| w.is_finite()).map(|w| w.clamp(BLADE_WIDTH_RANGE.0, BLADE_WIDTH_RANGE.1)),
@@ -99,13 +109,15 @@ pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
         .enumerate()
         .map(|(i, c)| Mark {
             wing: des.wings.contains(&c.pos),
-            split: des.splits.contains(&c.pos),
+            split: des.splits.get(&c.pos).copied(),
             role: des.roles.get(&c.pos).copied().filter(|r| *r != Role::None),
             foil: des.foils.get(&c.pos).copied(),
             default_foil: (i == 0 && des.default_foil != 0).then_some(des.default_foil),
             default_fin: if i == 0 { des.default_fin } else { None },
             fly: if i == 0 { des.fly } else { None },
             vrs: if i == 0 { des.vrs } else { None },
+            props: if i == 0 { des.props } else { None },
+            ground: if i == 0 { des.ground } else { None },
             blade_width: des.widths.get(&c.pos).map(|&w| w as f32),
             airscrew: des.shapes.get(&c.pos).copied(),
         })
@@ -123,8 +135,8 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
         if m.wing {
             d.wings.insert(c.pos);
         }
-        if m.split {
-            d.splits.insert(c.pos);
+        if let Some(n) = m.split {
+            d.splits.insert(c.pos, n);
         }
         if let Some(r) = m.role {
             d.roles.insert(c.pos, r);
@@ -143,6 +155,8 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
     d.default_fin = marks.iter().find_map(|m| m.default_fin);
     d.fly = marks.iter().find_map(|m| m.fly);
     d.vrs = marks.iter().find_map(|m| m.vrs);
+    d.props = marks.iter().find_map(|m| m.props);
+    d.ground = marks.iter().find_map(|m| m.ground);
     Some(d)
 }
 
@@ -204,7 +218,7 @@ mod tests {
     use super::*;
 
     fn comp(pos: [i32; 3]) -> Comp {
-        Comp { def: "x".into(), pos, rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None }
+        Comp { def: "x".into(), pos, rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None }
     }
 
     #[test]
@@ -224,16 +238,19 @@ mod tests {
         let comps: Vec<Comp> = (0..4).map(|i| comp([i, 0, 0])).collect();
         let mut d = Designations::default();
         d.wings.extend([[1, 0, 0], [2, 0, 0]]);
-        d.splits.insert([2, 0, 0]);
+        d.splits.insert([2, 0, 0], 1);
+        d.splits.insert([1, 0, 0], 3);
         d.roles.insert([3, 0, 0], Role::Roll);
         d.foils.insert([1, 0, 0], 2);
         d.default_foil = 4;
         d.default_fin = Some(9);
         d.fly = Some(false);
         d.vrs = Some(true);
+        d.props = Some(false);
+        d.ground = Some(false);
         let marks = from_designations(&d, &comps);
         let text: Vec<String> = marks.iter().map(Mark::encode).collect();
-        assert_eq!(text[0], "fd:naca0012 ff:fin_hex4 fm:off vrs:on");
+        assert_eq!(text[0], "fd:naca0012 ff:fin_hex4 fm:off vrs:on pm:off ge:off");
         assert_eq!(text[2], "w s");
         let back: Vec<Mark> = text.iter().map(|s| Mark::decode(s)).collect();
         assert_eq!(back, marks);

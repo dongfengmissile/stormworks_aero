@@ -326,6 +326,14 @@ pub(crate) struct PropDebug {
     /// Blade angle at 0.75 R, degrees, and the stalled share of the blades (0..1).
     pub blade_deg: f64,
     pub stalled: f64,
+    /// Body pointer, then hub and net force as (world, the body's grid frame): the overlay places
+    /// them with the body's render matrix every frame.
+    pub body: usize,
+    pub hub: (V3, V3),
+    pub force: (V3, V3),
+    /// Slipstream of a propeller under power: thrust axis (world, grid) and
+    /// [disc radius m, flight speed, induced speed m/s, swirl r·vθ m²/s signed by the spin].
+    pub wash: Option<((V3, V3), [f64; 4])>,
 }
 
 /// Set by the overlay while the flight data window or the arrows are shown.
@@ -462,23 +470,37 @@ struct Craft {
     prop_v: Vec<f64>,
     /// Vehicle key whose marks `fly` / `vrs` were read from (they gate the build).
     read_key: u64,
-    /// The vehicle's own settings (None: the global `ENABLED` / `VRS`).
+    /// The vehicle's own settings (None: the global `ENABLED` / `VRS` / `PROPS`).
     fly: Option<bool>,
     vrs: Option<bool>,
+    props: Option<bool>,
+    ground: Option<bool>,
 }
 
 /// Physics object (`body + OFF_BODY_PHYS_OBJ`) -> the plugin flies its vehicle, from the last
 /// tick. The force hooks drop the game's air forces only for these.
 /// Read from the game's worker threads (hull air), so a read-write lock.
-static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, bool>>> = LazyLock::new(Default::default);
+/// Value: (the plugin flies it, with the plugin's propellers and rotors).
+static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, (bool, bool)>>> = LazyLock::new(Default::default);
 /// The game's hull air forces are skipped per body (`fluid_air_node_forces` hook), so the
 /// settings air constants stay vanilla.
 pub(crate) static AIR_PER_BODY: AtomicBool = AtomicBool::new(false);
 
 /// The plugin flies this physics object's vehicle (unknown objects: the global setting).
 pub(crate) fn flies_obj(obj: usize) -> bool {
-    FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).copied().unwrap_or_else(|| ENABLED.load(Ordering::Relaxed))
+    FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).map_or_else(|| ENABLED.load(Ordering::Relaxed), |f| f.0)
 }
+
+/// This physics object's vehicle uses the plugin's propellers and rotors (unknown objects: the global settings).
+pub(crate) fn props_obj(obj: usize) -> bool {
+    FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).map_or_else(|| ENABLED.load(Ordering::Relaxed) && PROPS.load(Ordering::Relaxed), |f| f.1)
+}
+
+/// Propellers and rotors blade by blade. Off: the game's own thrust and shaft load, with the
+/// plugin's wings and fuselage (no propwash on them: the game's propellers have none).
+pub(crate) static PROPS: AtomicBool = AtomicBool::new(true);
+/// Ground effect on the wings. Off: the same lift and induced drag at any height.
+pub(crate) static GROUND: AtomicBool = AtomicBool::new(true);
 
 /// The propeller tick hook is in: the plugin may take over propellers (else the game's stay).
 pub(crate) static PROPS_HOOKED: AtomicBool = AtomicBool::new(false);
@@ -750,7 +772,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     prop_loads().retain(|_, l| l.step + 30 >= step);
     let mut st = STATE.lock().unwrap_or_else(|p| p.into_inner());
     air_constants(&mut st, enabled && !AIR_PER_BODY.load(Ordering::Relaxed));
-    let mut flown: HashMap<usize, bool> = HashMap::new();
+    let mut flown: HashMap<usize, (bool, bool)> = HashMap::new();
     TICKS.fetch_add(1, Ordering::Relaxed);
     let _fault = crate::fault::enter(crate::fault::stage::FLIGHT);
     let _cache = RegionCacheScope::new();
@@ -826,6 +848,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             read_key: 0,
             fly: None,
             vrs: None,
+            props: None,
+            ground: None,
         });
         // The vehicle's own settings ride on its parts' marks.
         if craft.read_key != key {
@@ -834,12 +858,15 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 let d = crate::marks::designations(&comps, &ptrs);
                 craft.fly = d.as_ref().and_then(|d| d.fly);
                 craft.vrs = d.as_ref().and_then(|d| d.vrs);
+                craft.props = d.as_ref().and_then(|d| d.props);
+                craft.ground = d.as_ref().and_then(|d| d.ground);
             }
         }
         let fly = craft.fly.unwrap_or(enabled);
+        let props_on = PROPS_HOOKED.load(Ordering::Relaxed) && craft.props.unwrap_or_else(|| PROPS.load(Ordering::Relaxed));
         for &b in &bodies {
             if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) {
-                flown.insert(read_usize_at(b + OFF_BODY_PHYS_OBJ), fly);
+                flown.insert(read_usize_at(b + OFF_BODY_PHYS_OBJ), (fly, fly && props_on));
             }
         }
         if !fly {
@@ -941,9 +968,14 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         let fmax = 60.0 * 9.81 * total_mass.max(1.0);
         let rbs: HashSet<usize> = live.iter().flatten().map(|l| l.1).collect();
         let jet_fill = fill_jets(&rbs, apply_force);
-        let (ground, wing_height) = ground_factors(physics_scene, scene, &model, &lbs, main, &bodies);
+        let (ground, wing_height) = if craft.ground.unwrap_or_else(|| GROUND.load(Ordering::Relaxed)) {
+            ground_factors(physics_scene, scene, &model, &lbs, main, &bodies)
+        } else {
+            (Vec::new(), None)
+        };
         let deflect: Vec<f64> =
             model.fin_live.iter().map(|f| f.and_then(|f| Some(f.sign * live_angle(*craft.comp_ptrs.get(f.comp)?, f.src)?)).unwrap_or(0.0)).collect();
+<<<<<<< HEAD
         // Propeller slipstreams, from each one's inflow as of the last tick.
         craft.prop_v.resize(model.props.len(), 0.0);
         let slips: Vec<Option<crate::model::Slipstream>> = (0..model.props.len())
@@ -951,11 +983,14 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 let u = &model.props[k];
                 let lb = live.get(u.body as usize).copied().flatten()?.0;
                 let (s, linked, _) = prop_live_state(*craft.comp_ptrs.get(u.comp)?, u.def.rotor())?;
-                (PROPS_HOOKED.load(Ordering::Relaxed) && linked && lb.to_world(u.hub).y > 0.0).then(|| model.slipstream(k, &lb, &s, craft.prop_v[k])).flatten()
+                (props_on && linked && lb.to_world(u.hub).y > 0.0).then(|| model.slipstream(k, &lb, &s, craft.prop_v[k])).flatten()
             })
             .collect();
         let washes: Vec<crate::model::Slipstream> = slips.iter().flatten().copied().collect();
         let mut forces = model.live_forces(&lbs, main, &mut craft.stall, &ground, &deflect, &washes);
+=======
+        let mut forces = model.live_forces(&lbs, main, &mut craft.stall, &ground, &deflect);
+>>>>>>> parent of 7bf3816 (added propwash, surfaces behind the wash get additional lift; propeller slipstream swirl cancels out part of the torque generated by the propeller; lightened propeller load on engines)
         // Wings and fuselage only: the flight data's lift, drag and coefficients leave out rotor thrust.
         let n_aero = forces.len();
         // Propellers and rotors: blade-element forces at each one's live speed and pitch.
@@ -963,7 +998,14 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         let step = STEP.load(Ordering::Relaxed);
         let vrs = craft.vrs.unwrap_or_else(|| VRS.load(Ordering::Relaxed));
         let mut prop_out: Vec<(usize, crate::model::PropOut, f64)> = Vec::new();
-        for (k, u) in model.props.iter().enumerate().filter(|_| PROPS_HOOKED.load(Ordering::Relaxed)) {
+        if !props_on {
+            // Switched off: hand thrust and shaft load back to the game this tick, not when the entries age out.
+            let mut loads = prop_loads();
+            model.props.iter().filter_map(|u| craft.comp_ptrs.get(u.comp)).for_each(|p| {
+                loads.remove(p);
+            });
+        }
+        for (k, u) in model.props.iter().enumerate().filter(|_| props_on) {
             let Some(&ptr) = craft.comp_ptrs.get(u.comp) else {
                 continue;
             };
@@ -1010,8 +1052,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             // The air's torque on the spin axis reaches the airframe through a driven shaft (the
             // engine or hinge motor holds it); a free rotor just changes speed. A hinge motor only
             // holds the hub's speed: the air never loads the hub, so it reacts with nothing itself.
-            // A driven propeller's slipstream swirl hands part of that torque back through the wing and tail.
-            let torque = if linked { out.moment + slips[k].map_or(V3::ZERO, |sl| model.swirl_recovery(&sl, &lbs, &out)) } else { out.moment - out.axial };
+            let torque = if linked { out.moment } else { out.moment - out.axial };
             forces.push(crate::model::LiveForce { body: u.body as usize, force: out.force, at: out.at, torque });
             prop_out.push((k, out, s.w));
         }
@@ -1063,6 +1104,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             for (k, o, shaft) in &prop_out {
                 let along = o.force.len();
                 (ef, ecalls, bits, wp, w) = (ef + o.force, ecalls + 1, bits | 4, wp + o.at * along, w + along);
+                let pb = (model.props[*k].body as usize).min(lbs.len() - 1);
+                let plb = &lbs[pb];
                 d.props.push(PropDebug {
                     name: model.comps[model.props[*k].comp].def.clone(),
                     rps: o.omega / (2.0 * std::f64::consts::PI),
@@ -1072,6 +1115,13 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                     vrs: o.vrs,
                     blade_deg: o.blade_angle.to_degrees(),
                     stalled: o.stalled,
+                    body: bodies.get(pb).copied().unwrap_or(0),
+                    hub: (o.at, plb.world_to_grid(o.at)),
+                    force: (o.force, plb.world_dir_to_grid(o.force)),
+                    wash: slips[*k].map(|sl| {
+                        let flux = crate::model::atmosphere(o.at.y).rho * (sl.v0 + sl.vi) * std::f64::consts::PI * sl.radius * sl.radius;
+                        ((sl.axis, plb.world_dir_to_grid(sl.axis)), [sl.radius, sl.v0, sl.vi, o.spin * o.torque.max(0.0) / flux])
+                    }),
                 });
             }
             if w > 1.0 {
