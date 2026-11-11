@@ -41,8 +41,9 @@ pub struct Def {
     /// voxel grid. `fins`: they are the part's aerodynamic fins (rocket fins), lifting unmarked.
     pub plates: Vec<(Vec<Tri>, Option<FinCtrl>)>,
     pub fins: bool,
-    /// Voxels the game draws block faces on (`<surface shape>` ≠ 0): solid, whatever the mesh.
-    pub faced: std::collections::HashSet<[i32; 3]>,
+    /// Voxels the game draws block faces on (`<surface shape>` ≠ 0), with the sides drawn as bits
+    /// `1 << orientation` (0 +x, 1 −x, 2 +y, 3 −y, 4 +z, 5 −z): solid between them, whatever the mesh.
+    pub faced: HashMap<[i32; 3], u8>,
     /// `block_type` > 0: a block the game draws from its surfaces, a mesh only adds to it.
     pub block: bool,
     /// Has logic nodes (a control surface's "Rotation" input).
@@ -274,7 +275,12 @@ pub fn parse_def(text: &str) -> Def {
     let mut in_voxels = false;
     // Inside a drawn <surface> of <surfaces> (not <buoyancy_surfaces>): its <position>
     // (omitted when 0,0,0) may follow.
-    let (mut in_surfaces, mut face) = (false, None::<[i32; 3]>);
+    let (mut in_surfaces, mut face) = (false, None::<([i32; 3], u8)>);
+    let add_face = |def: &mut Def, f: Option<([i32; 3], u8)>| {
+        if let Some((pos, side)) = f {
+            *def.faced.entry(pos).or_default() |= side;
+        }
+    };
     // Inside a solid <voxel>: its <position> (omitted when 0,0,0) and rotation may follow.
     let mut open = false;
     for tag in xml::tags(text) {
@@ -305,13 +311,13 @@ pub fn parse_def(text: &str) -> Def {
             ("voxels", close) => in_voxels = !close && !tag.empty,
             ("surfaces", close) => in_surfaces = !close && !tag.empty,
             ("surface", false) if in_surfaces => {
-                face = (tag.int0("shape") != 0).then_some([0; 3]);
+                face = (tag.int0("shape") != 0).then_some(([0; 3], 1 << tag.int0("orientation").clamp(0, 5)));
                 if tag.empty {
-                    def.faced.extend(face.take());
+                    add_face(&mut def, face.take());
                 }
             }
-            ("surface", true) => def.faced.extend(face.take()),
-            ("position", false) if face.is_some() => face = Some([tag.int0("x"), tag.int0("y"), tag.int0("z")]),
+            ("surface", true) => add_face(&mut def, face.take()),
+            ("position", false) if face.is_some() => face = face.map(|f| ([tag.int0("x"), tag.int0("y"), tag.int0("z")], f.1)),
             ("logic_node", false) => def.logic = true,
             ("voxel", false) if in_voxels => {
                 let flags = tag.int0("flags");
@@ -462,16 +468,27 @@ pub fn apply_mesh(def: &mut Def, tris: &[Tri], moving: &[Vec<Tri>], shapes: &cra
     }
     let physics: HashMap<[i32; 3], (i32, [i32; 9])> = def.voxels.iter().map(|v| (v.pos, (v.shape, v.rot))).collect();
     let mut out: Vec<DefVoxel> = Vec::new();
-    for v in &def.voxels {
-        // A voxel the game draws faces on is closed by them: one hull around faces and mesh.
-        if def.faced.contains(&v.pos) {
-            if let Some(b) = kdop(tris, v.pos, true) {
-                out.push(DefVoxel { pos: v.pos, shape: v.shape, rot: v.rot, bounds: Some(b), moving: false });
+    // Faces are drawn on reserved cells too (the floor under a passenger seat's legroom).
+    let mut faced: Vec<(&[i32; 3], &u8)> = def.faced.iter().collect();
+    faced.sort();
+    for (pos, &sides) in faced {
+        let (shape, rot) = physics.get(pos).copied().unwrap_or((0, crate::vehicle::IDENTITY));
+        // A voxel the game draws faces on is closed by them: one hull around faces and mesh
+        // (a sensor is five block faces and a mesh on the sixth side; a lone face is a thin plate).
+        // shortcut: every face counts as a full square; use the surface shape if cut faces matter.
+        let (mut pts, dirs) = cell_points(tris, *pos, true).unwrap_or((Vec::new(), vec![v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)]));
+        for o in (0..6).filter(|o| sides >> o & 1 != 0) {
+            let (a, h) = (o / 2, if o % 2 == 0 { 0.5 } else { -0.5 });
+            for (u, w) in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)] {
+                let mut q = [0.0; 3];
+                (q[a], q[(a + 1) % 3], q[(a + 2) % 3]) = (h, u, w);
+                pts.push(v3(q[0], q[1], q[2]));
             }
         }
+        out.push(DefVoxel { pos: *pos, shape, rot, bounds: Some(hull(&pts, &dirs)), moving: false });
     }
-    if !tris.is_empty() && !def.voxels.iter().any(|v| cell_points(tris, v.pos, true).is_some()) {
-        return; // mesh not in the voxels' frame: keep the physics shapes
+    if out.is_empty() && !tris.is_empty() && !def.voxels.iter().any(|v| cell_points(tris, v.pos, true).is_some()) {
+        return; // mesh not in the voxels' frame: keep the physics shapes (drawn faces: it sits on them)
     }
     let static_pieces: Vec<Vec<Tri>> = pieces(tris).into_iter().map(|p| p.into_iter().map(|t| tris[t]).collect()).collect();
     for (k, piece) in moving.iter().chain(&static_pieces).enumerate() {
@@ -487,7 +504,7 @@ pub fn apply_mesh(def: &mut Def, tris: &[Tri], moving: &[Vec<Tri>], shapes: &cra
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
                     let pos = [x, y, z];
-                    if def.faced.contains(&pos) {
+                    if def.faced.contains_key(&pos) {
                         continue;
                     }
                     let own = physics.contains_key(&pos);
@@ -532,7 +549,8 @@ fn cell_points(tris: &[Tri], pos: [i32; 3], own: bool) -> Option<(Vec<V3>, Vec<V
     // Outside the part, a mesh reaching under 1/10 voxel into a cell (window frames lapping onto
     // the next block by 1.5 cm, a fin edge 2 mm over) is no new cell.
     // shortcut: fixed depth cut-off; make it volume-based if real overhangs this thin matter.
-    if pts.is_empty() || (!own && pts.iter().all(|q| q.x.abs().max(q.y.abs()).max(q.z.abs()) > 0.4)) {
+    // Along one axis, on one side: a rod running through the cell also has all its points on the faces.
+    if pts.is_empty() || (!own && (0..3).any(|a| pts.iter().all(|q| q.get(a) > 0.4) || pts.iter().all(|q| q.get(a) < -0.4))) {
         return None;
     }
     Some((pts, dirs))
