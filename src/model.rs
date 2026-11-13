@@ -179,6 +179,34 @@ pub struct Atmo {
     pub gamma: f64,
 }
 
+/// A jet's full-throttle thrust at `mach` and altitude over its thrust standing still at sea level:
+/// the installed thrust lapse of an afterburning turbojet, Mattingly, Heiser & Pratt, Aircraft
+/// Engine Design 2nd ed. eq. 2.55a. θ0, δ0: total temperature and pressure over sea level's.
+/// shortcut: throttle ratio 1.05, the middle of the book's 1.0 to 1.08 for fighters.
+pub fn jet_thrust_lapse(mach: f64, alt: f64) -> f64 {
+    const TR: f64 = 1.05;
+    let (at, sl) = (atmosphere(alt), atmosphere(0.0));
+    let theta = at.temp / sl.temp;
+    let ram = 1.0 + 0.2 * mach * mach;
+    let theta0 = theta * ram;
+    let delta0 = at.rho / sl.rho.max(1e-9) * theta * ram.powf(3.5);
+    let hot = if theta0 > TR { 1.5 * (theta0 - TR) / theta0 } else { 0.0 };
+    (delta0 * (1.0 - 0.3 * (theta0 - 1.0) - 0.1 * mach.sqrt() - hot)).max(0.0)
+}
+
+/// The same for the large intake's fan: a high bypass turbofan, eq. 2.53 of the same book.
+/// shortcut: the book fits it to Mach 0.9; past that it keeps falling, to nothing near Mach 1.5.
+pub fn fan_thrust_lapse(mach: f64, alt: f64) -> f64 {
+    const TR: f64 = 1.05;
+    let (at, sl) = (atmosphere(alt), atmosphere(0.0));
+    let theta = at.temp / sl.temp;
+    let ram = 1.0 + 0.2 * mach * mach;
+    let theta0 = theta * ram;
+    let delta0 = at.rho / sl.rho.max(1e-9) * theta * ram.powf(3.5);
+    let hot = if theta0 > TR { 3.0 * (theta0 - TR) / (1.5 + mach) } else { 0.0 };
+    (delta0 * (1.0 - 0.49 * mach.sqrt() - hot)).max(0.0)
+}
+
 pub fn atmosphere(alt: f64) -> Atmo {
     // Density: Stormworks' own curve (air_density_ratio 0x2B8F90), sea-level value from the game's settings.
     let ratio = if alt > 40_000.0 { 0.0 } else { (1.0 - alt.max(-1000.0) * 2.241_379_3e-5).max(0.0).powf(5.359_502_3) };

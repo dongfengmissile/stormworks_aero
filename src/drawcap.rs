@@ -15,10 +15,11 @@ use crate::offsets::OFF_SIM_FRAME;
 pub(crate) type MatrixInterp = unsafe extern "system" fn(*const f32, *const f32, f32, *mut f32);
 pub(crate) static ORIGINAL: OnceLock<MatrixInterp> = OnceLock::new();
 
-/// Bodies to look for, with their recorded build poses [build n-1, build n], published by the overlay.
-pub(crate) static TRACK: Mutex<Vec<(usize, [[f64; 16]; 2])>> = Mutex::new(Vec::new());
-/// Candidates per body: recorded builds n-1 and n, then built and live poses read as the draw starts.
-const CANDS: usize = 4;
+/// Bodies to look for, published by the overlay.
+pub(crate) static TRACK: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Candidates per body: the recorded builds (oldest first, up to 4), then the built and live poses,
+/// all read at the draw's first item.
+const CANDS: usize = 6;
 /// Last main-view draw: when (ms) and the drawn world matrix per tracked body.
 pub(crate) static CAPTURED: Mutex<(u64, Vec<(usize, [f64; 16])>)> = Mutex::new((0, Vec::new()));
 
@@ -31,6 +32,9 @@ struct Best {
 
 #[derive(Default)]
 struct Ctx {
+    g: usize,
+    /// `setup` ran for this draw.
+    ready: bool,
     origin: [f64; 3],
     track: Vec<(usize, [[f64; 16]; CANDS])>,
     best: HashMap<usize, Best>,
@@ -41,38 +45,48 @@ thread_local! {
     static CTX: RefCell<Ctx> = RefCell::new(Ctx::default());
 }
 
-/// Before the game draws the frame: the floating origin of its item matrices and the bodies to look for.
+/// Before the game draws the frame.
 pub(crate) fn begin(g: usize) {
     if !crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) {
         return; // arrows hidden: no work in the draw
     }
-    let frame = unsafe { read_usize_at(g + OFF_SIM_FRAME) };
+    CTX.with(|c| {
+        let mut c = c.borrow_mut();
+        (c.g, c.ready) = (g, false);
+        c.track.clear();
+        c.best.clear();
+    });
+    IN_DRAW.with(|d| d.set(true));
+}
+
+/// At the draw's first item: the floating origin of the item matrices and the poses to look for.
+/// Not in `begin`: the game swaps in the frame it draws after that, and when a new build had just
+/// arrived the old frame's origin and poses matched nothing (arrows off the vehicle for a frame).
+fn setup(c: &mut Ctx) {
+    c.ready = true;
+    let frame = unsafe { read_usize_at(c.g + OFF_SIM_FRAME) };
     if !crate::editor::ptr_ok(frame, 24) {
         return;
     }
     let f64_at = |o: usize| f64::from_bits(unsafe { read_usize_at(frame + o) } as u64);
-    // Fresh poses right before the draw: the items' matrices are one of these to f32 precision.
-    let track: Vec<(usize, [[f64; 16]; CANDS])> = TRACK
+    c.origin = [f64_at(0), f64_at(8), f64_at(16)];
+    let hist = crate::flight::BUILT_HISTORY.lock().map(|h| h.clone()).unwrap_or_default();
+    // The items' matrices are one of these to f32 precision.
+    c.track = TRACK
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(b, [h1, h0])| {
+        .filter_map(|b| {
             let live = crate::flight::body_render_matrix(b)?;
-            let built = crate::flight::body_built_matrix(b).unwrap_or(live);
-            Some((b, [h1, h0, built, live]))
+            let mut cands = [live; CANDS];
+            cands[4] = crate::flight::body_built_matrix(b).unwrap_or(live);
+            for (k, (_, m)) in hist.get(&b).map_or(&[][..], |h| h.as_slice()).iter().rev().take(4).enumerate() {
+                cands[3 - k] = *m;
+            }
+            Some((b, cands))
         })
         .collect();
-    if track.is_empty() {
-        return;
-    }
-    CTX.with(|c| {
-        let mut c = c.borrow_mut();
-        c.origin = [f64_at(0), f64_at(8), f64_at(16)];
-        c.track = track;
-        c.best.clear();
-    });
-    IN_DRAW.with(|d| d.set(true));
 }
 
 /// After the draw: publish what was matched.
@@ -120,6 +134,9 @@ pub(crate) unsafe extern "system" fn interp_detour(prev: *const f32, cur: *const
     CTX.with(|ctx| {
         let mut ctx = ctx.borrow_mut();
         let ctx = &mut *ctx;
+        if !ctx.ready {
+            setup(ctx);
+        }
         for (body, cands) in &ctx.track {
             // Items should be origin-relative; a zero origin is tried too in case they are not.
             let pick = |origin: &[f64; 3]| cands.map(|m| err(&c, origin, &m)).iter().copied().enumerate().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((0, f64::MAX));
@@ -148,7 +165,7 @@ fn diag(b: &Best) {
     if n.3 >= 2000 {
         if LINES.fetch_add(1, Ordering::Relaxed) < 200 {
             log_line(&format!(
-                "draw capture: {} matches; game cur = [rec n-1, rec n, built now, live now] {:?}, prev = {:?}, mean match error {:.4}",
+                "draw capture: {} matches; game cur = [rec n-3, n-2, n-1, n, built now, live now] {:?}, prev = {:?}, mean match error {:.4}",
                 n.3, n.0, n.1, n.2 / n.3 as f64
             ));
         }

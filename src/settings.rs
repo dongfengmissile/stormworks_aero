@@ -20,13 +20,15 @@ mod file {
 
     use crate::logging::log_line;
 
-    fn flags() -> [(&'static str, &'static AtomicBool); 5] {
+    fn flags() -> [(&'static str, &'static AtomicBool); 7] {
         [
             ("flight_model", &crate::flight::ENABLED),
             ("propeller_model", &crate::flight::PROPS),
             ("vortex_ring_state", &crate::flight::VRS),
             ("ground_effect", &crate::flight::GROUND),
             ("rotor_blur", &crate::blur::ENABLED),
+            ("jet_smoke", &crate::hooks::JET_SMOKE),
+            ("jet_speed_thrust", &crate::flight::JET_RAM),
         ]
     }
 

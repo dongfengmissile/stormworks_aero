@@ -195,6 +195,10 @@ pub(crate) struct Overlay {
     flight_data: bool,
     /// F8: the vehicle list (watch camera).
     vehicles: bool,
+    /// F9: vehicle ids in the order their flight data is shown.
+    flight_order: Vec<u32>,
+    /// F8 list: rows of static vehicles (map scenery) left out.
+    hide_fixed: bool,
     /// Frames left to keep the mouse from the game after the F8 list closed.
     mouse_hold: u8,
 }
@@ -265,6 +269,8 @@ impl Overlay {
             bench: false,
             flight_data: false,
             vehicles: false,
+            flight_order: Vec::new(),
+            hide_fixed: true,
             mouse_hold: 0,
         }
     }
@@ -281,7 +287,20 @@ impl Overlay {
     /// FAR-style flight data for the vehicles the plugin flies (click-through: never takes keys).
     fn draw_flight_data(&mut self, ui: &Ui) {
         let mut data = crate::flight::DEBUG.lock().map(|d| d.clone()).unwrap_or_default();
-        data.sort_by(|a, b| b.airspeed.total_cmp(&a.airspeed));
+        // Fastest first, but an order once shown holds until one is clearly faster: a missile on its
+        // rail and the aircraft carrying it must not trade places each time their speeds cross.
+        let order = &mut self.flight_order;
+        order.retain(|id| data.iter().any(|v| v.id == *id));
+        order.extend(data.iter().map(|v| v.id).filter(|id| !order.contains(id)).collect::<Vec<_>>());
+        let speed = |id: u32| data.iter().find(|v| v.id == id).map_or(0.0, |v| v.airspeed);
+        for i in 1..order.len() {
+            let mut j = i;
+            while j > 0 && speed(order[j]) > speed(order[j - 1]) * 1.1 + 5.0 {
+                order.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        data.sort_by_key(|v| order.iter().position(|id| *id == v.id));
         let flags =
             imgui::WindowFlags::NO_INPUTS | imgui::WindowFlags::NO_FOCUS_ON_APPEARING | imgui::WindowFlags::ALWAYS_AUTO_RESIZE | imgui::WindowFlags::NO_NAV;
         ui.window("Flight data##flight").position([12.0, 120.0], Condition::FirstUseEver).bg_alpha(0.75).flags(flags).build(|| {
@@ -312,6 +331,11 @@ impl Overlay {
         let mut rows: Vec<(f64, crate::watch::Row)> = crate::watch::rows().into_iter().map(|r| (eye.map_or(0.0, |e| (r.com - e).len()), r)).collect();
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
         let watched = crate::watch::watched();
+        let fixed = rows.iter().filter(|r| r.1.fixed).count();
+        if self.hide_fixed {
+            rows.retain(|r| !r.1.fixed || watched == Some(r.1.id));
+        }
+        let mut hide_fixed = self.hide_fixed;
         let can_watch = crate::watch::AVAILABLE.load(Ordering::Relaxed);
         let mut open = self.vehicles;
         ui.window("Vehicles##vehicles")
@@ -328,20 +352,23 @@ impl Overlay {
                         }
                         ui.text_colored(DIM, "Close this list (F8) to orbit with the mouse.");
                     }
-                    None if can_watch => ui.text_colored(DIM, "Watch a vehicle to move the camera to it."),
+                    None if can_watch => ui.text_colored(DIM, "Watch a vehicle to move the camera to it. One that is not loaded takes a second to appear."),
                     None => ui.text_colored(WARN, "Watch camera unavailable (see aero.log)"),
+                }
+                if fixed > 0 {
+                    ui.checkbox(format!("Hide map assets ({fixed})"), &mut hide_fixed);
                 }
                 ui.dummy([0.0, 4.0]);
                 if rows.is_empty() {
                     ui.text_colored(DIM, if crate::flight::ENABLED.load(Ordering::Relaxed) { "No vehicles spawned" } else { "Plugin flight model is off (F7, Settings)" });
                     return;
                 }
-                let cols = [("Vehicle", 0.8), ("Distance", 1.0), ("Speed", 1.0), ("Altitude", 1.0), ("Mass", 0.9), ("Parts", 0.7), ("", 0.9)];
+                let cols = [("Vehicle", 1.5), ("Distance", 1.0), ("Speed", 1.0), ("Altitude", 1.0), ("Mass", 0.9), ("Parts", 0.7), ("", 0.9)];
                 // Scrolls only past 16 rows; shorter lists size to their rows.
                 let scroll = rows.len() > 16;
                 let flags = TableFlags::ROW_BG | TableFlags::BORDERS_INNER_H | TableFlags::PAD_OUTER_X | TableFlags::SIZING_STRETCH_PROP | if scroll { TableFlags::SCROLL_Y } else { TableFlags::empty() };
                 let h = if scroll { 17.0 * (ui.frame_height() + 4.0) } else { 0.0 };
-                let Some(_t) = ui.begin_table_with_sizing("##vehicle_list", cols.len(), flags, [560.0, h], 0.0) else { return };
+                let Some(_t) = ui.begin_table_with_sizing("##vehicle_list", cols.len(), flags, [620.0, h], 0.0) else { return };
                 ui.table_setup_scroll_freeze(0, 1);
                 for &(name, w) in &cols {
                     ui.table_setup_column_with(TableColumnSetup { flags: TableColumnFlags::WIDTH_STRETCH, init_width_or_weight: w, ..TableColumnSetup::new(name) });
@@ -362,12 +389,17 @@ impl Overlay {
                         Some(c) => ui.text_colored(c, r.id.to_string()),
                         None => ui.text(r.id.to_string()),
                     }
+                    if !r.loaded {
+                        ui.same_line();
+                        ui.text_colored(DIM, "not loaded");
+                    }
+                    let known = |s: String| if r.modelled { s } else { "-".into() };
                     let cells = [
                         if eye.is_some() { dist(*d) } else { "-".into() },
-                        format!("{:.0} km/h", r.vel.len() * 3.6),
+                        known(format!("{:.0} km/h", r.vel.len() * 3.6)),
                         format!("{:.0} m", r.com.y),
-                        if r.mass < 1000.0 { format!("{:.0} kg", r.mass) } else { format!("{:.1} t", r.mass / 1000.0) },
-                        r.parts.to_string(),
+                        known(if r.mass < 1000.0 { format!("{:.0} kg", r.mass) } else { format!("{:.1} t", r.mass / 1000.0) }),
+                        known(r.parts.to_string()),
                     ];
                     for (k, s) in cells.iter().enumerate() {
                         ui.table_set_column_index(k + 1);
@@ -382,6 +414,7 @@ impl Overlay {
                 }
             });
         self.vehicles = open;
+        self.hide_fixed = hide_fixed;
     }
 
     /// The game's "Aero wings" toolbar mode: paint on, a small tool window, clicks on the vehicle
@@ -1586,11 +1619,13 @@ impl Overlay {
             saved |= setting_row(ui, 1, "Propeller and rotor model", "Blade by blade, with engine load and propwash.", props_tip, &PROPS, (props_hooked && fly.0, props_hooked && fly.1 && vehicle), Some(&mut des.props));
             saved |= setting_row(ui, 2, "Vortex ring state", "Rotors lose lift sinking into their downwash.", VRS_TIP, &VRS, (props.0, props.1 && vehicle), Some(&mut des.vrs));
             saved |= setting_row(ui, 1, "Ground effect", "Less drag within a wingspan of the surface.", GROUND_TIP, &GROUND, (fly.0, fly.1 && vehicle), Some(&mut des.ground));
+            saved |= setting_row(ui, 0, "Jets push harder at speed", "Jet thrust grows with airspeed, like a real engine.", "A real jet gets more air rammed into it the faster it flies, so it makes more thrust: about a fifth more near the speed of sound at low level. Very fast and low, the engine runs too hot and the gain fades. Thrust still falls with altitude as the air thins. The large intake's fan does the opposite and fades as speed builds. Off: thrust depends on altitude only.", &crate::flight::JET_RAM, (hooked, false), None);
         }
         ui.dummy([0.0, 6.0]);
         heading(ui, "Display");
         if let Some(_t) = table(ui, "##display", &SETTING_COLS) {
             saved |= setting_row(ui, 0, "Rotor blur", "Fast blades drawn as a smear over their sweep.", BLUR_TIP, &crate::blur::ENABLED, (true, false), None);
+            saved |= setting_row(ui, 0, "Jet exhaust smoke", "Jet engines trail the game's exhaust smoke.", "Off: jet engines make no exhaust smoke, trail or surface splash. Piston engines, rockets and fires keep theirs, and thrust, sound and heat are unchanged.", &crate::hooks::JET_SMOKE, (true, false), None);
         }
 
         if saved {
@@ -2560,19 +2595,11 @@ fn interp(prev: &[f64; 16], cur: &[f64; 16], alpha: f32) -> [f64; 16] {
 
 /// Bodies the next frame's draw capture should look for, with their recorded poses [build n-1, build n].
 fn publish_track(data: &[crate::flight::VehicleDebug]) {
-    let hist = crate::flight::BUILT_HISTORY.lock().map(|h| h.clone()).unwrap_or_default();
-    let mut track: Vec<(usize, [[f64; 16]; 2])> = Vec::new();
+    let mut track: Vec<usize> = Vec::new();
     for a in data.iter().flat_map(|v| v.arrows.iter()) {
-        if track.iter().any(|(b, _)| *b == a.body) {
-            continue;
+        if !track.contains(&a.body) {
+            track.push(a.body);
         }
-        let Some(live) = crate::flight::body_render_matrix(a.body) else {
-            continue;
-        };
-        let h = hist.get(&a.body);
-        let n = h.and_then(|h| h.last()).map_or(live, |x| x.1);
-        let n1 = h.and_then(|h| h.len().checked_sub(2).map(|i| h[i].1)).unwrap_or(n);
-        track.push((a.body, [n1, n]));
     }
     *crate::drawcap::TRACK.lock().unwrap_or_else(|p| p.into_inner()) = track;
 }

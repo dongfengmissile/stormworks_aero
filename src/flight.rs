@@ -155,7 +155,13 @@ pub(crate) unsafe fn jet_sample(this: usize, phys_obj: usize, f: [f32; 3], rel: 
     let h = if ptr_ok(rb + OFF_RB_COM, 24) { f64::from_bits(read_usize_at(rb + OFF_RB_COM + 8) as u64) } else { 0.0 };
     let linear = (1.0 - h * 1.5 / 40_000.0).clamp(0.0, 1.0);
     let density = crate::model::atmosphere(h).rho / f64::from_bits(crate::model::SEA_LEVEL_RHO.load(Ordering::Relaxed)).max(1e-6);
-    let k = if linear > 0.01 { density / linear } else { 0.0 };
+    // With speed too: ram air packs more through the engine (`jet_thrust_lapse`).
+    let lapse = if JET_RAM.load(Ordering::Relaxed) && ptr_ok(rb + OFF_RB_LIN_VEL, 24) {
+        crate::model::jet_thrust_lapse(v3_f64(rb + OFF_RB_LIN_VEL).len() / crate::model::atmosphere(h).a, h)
+    } else {
+        density
+    };
+    let k = if linear > 0.01 { lapse / linear } else { 0.0 };
     let f = f.map(|x| (x as f64 * k) as f32);
     let n = f.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     let key = (read_usize_at(this + 0x58), [0, 4, 8].map(|o| read_u32_at(this + 0x18 + o) as i32));
@@ -182,6 +188,23 @@ pub(crate) unsafe fn jet_sample(this: usize, phys_obj: usize, f: [f32; 3], rel: 
         log_line(&format!("jet spool: nozzle {this:#x} shaft {rps:.1} RPS, game thrust {n:.0} N, applied {out:.0} N"));
     }
     Some(j.dir.map(|d| (d * out) as f32))
+}
+
+/// What to multiply a large intake's fan thrust on `phys_obj` by: the fan's lapse with speed and
+/// altitude in place of the game's linear altitude factor.
+pub(crate) unsafe fn fan_scale(phys_obj: usize) -> f64 {
+    use crate::editor::ptr_ok;
+    if !JET_RAM.load(Ordering::Relaxed) || !ptr_ok(phys_obj + OFF_OBJ_RIGID_BODY, 8) {
+        return 1.0;
+    }
+    let rb = read_usize_at(phys_obj + OFF_OBJ_RIGID_BODY);
+    if !ptr_ok(rb + OFF_RB_COM, 24) || !ptr_ok(rb + OFF_RB_LIN_VEL, 24) {
+        return 1.0;
+    }
+    let h = f64::from_bits(read_usize_at(rb + OFF_RB_COM + 8) as u64);
+    let linear = (1.0 - h * 1.5 / 40_000.0).clamp(0.0, 1.0);
+    let mach = v3_f64(rb + OFF_RB_LIN_VEL).len() / crate::model::atmosphere(h).a;
+    if linear > 0.01 { crate::model::fan_thrust_lapse(mach, h) / linear } else { 0.0 }
 }
 
 /// Once per physics step for a vehicle's rigid bodies `rbs`: nozzles whose combustion queued nothing since
@@ -391,9 +414,11 @@ pub(crate) fn frame_build_ts(g: usize) -> Option<u64> {
     }
 }
 
-/// After the game drew the frame (slot 7 returned): keep its alpha and camera with the build time read before.
-pub(crate) fn note_sim_frame(ts: Option<u64>) {
-    let (Some(ts), Some((alpha, _)), Some(vp)) = (ts, render_frame(), main_viewproj()) else {
+/// After the game drew the frame (slot 7 returned): keep its alpha, build time and camera. All read
+/// now: slot 7 swaps in a newly arrived build before drawing, so a build time read before it went
+/// with the wrong alpha in those frames (arrows a tick behind the vehicle).
+pub(crate) fn note_sim_frame() {
+    let (Some((alpha, ts)), Some(vp)) = (render_frame(), main_viewproj()) else {
         return;
     };
     *FRAME_SNAP.lock().unwrap_or_else(|p| p.into_inner()) = Some((FrameSnap { alpha, ts, vp }, crate::editor::now_ms()));
@@ -520,6 +545,8 @@ pub(crate) fn props_obj(obj: usize) -> bool {
 pub(crate) static PROPS: AtomicBool = AtomicBool::new(true);
 /// Ground effect on the wings. Off: the same lift and induced drag at any height.
 pub(crate) static GROUND: AtomicBool = AtomicBool::new(true);
+/// Jet thrust follows speed and altitude as a real engine's (off: thinner air only).
+pub(crate) static JET_RAM: AtomicBool = AtomicBool::new(true);
 
 /// The propeller tick hook is in: the plugin may take over propellers (else the game's stay).
 pub(crate) static PROPS_HOOKED: AtomicBool = AtomicBool::new(false);
@@ -1167,7 +1194,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         craft.prev_com = Some(mb.com);
         crate::watch::note(id, mb.com, bodies.get(main).copied().unwrap_or(0), mb.world_to_grid(mb.com));
-        crate::watch::add_row(crate::watch::Row { id, com: mb.com, vel: mb.vel, mass: total_mass, parts: model.comps.len() });
+        crate::watch::add_row(crate::watch::Row { id, com: mb.com, vel: mb.vel, mass: total_mass, parts: model.comps.len(), modelled: true, loaded: true, fixed: false });
         if crate::watch::watched() == Some(id) && !client {
             watch_log(id, &mb, live.get(main).copied().flatten().map_or(0, |l| l.1), &model, &forces, craft.dt, fmax, &deflect);
         }
@@ -1315,13 +1342,47 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         crate::paint::publish(stalled);
         crate::paint::publish_flight_tint(std::mem::take(&mut stalled_parts));
     }
+    spawned_rows(scene);
     crate::watch::publish_rows();
-    if want_debug {
+    // A repeat sync call (physics has not stepped) gathers nothing: the last data stays.
+    if want_debug && (stepped || client || !debug.is_empty() || st.crafts.is_empty()) {
         *DEBUG.lock().unwrap_or_else(|p| p.into_inner()) = debug;
     }
     // Built poses: the arrows and the watch camera place things exactly as the game draws them.
     if want_debug || crate::watch::watched().is_some() {
         record_builds(st.crafts.values().flat_map(|c| c.bodies.iter().copied()));
+    }
+}
+
+/// Every spawned vehicle from the game's own list (what Lua's getVehiclePos reads; empty on a
+/// multiplayer client): rows for the ones the tick did not fly, and the watched one is kept loaded
+/// through its keep-active byte, as a Keep Active block does (the game loads it within a second).
+/// shortcut: a world saved while watching keeps that vehicle active after a game restart; restore
+/// on save if that ever matters.
+unsafe fn spawned_rows(scene: usize) {
+    static FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let watched = crate::watch::watched();
+    for rec in ring(scene + OFF_SCENE_SPAWNED, 1 << 16).unwrap_or_default() {
+        if !ptr_ok(rec, 0xE8) || *(rec as *const u8) != 0 {
+            continue;
+        }
+        let id = read_u32_at(rec + 4);
+        let pos = v3_f64(rec + 0x70);
+        let row = crate::watch::Row { id, com: pos, vel: V3::ZERO, mass: 0.0, parts: 0, modelled: false, loaded: read_usize_at(rec + 0xE0) != 0, fixed: *((rec + 0xD2) as *const u8) != 0 };
+        if crate::watch::add_row_if_new(row) {
+            crate::watch::note(id, pos, 0, V3::ZERO);
+        }
+        let keep = (rec + 0xD5) as *mut u8;
+        if watched == Some(id) {
+            if *keep == 0 {
+                *keep = 1;
+                FORCED.store(id, Ordering::Relaxed);
+            }
+        } else if FORCED.load(Ordering::Relaxed) == id {
+            // A real Keep Active block sets it again on the next tick.
+            *keep = 0;
+            FORCED.store(0, Ordering::Relaxed);
+        }
     }
 }
 

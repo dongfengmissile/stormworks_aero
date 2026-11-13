@@ -139,20 +139,20 @@ fn step_bluntness(j: f64) -> f64 {
 /// Drag of a small flat step on a body, as a share of the same face on a bare nose.
 /// shortcut: a guess. Hoerner ch. V figs. 9-10 give steps and joints in a boundary layer about
 /// 0.4 on their height, but as plots; Stormworks builds are all steps, so this sets their drag.
-const STEP_FACE: f64 = 0.4;
+const STEP_FACE: f64 = 0.3;
 
 /// Per slice (in `cross_sections` order, nose first) the blunt area facing forward and aft, and
 /// the totals. Each column of cells counts only where the outline first appears from that side:
 /// a step behind something larger sits in its wake.
-fn blunt_faces(g: &Grid, skip: &[bool]) -> (Vec<(f64, f64)>, Blunt) {
+fn blunt_faces(g: &Grid, skip: &[bool], hollow: &[bool]) -> (Vec<(f64, f64)>, Blunt) {
     let nz = g.dims[2];
     let mut per = vec![(0.0, 0.0); nz];
     let mut b = Blunt::default();
     // Filled area of each slice, to tell a nose from a step on a body that is already there.
     let mut area = vec![0.0; nz];
     for i in 0..g.owner.len() {
-        if g.owner[i] != EMPTY && !skip.get(i).copied().unwrap_or(false) {
-            let f = if g.owner[i] == crate::voxel::INTERIOR { 1.0 } else { g.fill[i].min(1.0) as f64 };
+        if hollow[i] || (g.owner[i] != EMPTY && !skip.get(i).copied().unwrap_or(false)) {
+            let f = if hollow[i] || g.owner[i] == crate::voxel::INTERIOR { 1.0 } else { g.fill[i].min(1.0) as f64 };
             area[nz - 1 - (g.cell(i)[2] - g.min[2]) as usize] += f * VOXEL_M * VOXEL_M;
         }
     }
@@ -235,8 +235,9 @@ impl BodyAero {
     /// `no_skin`: cells whose skin is a wing panel's. `skip`: cells left out altogether (they
     /// belong to a body with its own model). Both may be empty.
     pub fn build(grid: &Grid, no_skin: &[bool], skip: &[bool]) -> BodyAero {
-        let mut xs = cross_sections(grid, no_skin, skip);
-        let (blunt_per, blunt) = blunt_faces(grid, skip);
+        let hollow = hollow_cells(grid);
+        let mut xs = cross_sections(grid, no_skin, skip, &hollow);
+        let (blunt_per, blunt) = blunt_faces(grid, skip, &hollow);
         let thickness = VOXEL_M;
         let filled: Vec<usize> = (0..xs.len()).filter(|&i| xs[i].area > 0.0).collect();
         let (front, back) = match (filled.first(), filled.last()) {
@@ -511,6 +512,23 @@ impl BodyAero {
     /// Sum of all section forces and torques (about `com`), body frame, newtons.
     /// `air_vel`: air velocity relative to the vehicle CoM (= −vehicle velocity), m/s.
     /// `omega`: body rotation rate, rad/s. `q_scale`: multiplies ½ρV² (ρ passed in through it).
+    /// Drag areas (m²) flying straight ahead: skin friction, pressure along the area curve (wave
+    /// drag), flat faces, base. For diagnosis: `forces` is what flies.
+    pub fn axial_breakdown(&self, flow: &Flow) -> [f64; 4] {
+        let skin: f64 = self.sections.iter().map(|s| flow.cf * s.skin.eval(flow.mach)).sum();
+        let pressure: f64 = self.sections.iter().map(|s| -s.xforce_aoa0.eval(flow.mach)).sum();
+        let b = &self.blunt;
+        let face = b.front * blunt_face_cd(flow.mach);
+        let fore = (face + flow.cf * self.skin_area) / b.back.max(1e-9);
+        let base = b.back * blunt_base_cd(flow.mach, fore, self.length.max(self.thickness) / (4.0 * self.max_area.max(b.back) / PI).sqrt());
+        [skin, pressure, face, base]
+    }
+
+    /// Per section: station along the body (m, nose positive) and its pressure drag area at `mach`.
+    pub fn wave_by_section(&self, mach: f64) -> Vec<(f64, f64)> {
+        self.sections.iter().map(|s| (s.centroid.x, -s.xforce_aoa0.eval(mach))).collect()
+    }
+
     pub fn forces(&self, flow: &Flow, air_vel: V3, omega: V3, com: V3, rho: f64) -> (V3, V3) {
         let mut force = V3::ZERO;
         let mut torque = V3::ZERO;
@@ -713,7 +731,83 @@ fn rotate_from_to(from: V3, to: V3, v: V3) -> V3 {
 }
 
 /// Slices along the main axis (grid Z, nose first) with area, centroid, flatness, exposure.
-fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
+/// Air that counts as body for the area curve, as in FAR: empty cells their own slice's outline
+/// closes in. A hollow fuselage open at an intake or exhaust is still a solid shape to the air
+/// round it (`Grid::solidify` only fills what is sealed on every side). Not where one can see
+/// straight through the vehicle from nose to tail: air does pass a duct or a ring.
+pub fn hollow_cells(g: &Grid) -> Vec<bool> {
+    let [nx, ny, nz] = g.dims;
+    let through: Vec<bool> = (0..nx * ny).map(|k| (0..nz).all(|zi| g.owner[k + nx * ny * zi] == EMPTY)).collect();
+    let mut out = vec![false; g.owner.len()];
+    // The outside air is flooded twice: cell by cell, and with a 2 x 2 probe that a slot one cell
+    // wide (a gear leg's cut in the belly, the seam between two wedges) does not let in. What only
+    // the fine flood reaches is body if it has room inside (a cavity behind a slot), and stays air
+    // if it has none (the notch between two fins). Two cells of margin round the slice keep the
+    // probe free to pass the widest point.
+    let (wx, wy) = (nx + 4, ny + 4);
+    let flood = |fits: &dyn Fn(usize, usize) -> bool| {
+        let mut reached = vec![false; wx * wy];
+        let mut stack = vec![0usize];
+        reached[0] = true;
+        while let Some(k) = stack.pop() {
+            let (x, y) = (k % wx, k / wx);
+            for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let (x, y) = (x as i32 + dx, y as i32 + dy);
+                if x < 0 || y < 0 || x as usize >= wx || y as usize >= wy {
+                    continue;
+                }
+                let (x, y) = (x as usize, y as usize);
+                if fits(x, y) && !reached[x + wx * y] {
+                    reached[x + wx * y] = true;
+                    stack.push(x + wx * y);
+                }
+            }
+        }
+        reached
+    };
+    for zi in 0..nz {
+        let empty = |x: usize, y: usize| x < 2 || y < 2 || x >= nx + 2 || y >= ny + 2 || g.owner[(x - 2) + nx * ((y - 2) + ny * zi)] == EMPTY;
+        let block = |x: usize, y: usize| x + 1 < wx && y + 1 < wy && empty(x, y) && empty(x + 1, y) && empty(x, y + 1) && empty(x + 1, y + 1);
+        let fine = flood(&empty);
+        let probe = flood(&block);
+        // Under any reached probe position.
+        let coarse = |x: usize, y: usize| probe[x + wx * y] || (x > 0 && probe[x - 1 + wx * y]) || (y > 0 && probe[x + wx * (y - 1)]) || (x > 0 && y > 0 && probe[x - 1 + wx * (y - 1)]);
+        // Groups of empty cells the probe did not reach; `roomy`: one holds a 2 x 2 block.
+        let mut group = vec![usize::MAX; wx * wy];
+        let mut roomy: Vec<bool> = Vec::new();
+        for start in 0..wx * wy {
+            let (sx, sy) = (start % wx, start / wx);
+            if group[start] != usize::MAX || !empty(sx, sy) || coarse(sx, sy) {
+                continue;
+            }
+            let id = roomy.len();
+            roomy.push(false);
+            group[start] = id;
+            let mut stack = vec![start];
+            while let Some(k) = stack.pop() {
+                let (x, y) = (k % wx, k / wx);
+                roomy[id] |= block(x, y);
+                for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                    let (x, y) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
+                    if x < wx && y < wy && group[x + wx * y] == usize::MAX && empty(x, y) && !coarse(x, y) {
+                        group[x + wx * y] = id;
+                        stack.push(x + wx * y);
+                    }
+                }
+            }
+        }
+        for yi in 0..ny {
+            for xi in 0..nx {
+                let w = xi + 2 + wx * (yi + 2);
+                let k = xi + nx * yi;
+                out[k + nx * ny * zi] = group[w] != usize::MAX && !through[k] && (!fine[w] || roomy[group[w]]);
+            }
+        }
+    }
+    out
+}
+
+fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool], hollow: &[bool]) -> Vec<Xsec> {
     let [nx, ny, nz] = g.dims;
     let cell_area = VOXEL_M * VOXEL_M;
     let mut out = Vec::with_capacity(nz);
@@ -727,18 +821,19 @@ fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
         for yi in 0..ny {
             for xi in 0..nx {
                 let i = xi + nx * (yi + ny * zi);
-                if g.owner[i] == EMPTY || skip.get(i).copied().unwrap_or(false) {
+                let hollow = hollow[i];
+                if (g.owner[i] == EMPTY && !hollow) || skip.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 let c = [g.min[0] + xi as i32, g.min[1] + yi as i32, z];
-                let f = g.fill[i].min(1.0) as f64;
+                let f = if hollow { 1.0 } else { g.fill[i].min(1.0) as f64 };
                 let p = aero_pos(c);
                 cnt += f;
                 sy += p.y * f;
                 sz += p.z * f;
                 pts.push((p.y, p.z, f));
                 (lo, hi) = ([lo[0].min(p.y), lo[1].min(p.z)], [hi[0].max(p.y), hi[1].max(p.z)]);
-                if no_skin.get(i).copied().unwrap_or(false) {
+                if hollow || no_skin.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 exposed += g.exposed_area(i);
@@ -1057,6 +1152,32 @@ fn critical_mach_number(f: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hollow_fuselage_counts_as_solid_but_a_see_through_tube_does_not() {
+        // 5 x 5 shell, 10 long, with a one-cell slot along the floor; `wall`: closed at the rear.
+        let tube = |wall: bool| {
+            let mut cells = Vec::new();
+            for z in 0..10 {
+                for x in 0..5 {
+                    for y in 0..5 {
+                        let shell = x == 0 || x == 4 || y == 0 || y == 4;
+                        if (shell && !(y == 0 && x == 2)) || (wall && z == 0) {
+                            cells.push(([x, y, z], 1.0, 0));
+                        }
+                    }
+                }
+            }
+            let g = Grid::from_cells(&cells);
+            (hollow_cells(&g).iter().filter(|&&h| h).count(), BodyAero::build(&g, &[], &[]).max_area)
+        };
+        // Closed at one end: 9 slices of 3 x 3 inside plus the slot cell, and the area of the full box.
+        let (cells, area) = tube(true);
+        assert_eq!(cells, 9 * 10);
+        assert!((area - 25.0 * VOXEL_M * VOXEL_M).abs() < 1e-9, "{area}");
+        // Open at both ends: air passes, nothing is filled.
+        assert_eq!(tube(false).0, 0);
+    }
 
     /// A long round-ish body flying straight has drag but no lift; at AoA it lifts up.
     #[test]

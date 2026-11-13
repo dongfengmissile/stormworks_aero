@@ -125,6 +125,9 @@ pub(crate) const OFF_SCENE_PHYSICS: usize = 0x64D0;
 /// c_scene vehicle container ring (container 0x4990 + 0x320): records
 /// `{u8 removed; u32 vehicle_id @+4; vehicle* @+8; u32 type @+0x10 (5 = vehicle)}`.
 pub(crate) const OFF_SCENE_VEHICLES: usize = 0x4CB0;
+/// Ring of every spawned vehicle, loaded or not (host / single player; knowledge/vehicle-model.md).
+/// Record: +0 removed, +4 id, +0x70 f64x3 position, +0xD5 keep active, +0xE0 loaded record or 0.
+pub(crate) const OFF_SCENE_SPAWNED: usize = 0x30;
 
 /// `physics_scene_set_damping(scene, obj, f32 linear, f32 angular)`: Bullet velocity damping,
 /// re-set on every vehicle body every tick (vanilla 0.1 = ~10 %/s speed loss).
@@ -214,6 +217,10 @@ pub(crate) const OFF_BODY_RENDER_BUILT: usize = 0x308; // f32[16]
 
 // Engine thrust (RE round 6): components queue world-frame forces through these physics-scene wrappers
 // (scene, phys_obj, f32[3]* force, ptr, ptr, f32 max, f32 scale); return addresses identify the source.
+/// `jet_engine_tick` (vtable slot 107 of every jet part), 25 arguments, rcx = component.
+pub(crate) const RVA_JET_TICK: usize = 0x0035_34c0;
+/// The jet engine class's vtable entry for its tick (slot 107): the exe's only pointer to the tick.
+pub(crate) const RVA_JET_TICK_SLOT: usize = 0x00B9_3380;
 pub(crate) const RVA_APPLY_FORCE_THRESHOLD: usize = 0x001a_7b20;
 pub(crate) const APPLY_FORCE_THRESHOLD_PROLOGUE: [u8; 20] =
     [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x60];
@@ -233,6 +240,7 @@ pub(crate) const THRUST_SOURCE_NAMES: [&str; 5] = ["jet", "rocket", "propeller/r
 // *(this+0x58)+0xED4 (u32: 0 fan, 1 compressor, 2 combustor, 3 turbine, 4 nozzle); shaft RPS f32 at +0x1BC on
 // types 1-3; upstream neighbours ring at +0x408 ({items, mod, offset, count}).
 pub(crate) const JET_NOZZLE_RETURN: usize = 0x0035_451f;
+pub(crate) const JET_FAN_RETURN: usize = 0x356442; // large intake fan force, build c38c03ff756b
 pub(crate) const JET_THIS_FROM_ARG4: usize = 0x510;
 pub(crate) const OFF_JET_DEF_TYPE: usize = 0xED4;
 pub(crate) const OFF_JET_RPS: usize = 0x1BC;

@@ -77,6 +77,12 @@ pub(crate) struct Row {
     pub vel: V3,
     pub mass: f64,
     pub parts: usize,
+    /// The plugin flies it (speed, mass and parts are known); else only where the game has it.
+    pub modelled: bool,
+    /// The game has it loaded (far from every player it is not, and stands still).
+    pub loaded: bool,
+    /// Spawned static (the game's own flag): map scenery and other fixed things.
+    pub fixed: bool,
 }
 /// Rows being gathered this tick, and the last complete tick's.
 static GATHER: Mutex<Vec<Row>> = Mutex::new(Vec::new());
@@ -85,6 +91,16 @@ static ROWS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
 /// Flight tick: one vehicle's row.
 pub(crate) fn add_row(r: Row) {
     GATHER.lock().unwrap_or_else(|p| p.into_inner()).push(r);
+}
+
+/// Flight tick: a row for a vehicle the plugin does not fly. False if it already has one.
+pub(crate) fn add_row_if_new(r: Row) -> bool {
+    let mut g = GATHER.lock().unwrap_or_else(|p| p.into_inner());
+    let new = !g.iter().any(|x| x.id == r.id);
+    if new {
+        g.push(r);
+    }
+    new
 }
 
 /// Flight tick end: the gathered rows become the list.

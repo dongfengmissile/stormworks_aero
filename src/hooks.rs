@@ -1,7 +1,7 @@
 //! MinHook detours, each gated on its recorded prologue (skip + log on mismatch).
 
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use minhook::MinHook;
@@ -10,6 +10,7 @@ use crate::logging::log_line;
 use crate::memory::bytes_match;
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
+use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
 
 type EditorUpdate = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize);
 static ORIGINAL_EDITOR_UPDATE: OnceLock<EditorUpdate> = OnceLock::new();
@@ -157,7 +158,6 @@ static ORIGINAL_SIM_RENDER: OnceLock<SimRender> = OnceLock::new();
 /// Records the simulation state (owner of the main camera) for the force arrows.
 unsafe extern "system" fn sim_render_detour(g: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
     crate::flight::note_sim_state(g);
-    let ts = crate::flight::frame_build_ts(g);
     crate::drawcap::begin(g);
     crate::paint::main_view(true);
     let r = match ORIGINAL_SIM_RENDER.get() {
@@ -166,7 +166,7 @@ unsafe extern "system" fn sim_render_detour(g: usize, a2: usize, a3: usize, a4: 
     };
     crate::paint::main_view(false);
     crate::drawcap::end();
-    crate::flight::note_sim_frame(ts);
+    crate::flight::note_sim_frame();
     r
 }
 
@@ -202,6 +202,7 @@ pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
     install_watch_hooks();
     install_watch_lod_hook();
     install_cursor_hook();
+    install_jet_smoke_hook();
     install_paint_hook();
     install_tint_hooks();
     install_blur_hooks();
@@ -284,6 +285,48 @@ unsafe fn install_cursor_hook() {
         }
         Err(e) => log_line(&format!("create cursor hook: {e:?}")),
     }
+}
+
+/// Display setting: jet engines make their exhaust smoke (the game's default).
+pub(crate) static JET_SMOKE: AtomicBool = AtomicBool::new(true);
+type JetTick = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+static ORIGINAL_JET_TICK: OnceLock<JetTick> = OnceLock::new();
+/// The part's own "Spawn Particles" option: gates only the tick's smoke, strip and splash emitters.
+const OFF_JET_SPAWN_PARTICLES: usize = 0x4D8;
+
+/// `jet_engine_tick` (every jet part, sim thread; all register arguments are integers): with the
+/// smoke off, the part's particle option reads 0 for this call only. It is saved with the vehicle,
+/// so it is put back.
+unsafe extern "system" fn jet_tick_detour(comp: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize, a9: usize, a10: usize, a11: usize, a12: usize, a13: usize, a14: usize, a15: usize, a16: usize, a17: usize, a18: usize, a19: usize, a20: usize, a21: usize, a22: usize, a23: usize, a24: usize, a25: usize) -> usize {
+    let Some(&orig) = ORIGINAL_JET_TICK.get() else { return 0 };
+    let flag = (comp + OFF_JET_SPAWN_PARTICLES) as *mut u8;
+    if JET_SMOKE.load(Ordering::Relaxed) || !crate::memory::readable(flag as usize, 1) {
+        return orig(comp, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25);
+    }
+    let old = flag.replace(0);
+    let r = orig(comp, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25);
+    flag.write(old);
+    r
+}
+
+/// Jet smoke switch; failure only leaves the smoke on. The class's vtable slot is swapped instead of
+/// detouring the function: the infrared plugin detours it, and refuses to load on a changed prologue.
+unsafe fn install_jet_smoke_hook() {
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    let slot = (base + RVA_JET_TICK_SLOT) as *mut usize;
+    if !crate::memory::readable(slot as usize, 8) || *slot != base + RVA_JET_TICK {
+        log_line(&format!("jet engine vtable slot at {slot:p} is not jet_engine_tick; jet exhaust smoke stays on"));
+        return;
+    }
+    let _ = ORIGINAL_JET_TICK.set(std::mem::transmute::<usize, JetTick>(base + RVA_JET_TICK));
+    let mut old = 0u32;
+    if VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) == 0 {
+        log_line("jet engine vtable could not be made writable; jet exhaust smoke stays on");
+        return;
+    }
+    slot.write(jet_tick_detour as *const () as usize);
+    VirtualProtect(slot as *const c_void, 8, old, &mut old);
+    log_line("jet smoke hook installed");
 }
 
 /// Stalled-voxel paint in the game render; failure only loses the red blocks.
@@ -460,7 +503,7 @@ unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: 
         return 0;
     }
     // A jet nozzle's thrust follows its spool: queue a reshaped copy of the force instead.
-    let shaped: [f32; 3];
+    let mut shaped: [f32; 3];
     let mut force = a3;
     if a3 != 0 && ret == MODULE_BASE.load(Ordering::Relaxed) + JET_NOZZLE_RETURN && crate::flight::flies_obj(a2) {
         let f = (a3 as *const [f32; 3]).read_unaligned();
@@ -469,6 +512,12 @@ unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: 
             shaped = g;
             force = shaped.as_ptr() as usize;
         }
+    }
+    // A large intake's fan loses thrust with speed.
+    if a3 != 0 && ret == MODULE_BASE.load(Ordering::Relaxed) + JET_FAN_RETURN && crate::flight::flies_obj(a2) {
+        let k = crate::flight::fan_scale(a2);
+        shaped = (a3 as *const [f32; 3]).read_unaligned().map(|x| (x as f64 * k) as f32);
+        force = shaped.as_ptr() as usize;
     }
     note_thrust(ret, &THRESHOLD_THRUST_RETURNS, a2, force, a5, a6, a7);
     ORIGINAL_THRESHOLD.get().map_or(0, |o| o(a1, a2, force, a4, a5, a6, a7))
