@@ -193,6 +193,10 @@ pub(crate) struct Overlay {
     faces_gen: Option<u64>,
     /// Flight data readout (F9).
     flight_data: bool,
+    /// F8: the vehicle list (watch camera).
+    vehicles: bool,
+    /// Frames left to keep the mouse from the game after the F8 list closed.
+    mouse_hold: u8,
 }
 
 impl Overlay {
@@ -260,6 +264,8 @@ impl Overlay {
             paint_key: None,
             bench: false,
             flight_data: false,
+            vehicles: false,
+            mouse_hold: 0,
         }
     }
 
@@ -298,6 +304,84 @@ impl Overlay {
                 flight_vehicle(ui, n, v);
             }
         });
+    }
+
+    /// F8: every vehicle the plugin models, nearest the camera first, each with Watch.
+    fn draw_vehicle_list(&mut self, ui: &Ui) {
+        let eye = crate::flight::main_viewproj().and_then(|vp| crate::math::camera_eye(&vp));
+        let mut rows: Vec<(f64, crate::watch::Row)> = crate::watch::rows().into_iter().map(|r| (eye.map_or(0.0, |e| (r.com - e).len()), r)).collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let watched = crate::watch::watched();
+        let can_watch = crate::watch::AVAILABLE.load(Ordering::Relaxed);
+        let mut open = self.vehicles;
+        ui.window("Vehicles##vehicles")
+            .position([12.0, 120.0], Condition::FirstUseEver)
+            .flags(imgui::WindowFlags::ALWAYS_AUTO_RESIZE | imgui::WindowFlags::NO_COLLAPSE)
+            .opened(&mut open)
+            .build(|| {
+                match watched {
+                    Some(id) => {
+                        ui.text_colored(WARN, format!("Watching vehicle {id}"));
+                        ui.same_line_with_spacing(0.0, 12.0);
+                        if ui.small_button("Back to me") {
+                            crate::watch::set(None);
+                        }
+                        ui.text_colored(DIM, "Close this list (F8) to orbit with the mouse.");
+                    }
+                    None if can_watch => ui.text_colored(DIM, "Watch a vehicle to move the camera to it."),
+                    None => ui.text_colored(WARN, "Watch camera unavailable (see aero.log)"),
+                }
+                ui.dummy([0.0, 4.0]);
+                if rows.is_empty() {
+                    ui.text_colored(DIM, if crate::flight::ENABLED.load(Ordering::Relaxed) { "No vehicles spawned" } else { "Plugin flight model is off (F7, Settings)" });
+                    return;
+                }
+                let cols = [("Vehicle", 0.8), ("Distance", 1.0), ("Speed", 1.0), ("Altitude", 1.0), ("Mass", 0.9), ("Parts", 0.7), ("", 0.9)];
+                // Scrolls only past 16 rows; shorter lists size to their rows.
+                let scroll = rows.len() > 16;
+                let flags = TableFlags::ROW_BG | TableFlags::BORDERS_INNER_H | TableFlags::PAD_OUTER_X | TableFlags::SIZING_STRETCH_PROP | if scroll { TableFlags::SCROLL_Y } else { TableFlags::empty() };
+                let h = if scroll { 17.0 * (ui.frame_height() + 4.0) } else { 0.0 };
+                let Some(_t) = ui.begin_table_with_sizing("##vehicle_list", cols.len(), flags, [560.0, h], 0.0) else { return };
+                ui.table_setup_scroll_freeze(0, 1);
+                for &(name, w) in &cols {
+                    ui.table_setup_column_with(TableColumnSetup { flags: TableColumnFlags::WIDTH_STRETCH, init_width_or_weight: w, ..TableColumnSetup::new(name) });
+                }
+                // Headers aligned like their columns: numbers right, the name left.
+                ui.table_next_row_with_flags(imgui::TableRowFlags::HEADERS);
+                for (k, &(name, _)) in cols.iter().enumerate() {
+                    ui.table_set_column_index(k);
+                    if k == 0 { ui.text_colored(DIM, name) } else { right(ui, name, Some(DIM)) }
+                }
+                let dist = |d: f64| if d < 1000.0 { format!("{d:.0} m") } else { format!("{:.1} km", d / 1000.0) };
+                for (d, r) in &rows {
+                    ui.table_next_row();
+                    let this = watched == Some(r.id);
+                    let col = this.then_some(WARN);
+                    ui.table_set_column_index(0);
+                    match col {
+                        Some(c) => ui.text_colored(c, r.id.to_string()),
+                        None => ui.text(r.id.to_string()),
+                    }
+                    let cells = [
+                        if eye.is_some() { dist(*d) } else { "-".into() },
+                        format!("{:.0} km/h", r.vel.len() * 3.6),
+                        format!("{:.0} m", r.com.y),
+                        if r.mass < 1000.0 { format!("{:.0} kg", r.mass) } else { format!("{:.1} t", r.mass / 1000.0) },
+                        r.parts.to_string(),
+                    ];
+                    for (k, s) in cells.iter().enumerate() {
+                        ui.table_set_column_index(k + 1);
+                        right(ui, s, col.or((k == 4).then_some(DIM)));
+                    }
+                    ui.table_set_column_index(6);
+                    if this {
+                        right(ui, "Watching", Some(WARN));
+                    } else if can_watch && right_button(ui, &format!("Watch##w{}", r.id)) {
+                        crate::watch::set(Some(r.id));
+                    }
+                }
+            });
+        self.vehicles = open;
     }
 
     /// The game's "Aero wings" toolbar mode: paint on, a small tool window, clicks on the vehicle
@@ -2133,6 +2217,16 @@ impl Overlay {
             self.flight_data = !self.flight_data;
         }
         crate::flight::DEBUG_WANTED.store(self.flight_data, Ordering::Relaxed);
+        if ui.is_key_pressed(Key::F8) {
+            self.vehicles = !self.vehicles;
+        }
+        if self.vehicles {
+            self.draw_vehicle_list(ui);
+        }
+        crate::watch::FREE_CURSOR.store(self.vehicles, Ordering::Relaxed);
+        // A couple of frames more without mouse input after closing: the game's last cursor
+        // position is stale and the first move would jerk the view.
+        self.mouse_hold = if self.vehicles { 2 } else { self.mouse_hold.saturating_sub(1) };
         if self.flight_data {
             self.draw_flight_data(ui);
             draw_force_arrows(ui);
@@ -2195,10 +2289,15 @@ impl Overlay {
     }
 
     fn filter(&self, io: &Io) -> MessageFilter {
-        if !self.open && !self.bench {
-            return MessageFilter::empty();
-        }
         let mut f = MessageFilter::empty();
+        // The F8 list owns the mouse while open (the view must not turn under the cursor);
+        // keys still go to the game.
+        if self.vehicles || self.mouse_hold > 0 {
+            f |= MessageFilter::InputMouse | MessageFilter::InputRaw;
+        }
+        if !self.open && !self.bench {
+            return f;
+        }
         if io.want_capture_mouse {
             f |= MessageFilter::InputMouse | MessageFilter::InputRaw;
         }
@@ -2476,4 +2575,12 @@ fn publish_track(data: &[crate::flight::VehicleDebug]) {
         track.push((a.body, [n1, n]));
     }
     *crate::drawcap::TRACK.lock().unwrap_or_else(|p| p.into_inner()) = track;
+}
+
+/// A small button right-aligned in the current table cell.
+fn right_button(ui: &Ui, label: &str) -> bool {
+    let shown = label.split("##").next().unwrap_or(label);
+    let w = ui.calc_text_size(shown)[0] + ui.clone_style().frame_padding[0] * 2.0;
+    ui.set_cursor_pos([ui.cursor_pos()[0] + ui.content_region_avail()[0] - w, ui.cursor_pos()[1]]);
+    ui.small_button(label)
 }

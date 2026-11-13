@@ -102,22 +102,25 @@ fn on_off(v: &str) -> Option<bool> {
     }
 }
 
-/// Each component's marks from position-keyed designations (`comps[0]` carries the defaults).
+/// Each component's marks from position-keyed designations (each body's first component carries the defaults).
 pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
+    // Each body's first component: a body held only by a hardpoint (a missile) spawns as its own
+    // vehicle and must bring the settings with it.
+    let mut seen = std::collections::HashSet::new();
     comps
         .iter()
-        .enumerate()
-        .map(|(i, c)| Mark {
+        .map(|c| (seen.insert(c.body), c))
+        .map(|(first, c)| Mark {
             wing: des.wings.contains(&c.pos),
             split: des.splits.get(&c.pos).copied(),
             role: des.roles.get(&c.pos).copied().filter(|r| *r != Role::None),
             foil: des.foils.get(&c.pos).copied(),
-            default_foil: (i == 0 && des.default_foil != 0).then_some(des.default_foil),
-            default_fin: if i == 0 { des.default_fin } else { None },
-            fly: if i == 0 { des.fly } else { None },
-            vrs: if i == 0 { des.vrs } else { None },
-            props: if i == 0 { des.props } else { None },
-            ground: if i == 0 { des.ground } else { None },
+            default_foil: (first && des.default_foil != 0).then_some(des.default_foil),
+            default_fin: if first { des.default_fin } else { None },
+            fly: if first { des.fly } else { None },
+            vrs: if first { des.vrs } else { None },
+            props: if first { des.props } else { None },
+            ground: if first { des.ground } else { None },
             blade_width: des.widths.get(&c.pos).map(|&w| w as f32),
             airscrew: des.shapes.get(&c.pos).copied(),
         })
@@ -195,6 +198,32 @@ pub fn read(ptrs: &[usize]) -> Vec<Mark> {
     ptrs.iter().map(|p| t.get(p).cloned().unwrap_or_default()).collect()
 }
 
+/// Copy the vehicle settings (the first of each found, in part order) onto every body's first part.
+/// `parts`: (component, body) in part order. A body held only by a hardpoint (a missile) spawns
+/// as its own vehicle and has to bring them along.
+pub fn spread_settings(parts: &[(usize, u32)]) {
+    let mut t = table();
+    let mut d = Mark::default();
+    for m in parts.iter().filter_map(|(p, _)| t.get(p)) {
+        d.default_foil = d.default_foil.or(m.default_foil);
+        d.default_fin = d.default_fin.or(m.default_fin);
+        d.fly = d.fly.or(m.fly);
+        d.vrs = d.vrs.or(m.vrs);
+        d.props = d.props.or(m.props);
+        d.ground = d.ground.or(m.ground);
+    }
+    if d.is_empty() {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (p, _) in parts.iter().filter(|(_, b)| seen.insert(*b)) {
+        let m = t.entry(*p).or_default();
+        m.default_foil = d.default_foil;
+        m.default_fin = d.default_fin;
+        (m.fly, m.vrs, m.props, m.ground) = (d.fly, d.vrs, d.props, d.ground);
+    }
+}
+
 /// Designations of a live vehicle from its component pointers (None: no marks).
 pub fn designations(comps: &[Comp], ptrs: &[usize]) -> Option<Designations> {
     to_designations(comps, &read(ptrs))
@@ -231,6 +260,30 @@ mod tests {
         let des = to_designations(&comps, &[m.clone()]).unwrap();
         assert_eq!(des.widths.get(&[1, 2, 3]), Some(&1.5));
         assert_eq!(from_designations(&des, &comps)[0], m);
+    }
+
+    #[test]
+    fn spread_settings_reaches_every_body() {
+        // Distinct fake pointers; body 1 (the missile) has a wing mark but no switch.
+        let base = 0x7000_0000_1000usize;
+        set(base, Some(Mark { fly: Some(true), ..Default::default() }), false);
+        set(base + 16, Some(Mark { wing: true, ..Default::default() }), false);
+        spread_settings(&[(base, 0), (base + 8, 0), (base + 16, 1)]);
+        assert_eq!(get(base + 16), Some(Mark { wing: true, fly: Some(true), ..Default::default() }));
+        assert_eq!(get(base + 8), None);
+        [base, base + 16].into_iter().for_each(|p| set(p, None, false));
+    }
+
+    #[test]
+    fn every_body_carries_the_vehicle_settings() {
+        // A missile on a hardpoint is its own body and spawns as its own vehicle.
+        let mut comps: Vec<Comp> = (0..4).map(|i| comp([i, 0, 0])).collect();
+        comps[2].body = 1;
+        comps[3].body = 1;
+        let d = Designations { fly: Some(true), ..Default::default() };
+        let marks = from_designations(&d, &comps);
+        assert_eq!(marks.iter().map(|m| m.fly).collect::<Vec<_>>(), [Some(true), None, Some(true), None]);
+        assert_eq!(to_designations(&comps[2..], &marks[2..]).unwrap().fly, Some(true));
     }
 
     #[test]

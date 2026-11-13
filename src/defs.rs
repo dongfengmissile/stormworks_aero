@@ -4,7 +4,7 @@
 //! and component-mod `.bin` files (u32 length + XML) from mods, the workshop and
 //! the per-vehicle folders the game embeds them in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -311,7 +311,9 @@ pub fn parse_def(text: &str) -> Def {
             ("voxels", close) => in_voxels = !close && !tag.empty,
             ("surfaces", close) => in_surfaces = !close && !tag.empty,
             ("surface", false) if in_surfaces => {
-                face = (tag.int0("shape") != 0).then_some(([0; 3], 1 << tag.int0("orientation").clamp(0, 5)));
+                // A connection port (`trans_type`: fluid, hardpoint, ...) is an opening the game
+                // marks for joining, not a square of hull.
+                face = (tag.int0("shape") != 0 && tag.int0("trans_type") == 0).then_some(([0; 3], 1 << tag.int0("orientation").clamp(0, 5)));
                 if tag.empty {
                     add_face(&mut def, face.take());
                 }
@@ -411,6 +413,16 @@ pub fn bin_xml(bytes: &[u8]) -> Option<&str> {
     std::str::from_utf8(&body[..end]).ok()
 }
 
+/// The definition name in a mod part's header (u32 length, u32 1, name, NUL, XML); None for the
+/// older layout that has no name.
+fn bin_name(head: &[u8]) -> Option<&str> {
+    if head.get(4..8)? != 1u32.to_le_bytes() {
+        return None;
+    }
+    let name = head[8..].split(|&b| b == 0).next()?;
+    (name.len() < head.len() - 8).then(|| std::str::from_utf8(name).ok()).flatten().filter(|n| !n.is_empty())
+}
+
 /// A mesh triangle (metres, part origin) and its outward unit normal.
 pub type Tri = ([V3; 3], V3);
 
@@ -471,20 +483,33 @@ pub fn apply_mesh(def: &mut Def, tris: &[Tri], moving: &[Vec<Tri>], shapes: &cra
     // Faces are drawn on reserved cells too (the floor under a passenger seat's legroom).
     let mut faced: Vec<(&[i32; 3], &u8)> = def.faced.iter().collect();
     faced.sort();
+    // Cells closed by their drawn faces (the rest are bounded by the mesh alone, below).
+    let mut closed: HashSet<[i32; 3]> = HashSet::new();
+    let axes = || vec![v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)];
+    // shortcut: every face counts as a full square; use the surface shape if cut faces matter.
+    let square = |o: usize| {
+        let (a, h) = (o / 2, if o % 2 == 0 { 0.5 } else { -0.5 });
+        [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)].map(|(u, w)| {
+            let mut q = [0.0; 3];
+            (q[a], q[(a + 1) % 3], q[(a + 2) % 3]) = (h, u, w);
+            v3(q[0], q[1], q[2])
+        })
+    };
     for (pos, &sides) in faced {
         let (shape, rot) = physics.get(pos).copied().unwrap_or((0, crate::vehicle::IDENTITY));
+        let mesh = cell_points(tris, *pos, true);
+        let sides_on = (0..6).filter(|o| sides >> o & 1 != 0);
+        // One or two faces do not close a cell: with a mesh in it they are plates of their own
+        // (a hardpoint's hook on its base plate). One hull around both would fill the cell.
+        if sides.count_ones() <= 2 && mesh.is_some() {
+            out.extend(sides_on.map(|o| DefVoxel { pos: *pos, shape, rot, bounds: Some(hull(&square(o), &axes())), moving: false }));
+            continue;
+        }
+        closed.insert(*pos);
         // A voxel the game draws faces on is closed by them: one hull around faces and mesh
         // (a sensor is five block faces and a mesh on the sixth side; a lone face is a thin plate).
-        // shortcut: every face counts as a full square; use the surface shape if cut faces matter.
-        let (mut pts, dirs) = cell_points(tris, *pos, true).unwrap_or((Vec::new(), vec![v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)]));
-        for o in (0..6).filter(|o| sides >> o & 1 != 0) {
-            let (a, h) = (o / 2, if o % 2 == 0 { 0.5 } else { -0.5 });
-            for (u, w) in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)] {
-                let mut q = [0.0; 3];
-                (q[a], q[(a + 1) % 3], q[(a + 2) % 3]) = (h, u, w);
-                pts.push(v3(q[0], q[1], q[2]));
-            }
-        }
+        let (mut pts, dirs) = mesh.unwrap_or((Vec::new(), axes()));
+        sides_on.for_each(|o| pts.extend(square(o)));
         out.push(DefVoxel { pos: *pos, shape, rot, bounds: Some(hull(&pts, &dirs)), moving: false });
     }
     if out.is_empty() && !tris.is_empty() && !def.voxels.iter().any(|v| cell_points(tris, v.pos, true).is_some()) {
@@ -504,7 +529,7 @@ pub fn apply_mesh(def: &mut Def, tris: &[Tri], moving: &[Vec<Tri>], shapes: &cra
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
                     let pos = [x, y, z];
-                    if def.faced.contains_key(&pos) {
+                    if closed.contains(&pos) {
                         continue;
                     }
                     let own = physics.contains_key(&pos);
@@ -685,6 +710,9 @@ pub struct Library {
     rom: PathBuf,
     pub shapes: crate::shape::ShapeTable,
     bin_dirs: Vec<PathBuf>,
+    /// Mod part files by the definition name in their header. The game keys a mod part by that
+    /// name, not the file name, and it replaces a stock part of the same name.
+    named: HashMap<String, PathBuf>,
     cache: HashMap<String, Option<Arc<Def>>>,
 }
 
@@ -706,7 +734,24 @@ impl Library {
         // Vehicles carry the definitions of every mod part they use.
         push_children(appdata.join("data/vehicles"), "");
         let rom = game.join("rom/data/definitions");
-        Library { shapes: crate::shape::ShapeTable::from_rom(&rom), rom, bin_dirs, cache: HashMap::new() }
+        let mut named = HashMap::new();
+        for dir in &bin_dirs {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "bin")).collect();
+            files.sort();
+            for p in files {
+                let mut head = [0u8; 136];
+                let n = std::fs::File::open(&p).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+                if let Some(name) = bin_name(&head[..n]) {
+                    named.entry(name.to_string()).or_insert(p);
+                }
+            }
+        }
+        Library { shapes: crate::shape::ShapeTable::from_rom(&rom), rom, bin_dirs, named, cache: HashMap::new() }
+    }
+
+    /// Whether an installed mod part replaces the stock part of this name.
+    pub fn replaced_by_mod(&self, name: &str) -> bool {
+        self.named.contains_key(name)
     }
 
     pub fn get(&mut self, name: &str) -> Option<Arc<Def>> {
@@ -774,6 +819,11 @@ impl Library {
             }
             def
         };
+        if let Some(bytes) = self.named.get(name).and_then(|p| std::fs::read(p).ok()) {
+            if let Some(xml) = bin_xml(&bytes) {
+                return Some(finish(parse_def(xml), &bytes));
+            }
+        }
         if let Ok(text) = std::fs::read_to_string(self.rom.join(format!("{name}.xml"))) {
             return Some(finish(parse_def(&text), &[]));
         }
@@ -888,6 +938,20 @@ mod tests {
 
     /// Every installed definition: solid volume and cell count, for comparing voxelizer changes
     /// (`cargo test --release audit_defs -- --ignored --nocapture > out`).
+    #[test]
+    fn mod_part_replaces_stock_part_of_the_same_header_name() {
+        let root = std::env::temp_dir().join(format!("aero_named_{}", std::process::id()));
+        let (rom, mods) = (root.join("game/rom/data/definitions"), root.join("app/data/mods/m/data/components"));
+        std::fs::create_dir_all(&rom).unwrap();
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(rom.join("01_block_weight.xml"), r#"<definition mass="10"/>"#).unwrap();
+        let body = [&1u32.to_le_bytes()[..], b"01_block_weight\0", br#"<definition mass="50"/>"#].concat();
+        std::fs::write(mods.join("block_weight_50.bin"), [&(body.len() as u32).to_le_bytes()[..], &body].concat()).unwrap();
+        let mut lib = Library::new(&root.join("game"), &root.join("app"));
+        assert_eq!(lib.get("01_block_weight").unwrap().mass, 50.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[ignore]
     fn audit_defs() {

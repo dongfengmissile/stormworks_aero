@@ -27,6 +27,8 @@ pub struct Xsec {
     pub centroid: V3,
     pub second_deriv: f64,
     pub flatness: f64,
+    /// 1 where the slice fills its bounding box (a sharp-cornered box), 0 at a circle's π/4 or less.
+    pub square: f64,
     pub flat_normal: V3,
     pub cp_sonic_fwd: f64,
     pub cp_sonic_back: f64,
@@ -46,6 +48,10 @@ pub struct Section {
     visc_crossflow: f64,
     flatness: f64,
     inv_flatness: f64,
+    /// Sharp-cornered share of the section (`Xsec::square`) and the body's finite-length factor:
+    /// across the flow that share drags as a square prism, the rest as FAR's round cylinder.
+    square: f64,
+    eta: f64,
     hyp_moment_fwd: f64,
     hyp_moment_back: f64,
     diameter: f64,
@@ -68,6 +74,150 @@ pub struct BodyAero {
     /// Mach 1 wave drag area, m² (FAR `SonicDragArea`).
     pub sonic_drag_area: f64,
     pub sections: Vec<Section>,
+    /// Flat faces square to the axis (`blunt_faces`).
+    pub blunt: Blunt,
+    /// Wetted area times the form factor, m²: skin drag area per unit Cf.
+    skin_area: f64,
+}
+
+/// Flat faces square to the main axis that the outline first shows from the front and from the
+/// back: area m² and centre. FAR's area-rule curves treat such a step as a steep but smooth
+/// change of area: far too little drag when slow, too much near Mach 1. They drag by Hoerner's
+/// blunt-cylinder numbers instead (`blunt_face_cd`, `blunt_base_cd`).
+#[derive(Clone, Copy, Default)]
+pub struct Blunt {
+    pub front: f64,
+    pub back: f64,
+    front_at: V3,
+    back_at: V3,
+}
+
+/// Pressure drag on a flat face square to the flow, on its area. Hoerner, Fluid-Dynamic Drag:
+/// 0.74·(1 + 0.25 M²) subsonic (ch. XV eq. 10), 0.90 of the stagnation pressure from Mach 1 on
+/// (ch. XVI eq. 20). shortcut: a straight blend between Mach 0.7 and 1.
+pub fn blunt_face_cd(mach: f64) -> f64 {
+    let m2 = mach * mach;
+    let sub = |m2: f64| 0.74 * (1.0 + 0.25 * m2);
+    // Stagnation pressure coefficient behind a normal shock (Rayleigh pitot formula, γ = 1.4).
+    let sup = |m2: f64| 0.90 * ((1.2 * m2).powf(3.5) * (6.0 / (7.0 * m2 - 1.0)).powf(2.5) - 1.0) / (0.7 * m2);
+    if mach <= 0.7 {
+        sub(m2)
+    } else if mach >= 1.0 {
+        sup(m2)
+    } else {
+        let k = (mach - 0.7) / 0.3;
+        sub(0.49) * (1.0 - k) + sup(1.0) * k
+    }
+}
+
+/// Base drag behind a flat rear face, on its area. `fore`: the drag ahead of it (faces and skin)
+/// as a coefficient on the same area; `l_d`: body length over diameter. Hoerner: 0.029/√fore
+/// subsonic (ch. III eq. 34); about 0.2 transonic, then 0.6 of a vacuum, 0.6·2/(γM²) (ch. XVI
+/// 3a). A body shorter than its diameter has a plate's wake: disk 1.17 at no length, the long
+/// cylinder's 0.8 from l/d 1 (ch. III fig. 21). shortcut: straight blends in l/d and Mach 0.7-1.
+pub fn blunt_base_cd(mach: f64, fore: f64, l_d: f64) -> f64 {
+    let sub = (0.029 / fore.max(0.01).sqrt()).max(0.43 * (1.0 - l_d)).min(0.43);
+    let sup = (0.6 * 2.0 / (1.4 * mach * mach)).min(0.2f64.max(sub));
+    if mach <= 0.7 {
+        sub
+    } else if mach >= 1.0 {
+        sup
+    } else {
+        let k = (mach - 0.7) / 0.3;
+        sub * (1.0 - k) + 0.2f64.max(sub) * k
+    }
+}
+
+/// Share of a flat face's drag a step of `j` (0..1 of a cell, per slice) has: a full cell is a
+/// flat face, a quarter cell per slice (a 1x4 wedge, 14°) a sharp nose with none.
+/// shortcut: the curve between is a guess (a 45° wedge nose gets half); Hoerner ch. III fig. 34
+/// has cones and wedges by angle, as a plot.
+fn step_bluntness(j: f64) -> f64 {
+    j * ((j - 0.25) / 0.5).clamp(0.0, 1.0)
+}
+
+/// Drag of a small flat step on a body, as a share of the same face on a bare nose.
+/// shortcut: a guess. Hoerner ch. V figs. 9-10 give steps and joints in a boundary layer about
+/// 0.4 on their height, but as plots; Stormworks builds are all steps, so this sets their drag.
+const STEP_FACE: f64 = 0.4;
+
+/// Per slice (in `cross_sections` order, nose first) the blunt area facing forward and aft, and
+/// the totals. Each column of cells counts only where the outline first appears from that side:
+/// a step behind something larger sits in its wake.
+fn blunt_faces(g: &Grid, skip: &[bool]) -> (Vec<(f64, f64)>, Blunt) {
+    let nz = g.dims[2];
+    let mut per = vec![(0.0, 0.0); nz];
+    let mut b = Blunt::default();
+    // Filled area of each slice, to tell a nose from a step on a body that is already there.
+    let mut area = vec![0.0; nz];
+    for i in 0..g.owner.len() {
+        if g.owner[i] != EMPTY && !skip.get(i).copied().unwrap_or(false) {
+            let f = if g.owner[i] == crate::voxel::INTERIOR { 1.0 } else { g.fill[i].min(1.0) as f64 };
+            area[nz - 1 - (g.cell(i)[2] - g.min[2]) as usize] += f * VOXEL_M * VOXEL_M;
+        }
+    }
+    // A step on a body (an intake lip, a pylon front) meets air the body ahead has already turned
+    // aside: STEP_FACE of a nose's drag where the outline barely grows, all of it on a bare nose.
+    let step = |here: f64, beyond: f64| STEP_FACE + (1.0 - STEP_FACE) * (1.0 - beyond / here.max(1e-9)).clamp(0.0, 1.0);
+    for (i, a, front) in blunt_cells(g, skip) {
+        let c = g.cell(i);
+        let slice = nz - 1 - (c[2] - g.min[2]) as usize;
+        let beyond = if front { slice.checked_sub(1).map_or(0.0, |j| area[j]) } else { area.get(slice + 1).copied().unwrap_or(0.0) };
+        let a = a * step(area[slice], beyond);
+        if front {
+            per[slice].0 += a;
+            b.front += a;
+            b.front_at += aero_pos(c) * a;
+        } else {
+            per[slice].1 += a;
+            b.back += a;
+            b.back_at += aero_pos(c) * a;
+        }
+    }
+    if b.front > 0.0 {
+        b.front_at = b.front_at * (1.0 / b.front);
+    }
+    if b.back > 0.0 {
+        b.back_at = b.back_at * (1.0 / b.back);
+    }
+    (per, b)
+}
+
+/// The cells behind `blunt_faces`: (cell, blunt area m², facing forward).
+pub fn blunt_cells(g: &Grid, skip: &[bool]) -> Vec<(usize, f64, bool)> {
+    let [nx, ny, nz] = g.dims;
+    let cell_area = VOXEL_M * VOXEL_M;
+    let mut out = Vec::new();
+    for yi in 0..ny {
+        for xi in 0..nx {
+            let at = |zi: usize| xi + nx * (yi + ny * zi);
+            let fill = |zi: usize| {
+                let i = at(zi);
+                if g.owner[i] == EMPTY || skip.get(i).copied().unwrap_or(false) {
+                    0.0
+                } else if g.owner[i] == crate::voxel::INTERIOR {
+                    1.0
+                } else {
+                    g.fill[i].min(1.0) as f64
+                }
+            };
+            for front in [true, false] {
+                let mut seen = 0.0;
+                for k in 0..nz {
+                    let zi = if front { nz - 1 - k } else { k };
+                    let f = fill(zi);
+                    if f > seen {
+                        let a = step_bluntness(f - seen) * cell_area;
+                        if a > 0.0 {
+                            out.push((at(zi), a, front));
+                        }
+                        seen = f;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Flow state shared by every section of one evaluation.
@@ -86,6 +236,7 @@ impl BodyAero {
     /// belong to a body with its own model). Both may be empty.
     pub fn build(grid: &Grid, no_skin: &[bool], skip: &[bool]) -> BodyAero {
         let mut xs = cross_sections(grid, no_skin, skip);
+        let (blunt_per, blunt) = blunt_faces(grid, skip);
         let thickness = VOXEL_M;
         let filled: Vec<usize> = (0..xs.len()).filter(|&i| xs[i].area > 0.0).collect();
         let (front, back) = match (filled.first(), filled.last()) {
@@ -102,6 +253,8 @@ impl BodyAero {
                     critical_mach: 1.0,
                     sonic_drag_area: 0.0,
                     sections: Vec::new(),
+                    blunt,
+                    skin_area: 0.0,
                 }
             }
         };
@@ -118,15 +271,17 @@ impl BodyAero {
             critical_mach: 1.0,
             sonic_drag_area: 0.0,
             sections: Vec::new(),
+            blunt,
+            skin_area: 0.0,
         };
         let inner = [0, 1, 2].map(|a| (grid.dims[a] - 2) as f64);
         let voxel_volume = inner[0] * inner[1] * inner[2] * VOXEL_M.powi(3);
-        body.properties(voxel_volume, &mut max_area);
+        body.properties(voxel_volume, &mut max_area, &blunt_per);
         body
     }
 
     /// FAR `CalculateVesselAeroProperties` (minus intake ducting).
-    fn properties(&mut self, voxel_volume: f64, max_area: &mut f64) {
+    fn properties(&mut self, voxel_volume: f64, max_area: &mut f64, blunt_per: &[(f64, f64)]) {
         let (front, back, t) = (self.front, self.back, self.thickness);
         let num_sections = back - front;
         let length = t * num_sections as f64;
@@ -140,6 +295,17 @@ impl BodyAero {
         let extra_deriv = (((5.0 - fineness) * 0.5).round() as i32 * DERIV_SMOOTHING_PASSES).max(0);
         let extra_area = (((grid_filledness / 25.0 - 0.5) * 4.0).round() as i32).max(0);
 
+        // Share of each slice's area step that is a flat face (those drag by `blunt_face_cd`, so the
+        // area-rule pressure curves of the slices around it are scaled down by it).
+        let raw: Vec<f64> = self.xs.iter().map(|s| s.raw_area).collect();
+        let at = |i: isize| if i < 0 { 0.0 } else { raw.get(i as usize).copied().unwrap_or(0.0) };
+        let blunt_share: Vec<f64> = (0..raw.len() as isize)
+            .map(|i| {
+                let step = (at(i) - at(i - 1)).abs().max((at(i) - at(i + 1)).abs());
+                let (f, b) = blunt_per[i as usize];
+                if step > 0.0 { ((f + b) / step).min(1.0) } else { 0.0 }
+            })
+            .collect();
         gaussian_smooth(
             &mut self.xs,
             std_dev_cutoff,
@@ -158,7 +324,12 @@ impl BodyAero {
         // DATCOM 4.2.3.1 body form factor on each slice's own wetted area. FAR also divides
         // by the section count, which makes subsonic skin drag N times smaller than at Mach 2;
         // we keep the documented intent (see docs/DESIGN.md).
-        let viscous_drag_factor = 60.0 / fineness.powi(3) + 0.0025 * fineness + 1.0;
+        // Below a fineness of about 2 the formula runs away (60/f³: a cube's skin drag ×200).
+        let ff = fineness.max(2.0);
+        // Its 60/f³ is the pressure drag of a rounded shape: not for the share that is flat faces.
+        let rounded = 1.0 - ((self.blunt.front + self.blunt.back) / (2.0 * *max_area).max(1e-9)).min(1.0);
+        let viscous_drag_factor = 60.0 / ff.powi(3) * rounded + 0.0025 * ff + 1.0;
+        self.skin_area = self.xs[front..=back].iter().map(|s| s.surface).sum::<f64>() * viscous_drag_factor;
         let crit = critical_mach_number(fineness) * self.crit_factor_unsmooth(fineness);
         self.critical_mach = crit;
         // FAR: `blendFactor = lowFinenessRatioFactor--` keeps the value BEFORE the decrement, so
@@ -168,6 +339,9 @@ impl BodyAero {
         let low_fineness = 1.0 / (1.0 + 0.5 * fineness);
         let blend = 1.0 + low_fineness;
 
+        // Flow round the ends relieves a short body's wake. shortcut: Spera's factor for flat plates by
+        // aspect ratio (NASA/CR-2008-215434 eq. 4a) stands in for prisms; Jorgensen's η is a plot.
+        let eta = 0.60 + 0.40 * (-20.0 / fineness.max(1e-3)).exp();
         let main_axis = v3(1.0, 0.0, 0.0);
         let mut sections: Vec<Section> = Vec::new();
         for i in 0..=num_sections {
@@ -241,6 +415,11 @@ impl BodyAero {
             sonic180 *= 1.0 - blend;
             sonic180 += (-hyp_back * back_frac * 1.4 + base_s180) * blend;
 
+            // The smoothing spreads a step over its neighbours: the bluntest of the slices within two.
+            let keep = 1.0 - (index.saturating_sub(2)..=(index + 2).min(blunt_share.len() - 1)).map(|k| blunt_share[k]).fold(0.0, f64::max);
+            let (k0_fwd, k0_back, hyp_fwd, hyp_back) = (k0_fwd * keep, k0_back * keep, hyp_fwd * keep, hyp_back * keep);
+            sonic0 *= keep;
+            sonic180 *= keep;
             let d0 = sonic0.abs() - hyp_fwd.abs();
             let d180 = sonic180.abs() - hyp_back.abs();
             let aoa0 = Curve(vec![
@@ -290,6 +469,8 @@ impl BodyAero {
                 visc_crossflow,
                 flatness,
                 inv_flatness: 1.0 / flatness,
+                square: xs[index].square,
+                eta,
                 hyp_moment_fwd,
                 hyp_moment_back,
                 diameter: visc_crossflow / t,
@@ -341,6 +522,31 @@ impl BodyAero {
             force += f;
             torque += t + r.cross(f);
         }
+        // Flat faces square to the axis: the ones facing the flow, and the base behind.
+        let b = &self.blunt;
+        let x = v3(1.0, 0.0, 0.0);
+        let (face, face_at, base, base_at) = if air_vel.x < 0.0 { (b.front, b.front_at, b.back, b.back_at) } else { (b.back, b.back_at, b.front, b.front_at) };
+        for (area, at_p, is_face) in [(face, face_at, true), (base, base_at, false)] {
+            if area <= 0.0 {
+                continue;
+            }
+            let r = at_p - com;
+            let vel = -air_vel + omega.cross(r);
+            let speed2 = vel.dot(vel);
+            if speed2 < 1e-12 {
+                continue;
+            }
+            let cos = vel.x / speed2.sqrt();
+            let cd = if is_face {
+                blunt_face_cd(flow.mach)
+            } else {
+                let fore = (face * blunt_face_cd(flow.mach) + flow.cf * self.skin_area) / area;
+                blunt_base_cd(flow.mach, fore, self.length.max(self.thickness) / (4.0 * self.max_area.max(area) / PI).sqrt())
+            };
+            let f = x * (-cos.signum() * cos * cos * cd * area * 0.5 * rho * speed2);
+            force += f;
+            torque += r.cross(f);
+        }
         (force, torque)
     }
 }
@@ -367,6 +573,7 @@ impl Section {
         self.hyp_moment_back += o.hyp_moment_back;
         self.flatness = inv * (self.flatness * m + o.flatness);
         self.inv_flatness = inv * (self.inv_flatness * m + o.inv_flatness);
+        self.square = inv * (self.square * m + o.square);
         self.diameter = inv * (self.diameter * m + o.diameter);
         self.xforce_aoa0.add(&o.xforce_aoa0);
         self.xforce_aoa180.add(&o.xforce_aoa180);
@@ -404,7 +611,11 @@ impl Section {
         let nff = self.inv_flatness * (1.0 - nff) + self.flatness * nff;
         let cf_mach = mach * sin;
         let cf_re = flow.reynolds_per_m * self.diameter * sin / nff;
-        n_force += self.visc_crossflow * sin2 * crossflow_drag(cf_mach, cf_re);
+        // Sharp corners fix the separation: 2.05 against the round cylinder's 1.2, and no drop at
+        // high Reynolds numbers (Jorgensen, NASA TR R-474 table 1). Same rise with Mach.
+        // (√π/2: `visc_crossflow` takes the width of a circle of the slice's area, a square is narrower.)
+        let sharp = 2.05 / 1.2 * crossflow_mach(cf_mach) * self.eta * 0.886;
+        n_force += self.visc_crossflow * sin2 * (crossflow_drag(cf_mach, cf_re) * (1.0 - self.square) + sharp * self.square);
         n_force *= nff;
 
         let mut x_force = -skin_force * cos.signum() * cos2;
@@ -450,8 +661,9 @@ impl Section {
     }
 }
 
-pub(crate) fn crossflow_drag(mach: f64, re: f64) -> f64 {
-    let mach_curve = Curve(vec![
+/// Crossflow drag of a round cylinder against the crossflow Mach number, below the drag crisis.
+fn crossflow_mach(mach: f64) -> f64 {
+    Curve(vec![
         [0.0, 1.2, 0.0],
         [0.3, 1.2, 0.0],
         [0.7, 1.5, 0.0],
@@ -462,9 +674,15 @@ pub(crate) fn crossflow_drag(mach: f64, re: f64) -> f64 {
         [2.0, 1.4, -0.1],
         [5.0, 1.25, -0.02],
         [10.0, 1.2, 0.0],
-    ]);
-    if mach > 0.5 {
-        return mach_curve.eval(mach);
+    ])
+    .eval(mach)
+}
+
+pub(crate) fn crossflow_drag(mach: f64, re: f64) -> f64 {
+    // The low drag of high Reynolds numbers is gone by Mach 0.75 (Hoerner, Fluid-Dynamic Drag
+    // ch. XV, circular cylinder). FAR ended it between Mach 0.4 and 0.5: a step in gear drag.
+    if mach > 0.75 {
+        return crossflow_mach(mach);
     }
     // shortcut: the 250000 key's slope is a central difference (KSP's auto tangent is not in the repo).
     let re_curve = Curve(vec![
@@ -477,8 +695,8 @@ pub(crate) fn crossflow_drag(mach: f64, re: f64) -> f64 {
         [1000000.0, 0.333_333_333_333_333_3, 7e-8],
         [10000000.0, 0.583_333_333_333_333_4, 0.0],
     ]);
-    let influence = if mach > 0.4 { 1.0 - (mach - 0.4) * 10.0 } else { 1.0 };
-    ((re_curve.eval(re) - 1.0) * influence + 1.0) * mach_curve.eval(mach)
+    let influence = if mach > 0.5 { 1.0 - (mach - 0.5) * 4.0 } else { 1.0 };
+    ((re_curve.eval(re) - 1.0) * influence + 1.0) * crossflow_mach(mach)
 }
 
 /// Rotate `v` by the shortest rotation taking unit `from` to unit `to`.
@@ -503,6 +721,7 @@ fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
         let z = g.min[2] + zi as i32;
         let mut s = Xsec { x: z as f64 * VOXEL_M, ..Default::default() };
         let (mut cnt, mut sy, mut sz) = (0.0, 0.0, 0.0);
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
         let mut pts: Vec<(f64, f64, f64)> = Vec::new();
         let mut exposed = 0.0;
         for yi in 0..ny {
@@ -518,6 +737,7 @@ fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
                 sy += p.y * f;
                 sz += p.z * f;
                 pts.push((p.y, p.z, f));
+                (lo, hi) = ([lo[0].min(p.y), lo[1].min(p.z)], [hi[0].max(p.y), hi[1].max(p.z)]);
                 if no_skin.get(i).copied().unwrap_or(false) {
                     continue;
                 }
@@ -552,6 +772,8 @@ fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool]) -> Vec<Xsec> {
             };
             s.flat_normal = v3(0.0, ey, ez).norm();
             s.flatness = (l1 / l2).sqrt().sqrt().min(10.0);
+            let bbox = (hi[0] - lo[0] + VOXEL_M) * (hi[1] - lo[1] + VOXEL_M);
+            s.square = ((cnt * cell_area / bbox - PI / 4.0) / (1.0 - PI / 4.0)).clamp(0.0, 1.0);
         } else {
             s.centroid = v3(s.x, 0.0, 0.0);
         }

@@ -44,6 +44,7 @@ Logs go to:
 | key | |
 |---|---|
 | F7 | analysis window: AoA / Mach sweeps, stability derivatives, response simulation, area ruling, voxel view, the pitch / collective for each propeller and rotor's maximum thrust |
+| F8 | in flight: list of every vehicle the plugin is simulating, nearest first (distance, speed, altitude, mass, part count), with a Watch button that moves the camera to that vehicle so you can follow missiles, drones and other aircraft. Close the list to orbit with the mouse, "Back to me" returns the camera |
 | F9 | in flight: flight data (airspeed, Mach, AoA, Cl, Cd, L/D, thrust, air density, static margin…, and each propeller's RPS, thrust, power and vortex ring state), lift/drag arrows, CG / CoL / CoT markers, stalled blocks painted red |
 
 ## Credits

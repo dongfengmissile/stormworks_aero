@@ -332,6 +332,8 @@ pub struct Model {
     /// column, whether its hull fills any cell along the length.
     pub main_body: usize,
     pub silhouette: Vec<bool>,
+    /// Cells the main fuselage model leaves out (wing panels, bodies with their own model).
+    pub body_skip: Vec<bool>,
 }
 
 /// A body without lifting panels (a landing gear leg, a door, anything on a pivot) as its own
@@ -347,6 +349,9 @@ pub struct Bluff {
     mid: V3,
     /// Solid volume, m³: a body too short to slice drags as a lump of this size.
     volume: f64,
+    /// A body one cell thick (an airbrake, a door): its grid normal axis, face area m² and aspect
+    /// ratio. Across it, it drags as a flat plate, not as the slices of a fuselage.
+    plate: Option<(usize, f64, f64)>,
 }
 
 impl Bluff {
@@ -939,7 +944,8 @@ impl Model {
                     .collect();
                 let mut seen = std::collections::HashSet::new();
                 cells.retain(|x| seen.insert(*x));
-                if let Some(mut p) = crate::wing::plate_panel(&pts, cells, Role::None, com) {
+                let tris: Vec<[V3; 3]> = piece.iter().map(|t| t.0.map(|q| c.part_to_aero(q))).collect();
+                if let Some(mut p) = crate::wing::plate_panel(&pts, &tris, cells, Role::None, com) {
                     p.foil = des.foils.get(&c.pos).copied().unwrap_or(des.default_fin.unwrap_or(crate::wing::FIN_DEFAULT));
                     let live = ctrl.map(|f| FinLive { comp: *i, src: LiveSrc::Rocket { a: f.a }, sign: live_sign(c, &p, f.axis, false) });
                     panels.push(p);
@@ -996,10 +1002,24 @@ impl Model {
                 for &c in &cells {
                     skip[c] = !silhouette[c % column];
                 }
-                Bluff { body, cells, axis, aero, mid, volume }
+                // shortcut: only one-cell-thick bodies count as plates; thicker slabs keep the slice model.
+                let thin: Vec<usize> = (0..3).filter(|&a| extent(a) == 0).collect();
+                let plate = match thin[..] {
+                    [n] if extent((n + 1) % 3) > 0 && extent((n + 2) % 3) > 0 => {
+                        let area = at.iter().map(|p| (p[(n + 1) % 3], p[(n + 2) % 3])).collect::<HashSet<_>>().len() as f64 * VOXEL_M * VOXEL_M;
+                        Some((n, area, (extent((n + 1) % 3) + 1) as f64 / (extent((n + 2) % 3) + 1) as f64))
+                    }
+                    _ => None,
+                };
+                Bluff { body, cells, axis, aero, mid, volume, plate }
             })
             .collect();
         bluff.sort_by_key(|b| b.body);
+        // Wing panel cells are the wing model's alone: as fuselage volume too, a wing of square
+        // blocks dragged as a blunt slab whatever its aerofoil, and twice when broadside.
+        for (s, &w) in skip.iter_mut().zip(&no_skin) {
+            *s |= w;
+        }
         let body = BodyAero::build(&grid, &no_skin, &skip);
 
         let s: f64 = panels.iter().map(|p| p.area).sum();
@@ -1080,7 +1100,7 @@ impl Model {
                 _ => 0,
             })
             .collect();
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette }
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette, body_skip: skip }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -1265,11 +1285,13 @@ impl Model {
         let mut out = Vec::new();
         for bl in &self.bluff {
             let Some(lb) = bodies.get(bl.body) else { continue };
-            let open: Vec<V3> = bl.cells.iter().map(|&c| lb.to_world(aero_pos(self.grid.cell(c)))).filter(|&w| !shielded(w)).collect();
-            if open.is_empty() {
+            let open: Vec<(V3, f64)> = bl.cells.iter().map(|&c| (lb.to_world(aero_pos(self.grid.cell(c))), self.grid.fill[c] as f64)).filter(|&(w, _)| !shielded(w)).collect();
+            // By filled volume, not cell count: a thin plate left flush outside the outline is nearly no drag.
+            let open_fill: f64 = open.iter().map(|o| o.1).sum();
+            if !(open_fill > 0.0) {
                 continue;
             }
-            let point = open.iter().fold(V3::ZERO, |a, &w| a + w) * (1.0 / open.len() as f64);
+            let point = open.iter().fold(V3::ZERO, |a, &(w, f)| a + w * f) * (1.0 / open_fill);
             let v = lb.vel + lb.omega.cross(point - lb.com) - lb.wind;
             let speed = v.len();
             if !(speed >= 1.0) || !speed.is_finite() {
@@ -1290,7 +1312,19 @@ impl Model {
                 let [x, y, z] = unturn([f.x, f.y, f.z], bl.axis);
                 lb.dir_to_world(grid_to_aero(v3(x, y, z)))
             };
-            out.push((bl.body, force * (open.len() as f64 / bl.cells.len() as f64), point));
+            let force = match bl.plate {
+                // Keep the slice model's force along the face (friction), swap the one across it for a
+                // flat plate's normal force, Cn = Cd90·sin α (Hoerner's post-stall plate).
+                Some((axis, area, ar)) => {
+                    let mut e = [0.0; 3];
+                    e[axis] = 1.0;
+                    let n = lb.grid_dir_to_world(v3(e[0], e[1], e[2]));
+                    let along = force - n * force.dot(n);
+                    along - n * (0.5 * at.rho * speed * v.dot(n) * area * crate::wing::flat_plate_cd(mach, ar))
+                }
+                None => force,
+            };
+            out.push((bl.body, force * (open_fill / bl.cells.iter().map(|&c| self.grid.fill[c] as f64).sum::<f64>()), point));
         }
         out
     }
@@ -1666,8 +1700,9 @@ mod tests {
             let alpha = 0.2;
             // The fin piece whose rest panel is this one (same normal and centroid).
             let fit = |rot: f64, ctrl: crate::defs::FinCtrl, piece: &[crate::defs::Tri]| {
-                let pts: Vec<V3> = piece.iter().flat_map(|t| t.0).map(|q| c.part_to_aero(game_axis_angle(q, ctrl.axis, rot))).collect();
-                crate::wing::plate_panel(&pts, vec![0], Role::None, m.com).unwrap()
+                let tris: Vec<[V3; 3]> = piece.iter().map(|t| t.0.map(|q| c.part_to_aero(game_axis_angle(q, ctrl.axis, rot)))).collect();
+                let pts: Vec<V3> = tris.iter().flatten().copied().collect();
+                crate::wing::plate_panel(&pts, &tris, vec![0], Role::None, m.com).unwrap()
             };
             let (piece, ctrl) = d
                 .plates

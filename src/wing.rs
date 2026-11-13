@@ -53,7 +53,8 @@ pub struct Aerofoil {
     pub t_c: f64,
     /// Section Cl at zero angle of attack (camber); fades out by Mach 1.2.
     pub cl0: f64,
-    /// Max section lift coefficient: sets the stall angle (FAR uses 1.6).
+    /// Max section lift coefficient: sets the stall angle. FAR uses 1.6 for everything; a thin
+    /// section reaches about 0.9 (NACA 64A006: 0.89 at Reynolds 5.8 million, NACA TN 1923).
     pub cl_max: f64,
     /// Korn technology factor: drag-divergence Mach = κ − t/c at zero lift (0.87 conventional, 0.95 supercritical).
     pub kappa: f64,
@@ -83,7 +84,7 @@ impl Aerofoil {
 /// Selectable sections. The first is FAR's: its drag rise at Mach 0.8 and supersonic wave drag
 /// 0.009216/β are those of a ~4 % symmetric section.
 pub const AEROFOILS: [Aerofoil; 14] = [
-    Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. A safe all-round choice.", t_c: 0.0416, cl0: 0.0, cl_max: 1.6, kappa: 0.8416, k_wave: 16.0 / 3.0, kind: FoilKind::Wing },
+    Aerofoil { id: "far", name: "Default (thin, symmetric)", note: "The built-in shape: thin and symmetrical, no lift at zero angle. Low drag, but it stalls at a modest angle.", t_c: 0.0416, cl0: 0.0, cl_max: 0.9, kappa: 0.8416, k_wave: 16.0 / 3.0, kind: FoilKind::Wing },
     Aerofoil { id: "naca4415", name: "NACA 4415 (high lift, slow flight)", note: "Thick and strongly curved: lots of lift at low speed, but it stalls early and drags a lot when fast.", t_c: 0.15, cl0: 0.45, cl_max: 1.75, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
     Aerofoil { id: "naca2412", name: "NACA 2412 (light aircraft)", note: "Moderate curve and thickness: the usual light-aircraft wing, easy to fly.", t_c: 0.12, cl0: 0.24, cl_max: 1.6, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
     Aerofoil { id: "naca23015", name: "NACA 23015 (warbird)", note: "Old warbird wing: thick with little curve, so a high maximum lift without much lift at zero angle.", t_c: 0.15, cl0: 0.12, cl_max: 1.65, kappa: 0.87, k_wave: 8.0, kind: FoilKind::Wing },
@@ -364,11 +365,27 @@ pub fn extents(pts: &[V3]) -> Option<[f64; 3]> {
     }))
 }
 
+/// The plane between a thick fin's two sides: the area-weighted normal of the triangles facing
+/// about `n0`, each turned to agree with it. A wedge fin (thick root, blunt trailing edge) tilts a
+/// vertex fit by a fraction of a degree, a cant that rolls a missile with four of them.
+pub fn side_normal(tris: &[[V3; 3]], n0: V3) -> Option<V3> {
+    let sum = tris.iter().fold(V3::ZERO, |acc, t| {
+        let c = (t[1] - t[0]).cross(t[2] - t[0]);
+        let len = c.len();
+        if len < 1e-12 || (c.dot(n0) / len).abs() < 0.95 {
+            return acc;
+        }
+        acc + if c.dot(n0) < 0.0 { -c } else { c }
+    });
+    (sum.len() > 1e-12).then(|| sum.norm())
+}
+
 /// Lifting panel straight from a flat mesh piece (a missile fin, aero frame metres): plane fit
-/// to its vertices, planform from their outline. For fins far smaller than a voxel.
-pub fn plate_panel(pts: &[V3], cells: Vec<usize>, role: Role, com: V3) -> Option<Panel> {
+/// to its vertices (or to its sides, `tris`, when it has them), planform from their outline.
+/// For fins far smaller than a voxel.
+pub fn plate_panel(pts: &[V3], tris: &[[V3; 3]], cells: Vec<usize>, role: Role, com: V3) -> Option<Panel> {
     let (axes, mean) = principal(pts)?;
-    let n = axes[0];
+    let n = side_normal(tris, axes[0]).filter(|s| s.dot(axes[0]) > 0.98).unwrap_or(axes[0]);
     let fwd = v3(1.0, 0.0, 0.0);
     if n.x.abs() > 0.9 {
         return None; // faces the flow: no chord
@@ -757,7 +774,10 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
         normals[i] = (p.n * th.cos() + p.u * th.sin()).norm();
         let v = vel(i, p.centroid);
         let vn = v.norm();
-        let pl = v.reject(normals[i]).norm();
+        let pl = match v.reject(normals[i]).norm() {
+            V3::ZERO => p.u,
+            d => d,
+        };
         let (ls, cos_sweep) = subsonic_lift_slope(p, flow.mach, pl);
         let af = &AEROFOILS[p.foil.min(AEROFOILS.len() - 1)];
         raw[i] = Raw {
@@ -829,11 +849,11 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
             continue;
         }
         let vn = v * (1.0 / speed);
-        let pl = v.reject(n).norm();
-        if pl == V3::ZERO {
-            out.push(PanelForce { force: V3::ZERO, at: p.centroid, cl: 0.0, cd: 0.0, cd_induced: 0.0 });
-            continue;
-        }
+        // Flow straight onto the face has no in-plane direction: any one gives the same pure drag.
+        let pl = match v.reject(n).norm() {
+            V3::ZERO => p.u,
+            d => d,
+        };
         let perp = n.cross(pl).norm();
         let lift_dir = perp.cross(v).norm();
         let r = raw[i];
@@ -899,13 +919,14 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
         let tan_sweep = (1.0 - cos_sweep * cos_sweep).clamp(0.0, 1.0).sqrt() / cos_sweep.max(1e-6);
         let cd0_own = cd_compressibility(mach, cos_sweep, af);
         let cd0 = if up_infl > 0.99 { up_cd0 } else { cd0_own * (1.0 - up_infl.min(1.0)) + up_cd0 } + 2.0 * cf;
-        let cd_max = cd_max_flat_plate(mach, beta);
+        let cd_max = flat_plate_cd(mach, p.ar);
         let e = oswald(p.ar, cos_sweep, cd0, p.taper);
         let pi_ar_e = p.ar * e * PI;
         let cos_a = alpha.cos();
         let sin_a = (1.0 - cos_a * cos_a).clamp(0.0, 1.0).sqrt();
         let sgn = alpha.signum();
 
+        let lift_slope = lift_slope * rounded(a, aoa_max);
         let (mut cl, mut cd, cdi);
         if mach <= 0.8 {
             cl = lift_slope * cos_a * sgn * sin_a + cl_inc;
@@ -917,7 +938,11 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
             // supersonic Stormworks builds need it.
             let sup = |m: f64| {
                 let bt = (m * m - 1.0).max(0.44).sqrt();
-                4.0 / bt * sin_a * le_factor(p.ar, bt, tan_sweep)
+                // Tip Mach cones of a finite wing (linear theory, rectangular: 1 − 1/(2βA) for βA ≥ 1),
+                // by how much tip there is. shortcut: below βA 1 a straight run to the slender wing's πA/2.
+                let ba = bt * p.ar;
+                let tips = if ba >= 1.0 { 1.0 - 0.5 / ba } else { ba * (PI / 2.0 + (2.0 - PI / 2.0) * ba) / 4.0 };
+                4.0 / bt * sin_a * le_factor(p.ar, bt, tan_sweep) * (1.0 - (1.0 - tips) * p.taper.clamp(0.0, 1.0))
             };
             if mach <= 1.4 {
                 let sc = -(125.0 / 27.0) * (((2.0 * mach - 6.6) * mach + 6.72) * mach - 2.176);
@@ -935,13 +960,27 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
             }
             cd = cdi + cd0;
         }
+        // Vortex lift of slender wings (Polhamus' leading-edge suction analogy, NASA TN D-3767 eq. 15):
+        // the lost edge suction turns into a normal force Kv·sin²α, Kv ≈ π, so lift Kv·cos α·sin²α and
+        // drag Kv·sin³α (his CD ≈ CL·tan α). Subsonic, like camber.
+        // Lamar (NASA TR R-428): with the side edges' share the total stays near π, and predicts the
+        // lift of round-edged rectangular wings of aspect ratio 0.5 to 2 well. The vortices burst
+        // near 30° (Wentz & Kohlman: 29° on a 70° delta).
+        // shortcut: the fades from aspect ratio 2 to 3 and from 25° to 35° are guesses.
+        let vortex = PI * sin_a * sin_a * (3.0 - p.ar).clamp(0.0, 1.0) * ((0.61 - alpha.abs()) / 0.175).clamp(0.0, 1.0) * camber_fade(mach);
+        cl += vortex * cos_a * sgn;
+        cd += vortex * sin_a;
         let mut at = p.centroid + pl * ac_offset(mach, p.mac, cos_sweep, cos_a);
         if st > 0.0 {
             at -= pl * (0.75 / 1.6 * p.mac * cl.abs() * st * cos_a);
         }
-        cl *= 1.0 - 0.769 * st;
-        cd *= 1.0 + 3.0 * st;
-        cd = cd.max(cd_max * (1.0 - cos_a * cos_a));
+        // Stalled: a flat plate's normal force, CN = Cd90·sin α / (0.56 + 0.44 sin α). With Cd90 = 1.8
+        // it is within 0.06 of the NACA 0012 CL and CD measured from 30° to 90° (Sheldahl & Klimas,
+        // SAND80-2114, table 2). FAR instead scaled the unstalled lift and drag (×0.23, ×4): about half
+        // the lift and twice the drag at 30°.
+        let cn = cd_max * sin_a / (0.56 + 0.44 * sin_a);
+        cl += (cn * cos_a * sgn - cl) * st;
+        cd += (cn * sin_a + cd0 - cd) * st;
         cl *= p.interference;
         let q = 0.5 * flow.rho * speed * speed;
         let force = (lift_dir * cl - vn * cd) * (q * p.area);
@@ -991,8 +1030,27 @@ fn camber_fade(mach: f64) -> f64 {
     ((1.2 - mach) / 0.4).clamp(0.0, 1.0)
 }
 
+/// Share of the stall angle from which the lift curve bends over. Measured: 0.55 on a 6 % section
+/// (NACA 64A006: bends at 5°, peak 0.89 at 9°, NACA TN 1923), 0.71 at 18 % (63-018: 10° and 14°,
+/// NACA TN 2502). shortcut: one figure for every section; a 12 % one stays straight and breaks sharply.
+const ROUND_FROM: f64 = 0.65;
+
+/// What is left of the straight-line lift at angle `a`: a parabola from `ROUND_FROM` of the stall
+/// angle, level at the stall angle.
+fn rounded(a: f64, aoa_max: f64) -> f64 {
+    let from = ROUND_FROM * aoa_max;
+    let over = a.min(aoa_max) - from;
+    if over <= 0.0 || a <= 0.0 {
+        return 1.0;
+    }
+    (a.min(aoa_max) - over * over / (2.0 * (aoa_max - from))) / a
+}
+
 fn aoa_max(mach: f64, lift_slope: f64, cl_max: f64) -> f64 {
-    let tmp = cl_max / lift_slope;
+    // Slender wings: cl_max / slope runs past 60°, but their vortex lift breaks down near 30°
+    // (Polhamus: the analogy holds to 20-25° at AR 0.5-2). shortcut: 30° is a round figure.
+    // ×2/(1+ROUND_FROM): the rounded top (`rounded`) reaches cl_max later than a straight line would.
+    let tmp = (cl_max / lift_slope * 2.0 / (1.0 + ROUND_FROM)).min(0.52 * (cl_max / 1.6).max(1.0));
     if mach < 0.8 {
         tmp
     } else if mach > 1.4 {
@@ -1062,6 +1120,16 @@ fn cd_compressibility(mach: f64, cos_sweep: f64, af: &Aerofoil) -> f64 {
         inc = inc * s + (1.0 - s) * sup;
     }
     inc
+}
+
+/// Drag of a flat plate square to the flow: FAR's Mach curve (2.0 when slow, an endless plate),
+/// scaled to the plate's aspect ratio by Spera's fit to Hoerner's and Binder's plates,
+/// Cd90 = 1.98·(0.60 + 0.40·e^(−20/AR)) (NASA/CR-2008-215434 eq. 4a): 1.19 square, 1.98 endless.
+pub fn flat_plate_cd(mach: f64, ar: f64) -> f64 {
+    let beta = (mach * mach - 1.0).sqrt().max(0.663_324_958_07);
+    let ar = ar.max(1e-3);
+    let ar = ar.max(1.0 / ar);
+    cd_max_flat_plate(mach, if beta.is_nan() { 0.663_324_958_07 } else { beta }) * (0.60 + 0.40 * (-20.0 / ar).exp())
 }
 
 fn cd_max_flat_plate(mach: f64, beta: f64) -> f64 {
@@ -1321,5 +1389,23 @@ mod tests {
         for p in &panels {
             assert!((p.ar - 5.5).abs() < 1e-9, "whole-wing AR 5.5, got {} (b {})", p.ar, p.b);
         }
+    }
+}
+
+#[cfg(test)]
+mod side_normal_tests {
+    use super::*;
+
+    #[test]
+    fn wedge_fin_mid_plane_has_no_cant() {
+        // A fin in the x-z plane (flow along x), 10 mm thick at the root (z = 0) and 2 mm at the
+        // tip (z = 0.2): its two sides lean in opposite ways; their mid-plane is y = 0.
+        let side = |y: f64, flip: bool| {
+            let (a, b, c, d) = (v3(0.0, y * 1.0, 0.0), v3(0.3, y * 1.0, 0.0), v3(0.3, y * 0.2, 0.2), v3(0.0, y * 0.2, 0.2));
+            if flip { [[a, c, b], [a, d, c]] } else { [[a, b, c], [a, c, d]] }
+        };
+        let tris: Vec<[V3; 3]> = side(0.005, false).into_iter().chain(side(-0.005, true)).collect();
+        let n = side_normal(&tris, v3(0.0, 1.0, 0.0)).unwrap();
+        assert!((n.y - 1.0).abs() < 1e-9 && n.x.abs() < 1e-9, "{n:?}");
     }
 }

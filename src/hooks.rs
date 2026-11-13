@@ -109,6 +109,7 @@ unsafe extern "system" fn set_damping_detour(scene: usize, obj: usize, linear: f
         return;
     };
     if crate::flight::flies_obj(obj) {
+        crate::flight::touch(obj, 2);
         original(scene, obj, 0.0, 0.0);
     } else {
         original(scene, obj, linear, angular);
@@ -123,6 +124,7 @@ unsafe extern "system" fn air_node_detour(ctx: usize, a2: usize, a3: usize, a4: 
     let body = (ctx as *const usize).read().wrapping_sub(OFF_BODY_AIR_RECORDS);
     let obj = ((body + OFF_BODY_PHYS_OBJ) as *const usize).read();
     if obj != 0 && crate::flight::flies_obj(obj) {
+        crate::flight::touch(obj, 4);
         return;
     }
     if let Some(original) = ORIGINAL_AIR_NODE.get() {
@@ -197,11 +199,91 @@ pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
     } else {
         log_line(&format!("matrix_interp_prev_cur prologue mismatch at {interp:#x}; arrows use a linear blend"));
     }
+    install_watch_hooks();
+    install_watch_lod_hook();
+    install_cursor_hook();
     install_paint_hook();
     install_tint_hooks();
     install_blur_hooks();
     log_line(&format!("camera hook installed ({at:#x})"));
     Ok(())
+}
+
+/// Watch camera: both hooks or neither (a skipped status without the step would freeze nothing,
+/// but the step alone would turn the player with the orbit).
+unsafe fn install_watch_hooks() {
+    use crate::watch::*;
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    if !prologues_match(base) {
+        log_line("camera controller prologue mismatch; watch camera off");
+        return;
+    }
+    let at = |rva: usize| (base + rva) as *mut c_void;
+    let (step, status, sync, look) = (at(RVA_CAMERA_STEP), at(RVA_CAMERA_STATUS), at(RVA_CAMERA_SYNC), at(RVA_MOUSE_LOOK_ALLOWED));
+    let made = (|| {
+        Ok::<_, minhook::MH_STATUS>((
+            MinHook::create_hook(step, step_detour as *mut c_void)?,
+            MinHook::create_hook(status, status_detour as *mut c_void)?,
+            MinHook::create_hook(sync, sync_detour as *mut c_void)?,
+            MinHook::create_hook(look, look_detour as *mut c_void)?,
+        ))
+    })();
+    match made {
+        Ok((a, b, c, d)) => {
+            let _ = ORIGINAL_STEP.set(std::mem::transmute::<*mut c_void, CameraStep>(a));
+            let _ = ORIGINAL_STATUS.set(std::mem::transmute::<*mut c_void, CameraStatus>(b));
+            let _ = ORIGINAL_SYNC.set(std::mem::transmute::<*mut c_void, CameraSync>(c));
+            let _ = ORIGINAL_LOOK.set(std::mem::transmute::<*mut c_void, MouseLookAllowed>(d));
+            match MinHook::enable_hook(status).and_then(|_| MinHook::enable_hook(look)).and_then(|_| MinHook::enable_hook(sync)).and_then(|_| MinHook::enable_hook(step)) {
+                Ok(()) => {
+                    AVAILABLE.store(true, Ordering::Relaxed);
+                    log_line("watch camera hooks installed");
+                }
+                Err(e) => log_line(&format!("enable watch camera hooks: {e:?}")),
+            }
+        }
+        Err(e) => log_line(&format!("create watch camera hooks: {e:?}")),
+    }
+}
+
+/// Watched vehicle keeps its part detail far from the player; failure only loses that.
+unsafe fn install_watch_lod_hook() {
+    use crate::watch::*;
+    let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_BUILD_FRAME;
+    if !bytes_match(at, &BUILD_FRAME_PROLOGUE) {
+        log_line(&format!("build_frame prologue mismatch at {at:#x}; watched vehicles lose part detail past 750 m"));
+        return;
+    }
+    match MinHook::create_hook(at as *mut c_void, build_frame_detour as *mut c_void) {
+        Ok(o) => {
+            let _ = ORIGINAL_BUILD_FRAME.set(std::mem::transmute::<*mut c_void, BuildFrame>(o));
+            match MinHook::enable_hook(at as *mut c_void) {
+                Ok(()) => log_line("watch detail hook installed"),
+                Err(e) => log_line(&format!("enable build_frame hook: {e:?}")),
+            }
+        }
+        Err(e) => log_line(&format!("create build_frame hook: {e:?}")),
+    }
+}
+
+/// Free cursor for the F8 list; failure only leaves the list unclickable in mouse-look.
+unsafe fn install_cursor_hook() {
+    use crate::watch::*;
+    let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_SET_CURSOR_DISABLED;
+    if !bytes_match(at, &SET_CURSOR_DISABLED_PROLOGUE) {
+        log_line(&format!("set_cursor_disabled prologue mismatch at {at:#x}; F8 list keeps the game's cursor"));
+        return;
+    }
+    match MinHook::create_hook(at as *mut c_void, set_cursor_detour as *mut c_void) {
+        Ok(o) => {
+            let _ = ORIGINAL_SET_CURSOR.set(std::mem::transmute::<*mut c_void, SetCursorDisabled>(o));
+            match MinHook::enable_hook(at as *mut c_void) {
+                Ok(()) => log_line("cursor hook installed"),
+                Err(e) => log_line(&format!("enable cursor hook: {e:?}")),
+            }
+        }
+        Err(e) => log_line(&format!("create cursor hook: {e:?}")),
+    }
 }
 
 /// Stalled-voxel paint in the game render; failure only loses the red blocks.
@@ -374,6 +456,7 @@ unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: 
     let ret = RET_THRESHOLD.load(Ordering::Relaxed);
     // A propeller the plugin flies: its blade-element forces replace the game's thrust.
     if ret == MODULE_BASE.load(Ordering::Relaxed) + PROP_THRUST_RETURN && crate::flight::prop_modeled(a4.wrapping_sub(OFF_PROP_FORCE_ACC)) {
+        crate::flight::touch(a2, 16);
         return 0;
     }
     // A jet nozzle's thrust follows its spool: queue a reshaped copy of the force instead.
@@ -382,6 +465,7 @@ unsafe extern "system" fn threshold_detour(a1: usize, a2: usize, a3: usize, a4: 
     if a3 != 0 && ret == MODULE_BASE.load(Ordering::Relaxed) + JET_NOZZLE_RETURN && crate::flight::flies_obj(a2) {
         let f = (a3 as *const [f32; 3]).read_unaligned();
         if let Some(g) = crate::flight::jet_sample(a4.wrapping_sub(JET_THIS_FROM_ARG4), a2, f, a5 as *const f32) {
+            crate::flight::touch(a2, 64);
             shaped = g;
             force = shaped.as_ptr() as usize;
         }
@@ -394,10 +478,12 @@ unsafe extern "system" fn clamped_detour(a1: usize, a2: usize, a3: usize, a4: us
     let ret = RET_CLAMPED.load(Ordering::Relaxed);
     // The game's fin / wing air force: ours replace it (callers ignore the return value).
     if GAME_AIR_FORCE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::flies_obj(a2) {
+        crate::flight::touch(a2, 8);
         return 0;
     }
     // Coaxial rotors' anti-torque couple: the plugin's two counter-rotating discs replace it.
     if PROP_COUPLE_RETURNS.iter().any(|r| MODULE_BASE.load(Ordering::Relaxed) + r == ret) && crate::flight::any_prop_modeled() && crate::flight::props_obj(a2) {
+        crate::flight::touch(a2, 32);
         return 0;
     }
     note_thrust(ret, &CLAMPED_THRUST_RETURNS, a2, a3, a5, a6, a7);

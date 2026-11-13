@@ -167,3 +167,59 @@ mod rotated4_tests {
         assert!((r[5] - 1.0).abs() < 1e-12);
     }
 }
+
+/// The eye of a perspective viewproj (row vectors p·M, clip.w = −z_eye): the one point with
+/// clip x = y = w = 0. None for a degenerate matrix.
+pub fn camera_eye(m: &[f64; 16]) -> Option<V3> {
+    // Σ_i e_i·M[i][j] = −M[3][j] for the columns j = 0, 1, 3 (Cramer's rule).
+    let col = |j: usize| [m[j], m[4 + j], m[8 + j]];
+    let (a, b, c) = (col(0), col(1), col(3));
+    let r = [-m[12], -m[13], -m[15]];
+    let det3 = |x: [f64; 3], y: [f64; 3], z: [f64; 3]| {
+        x[0] * (y[1] * z[2] - y[2] * z[1]) - x[1] * (y[0] * z[2] - y[2] * z[0]) + x[2] * (y[0] * z[1] - y[1] * z[0])
+    };
+    let d = det3(a, b, c);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    // Rows are the equations (columns of M); unknowns e_x, e_y, e_z.
+    let rows = [[a[0], a[1], a[2]], [b[0], b[1], b[2]], [c[0], c[1], c[2]]];
+    let solve = |k: usize| {
+        let mut r2 = rows;
+        for (row, v) in r2.iter_mut().zip(r) {
+            row[k] = v;
+        }
+        det3(r2[0], r2[1], r2[2]) / d
+    };
+    Some(v3(solve(0), solve(1), solve(2)))
+}
+
+#[cfg(test)]
+mod eye_tests {
+    #[test]
+    fn eye_of_a_look_at_viewproj() {
+        // View: camera at (3, -2, 7) looking down −z (row vectors: p·V = p − eye), GL projection.
+        let e = [3.0, -2.0, 7.0];
+        let mut v = [0.0; 16];
+        for k in 0..3 {
+            v[k * 5] = 1.0;
+            v[12 + k] = -e[k];
+        }
+        v[15] = 1.0;
+        let (n, f, t) = (0.1, 1000.0, 1.0f64);
+        let mut p = [0.0; 16];
+        p[0] = 1.0 / t;
+        p[5] = 1.0 / t;
+        p[10] = -(f + n) / (f - n);
+        p[11] = -1.0;
+        p[14] = -2.0 * f * n / (f - n);
+        let mut m = [0.0; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                m[i * 4 + j] = (0..4).map(|k| v[i * 4 + k] * p[k * 4 + j]).sum();
+            }
+        }
+        let got = super::camera_eye(&m).unwrap();
+        assert!((got.x - 3.0).abs() < 1e-9 && (got.y + 2.0).abs() < 1e-9 && (got.z - 7.0).abs() < 1e-9, "{got:?}");
+    }
+}

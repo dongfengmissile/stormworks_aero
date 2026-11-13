@@ -202,6 +202,7 @@ unsafe fn fill_jets(rbs: &HashSet<usize>, apply: unsafe extern "system" fn(usize
         let f = [j.dir[0] * out, j.dir[1] * out, j.dir[2] * out, 0.0];
         let r = [j.rel[0], j.rel[1], j.rel[2], 0.0];
         apply(j.rb, f.as_ptr(), r.as_ptr());
+        touch(j.rb, 1);
         let at = if crate::editor::ptr_ok(j.rb + OFF_RB_COM, 24) { v3_f64(j.rb + OFF_RB_COM) } else { V3::ZERO } + v3(r[0], r[1], r[2]);
         sum = (sum.0 + v3(f[0], f[1], f[2]), sum.1 + 1, sum.2 + at * out, sum.3 + out);
     }
@@ -341,10 +342,19 @@ pub(crate) static DEBUG_WANTED: AtomicBool = AtomicBool::new(false);
 static SIM_STATE: AtomicUsize = AtomicUsize::new(0);
 static SIM_STATE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The simulation game state the render thread last drew (`G`), or 0.
+pub(crate) fn sim_state() -> usize {
+    SIM_STATE.load(Ordering::Relaxed)
+}
+
 pub(crate) fn note_sim_state(g: usize) {
     SIM_STATE.store(g, Ordering::Relaxed);
     SIM_STATE_MS.store(crate::editor::now_ms(), Ordering::Relaxed);
 }
+
+/// Flight data, arrows and stall paint only for vehicles whose CoM is within this of the camera,
+/// plus the vehicle's own size (a big aircraft seen from its third-person distance).
+const DEBUG_RADIUS: f64 = 20.0;
 
 /// Main in-game camera viewproj (world f64, row vectors p·M), if the simulation drew this moment.
 pub(crate) fn main_viewproj() -> Option<[f64; 16]> {
@@ -450,6 +460,7 @@ pub(crate) static DEBUG: Mutex<Vec<VehicleDebug>> = Mutex::new(Vec::new());
 
 struct Craft {
     key: u64,
+    touched: u8,
     bodies: Vec<usize>,
     /// Component pointers in `Model::comps` order (live fin angles).
     comp_ptrs: Vec<usize>,
@@ -485,6 +496,14 @@ static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, (bool, bool)>>> = LazyLo
 /// The game's hull air forces are skipped per body (`fluid_air_node_forces` hook), so the
 /// settings air constants stay vanilla.
 pub(crate) static AIR_PER_BODY: AtomicBool = AtomicBool::new(false);
+
+/// Diagnosis: physics objects / rigid bodies the plugin acted on since the last tick, by what it did
+/// (1 our force, 2 damping zeroed, 4 hull air skipped, 8 fin/rudder force dropped, 16 prop thrust
+/// dropped, 32 rotor couple dropped, 64 jet reshaped). Checked against vehicles the model is off for.
+static TOUCHED: LazyLock<Mutex<HashMap<usize, u8>>> = LazyLock::new(Default::default);
+pub(crate) fn touch(ptr: usize, bit: u8) {
+    *TOUCHED.lock().unwrap_or_else(|p| p.into_inner()).entry(ptr).or_insert(0) |= bit;
+}
 
 /// The plugin flies this physics object's vehicle (unknown objects: the global setting).
 pub(crate) fn flies_obj(obj: usize) -> bool {
@@ -692,6 +711,71 @@ unsafe fn fluid_mass(body: usize, body_mass: f64) -> f64 {
     sum
 }
 
+/// Watched vehicle, 5 lines a second: attitude, rates and our air moment in its own frame, and the
+/// game's rotational inertia beside the model's (a tumble diagnosis).
+fn watch_log(id: u32, mb: &LiveBody, rb: usize, model: &Model, forces: &[crate::model::LiveForce], dt: f64, fmax: f64, deflect: &[f64]) {
+    // Step lag check: Bullet should turn the moment we apply now into the next spin change,
+    // dω = I⁻¹·M·dt. Compare the measured dω with this tick's and the previous tick's moment.
+    // (id, ω, moments applied 1 and 2 ticks ago, sums: |dω|², |dω − pred(M₋₁)|², |dω − pred(M₋₂)|²)
+    static LAG: Mutex<(u32, V3, V3, V3, [f64; 3])> = Mutex::new((0, V3::ZERO, V3::ZERO, V3::ZERO, [0.0; 3]));
+    // Spin change our moment does not explain, summed over the window (aero frame, rad/s), and ticks.
+    static RESID: Mutex<(V3, f64)> = Mutex::new((V3::ZERO, 0.0));
+    let applied = forces.iter().fold(V3::ZERO, |a, f| {
+        let k = if f.force.len() > fmax { fmax / f.force.len() } else { 1.0 };
+        a + (f.at - mb.com).cross(f.force * k) + f.torque * k
+    });
+    let row = |r: usize| if ptr_ok(rb, 0x330 + 96) { unsafe { v3_f64(rb + 0x330 + 32 * r) } } else { V3::ZERO };
+    let iinv = [row(0), row(1), row(2)]; // btRigidBody::m_invInertiaTensorWorld, rows
+    let pred = |m: V3| v3(iinv[0].dot(m), iinv[1].dot(m), iinv[2].dot(m)) * dt;
+    let lag_line = {
+        let mut g = LAG.lock().unwrap_or_else(|p| p.into_inner());
+        if g.0 != id {
+            *g = (id, mb.omega, applied, applied, [0.0; 3]);
+        }
+        let dw = mb.omega - g.1;
+        {
+            let mut r = RESID.lock().unwrap_or_else(|p| p.into_inner());
+            *r = (r.0 + mb.axial_to_aero(dw - pred(g.2)), r.1 + 1.0);
+        }
+        g.4[0] += dw.dot(dw);
+        g.4[1] += (dw - pred(g.2)).dot(dw - pred(g.2));
+        g.4[2] += (dw - pred(g.3)).dot(dw - pred(g.3));
+        (g.1, g.3, g.2) = (mb.omega, g.2, applied);
+        g.4
+    };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::editor::now_ms();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 200 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    LAG.lock().unwrap_or_else(|p| p.into_inner()).4 = [0.0; 3];
+    let rel = |x: f64| if lag_line[0] > 1e-12 { (x / lag_line[0]).sqrt() } else { 0.0 };
+    let (rs, n) = std::mem::replace(&mut *RESID.lock().unwrap_or_else(|p| p.into_inner()), (V3::ZERO, 0.0));
+    let racc = rs * (1.0 / (n.max(1.0) * dt.max(1e-4))); // mean angular acceleration from everything but our air moment
+    let fins: Vec<String> = deflect.iter().filter(|d| **d != 0.0).map(|d| format!("{:.1}", d.to_degrees())).collect();
+    log_line(&format!(
+        "watch {id}: spin change unexplained by our moment of the last tick {:.2}, of the tick before {:.2} (0 = exact); other angular accel roll/pitch/yaw {:.1} {:.1} {:.1} rad/s²; live fin angles deg [{}]",
+        rel(lag_line[1]), rel(lag_line[2]), racc.x, racc.y, racc.z, fins.join(" ")
+    ));
+    let va = mb.dir_to_aero(mb.vel - mb.wind);
+    let speed = va.len().max(1e-6);
+    let w = mb.axial_to_aero(mb.omega);
+    let mo = mb.axial_to_aero(forces.iter().fold(V3::ZERO, |a, f| a + (f.at - mb.com).cross(f.force) + f.torque));
+    // btRigidBody::m_invInertiaLocal (rb+0x440, f64x3, principal axes): from the layout around +976 / +1056 / +1152.
+    let inv = if ptr_ok(rb, 0x440 + 24) { unsafe { v3_f64(rb + 0x440) } } else { V3::ZERO };
+    let gi = |x: f64| if x > 0.0 { 1.0 / x } else { 0.0 };
+    log_line(&format!(
+        "watch {id}: M {:.2} alpha {:.1} beta {:.1} deg | p q r {:.1} {:.1} {:.1} rad/s | air moment {:.0} {:.0} {:.0} N·m | dt {:.4} | I game {:.2} {:.2} {:.2} model {:.2} {:.2} {:.2}",
+        speed / crate::model::atmosphere(mb.com.y).a,
+        va.z.atan2(va.x).to_degrees(),
+        (va.y / speed).asin().to_degrees(),
+        w.x, w.y, w.z, mo.x, mo.y, mo.z, dt,
+        gi(inv.x), gi(inv.y), gi(inv.z),
+        model.inertia[0], model.inertia[1], model.inertia[2]
+    ));
+}
+
 /// Live pose and motion of one body; None if it is not a simulated, movable body.
 unsafe fn live_body(body: usize, client: bool) -> Option<(LiveBody, usize, f64)> {
     let obj = read_usize_at(body + OFF_BODY_PHYS_OBJ);
@@ -773,6 +857,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     let mut st = STATE.lock().unwrap_or_else(|p| p.into_inner());
     air_constants(&mut st, enabled && !AIR_PER_BODY.load(Ordering::Relaxed));
     let mut flown: HashMap<usize, (bool, bool)> = HashMap::new();
+    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|p| p.into_inner()));
     TICKS.fetch_add(1, Ordering::Relaxed);
     let _fault = crate::fault::enter(crate::fault::stage::FLIGHT);
     let _cache = RegionCacheScope::new();
@@ -804,6 +889,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     }
     let mut net = std::mem::take(&mut st.net);
     let want_debug = DEBUG_WANTED.load(Ordering::Relaxed);
+    let eye = if want_debug { main_viewproj().and_then(|vp| crate::math::camera_eye(&vp)) } else { None };
     // The game's forces of the last step (applied after our previous tick, before the step).
     let engine_forces = std::mem::take(&mut *ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner()));
     let mut debug = Vec::new();
@@ -850,6 +936,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             vrs: None,
             props: None,
             ground: None,
+            touched: 0,
         });
         // The vehicle's own settings ride on its parts' marks.
         if craft.read_key != key {
@@ -860,6 +947,17 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 craft.vrs = d.as_ref().and_then(|d| d.vrs);
                 craft.props = d.as_ref().and_then(|d| d.props);
                 craft.ground = d.as_ref().and_then(|d| d.ground);
+                log_line(&format!(
+                    "flight: vehicle {id}: {} parts, {} bodies; plugin flight model {} ({})",
+                    comps.len(),
+                    bodies.len(),
+                    if craft.fly.unwrap_or(enabled) { "ON" } else { "off" },
+                    match (craft.fly, d.is_some()) {
+                        (Some(_), _) => "its own saved setting",
+                        (None, true) => "global setting; it has aero marks but no saved switch",
+                        (None, false) => "global setting; no aero marks",
+                    }
+                ));
             }
         }
         let fly = craft.fly.unwrap_or(enabled);
@@ -870,6 +968,15 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             }
         }
         if !fly {
+            let bits = bodies.iter().fold(0u8, |a, &b| {
+                let obj = if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) { read_usize_at(b + OFF_BODY_PHYS_OBJ) } else { 0 };
+                let rb = if ptr_ok(obj, OFF_OBJ_RIGID_BODY + 8) { read_usize_at(obj + OFF_OBJ_RIGID_BODY) } else { 0 };
+                a | touched.get(&obj).copied().unwrap_or(0) | touched.get(&rb).copied().unwrap_or(0)
+            });
+            if bits & !craft.touched != 0 {
+                craft.touched |= bits;
+                log_line(&format!("flight: vehicle {id} has the plugin model OFF but the plugin acted on it: bits {bits:#04x} (1 force, 2 damping, 4 hull air, 8 fin force, 16 prop thrust, 32 couple, 64 jet)"));
+            }
             continue;
         }
         // (Re)build when the vehicle changed and can move; one build at a time, so a vehicle
@@ -1059,6 +1166,11 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             craft.dt = crate::model::measure_step(craft.dt, mb.com - pc, mb.vel);
         }
         craft.prev_com = Some(mb.com);
+        crate::watch::note(id, mb.com, bodies.get(main).copied().unwrap_or(0), mb.world_to_grid(mb.com));
+        crate::watch::add_row(crate::watch::Row { id, com: mb.com, vel: mb.vel, mass: total_mass, parts: model.comps.len() });
+        if crate::watch::watched() == Some(id) && !client {
+            watch_log(id, &mb, live.get(main).copied().flatten().map_or(0, |l| l.1), &model, &forces, craft.dt, fmax, &deflect);
+        }
         let vcom = live.iter().flatten().fold(V3::ZERO, |a, l| a + l.0.vel * l.2) * (1.0 / total_mass.max(1e-9));
         if let Some(pv) = craft.prev_vel {
             let other = (vcom - pv) * (total_mass / craft.dt) - craft.prev_aero - v3(0.0, -9.81 * weight_mass, 0.0);
@@ -1069,7 +1181,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         craft.prev_vel = Some(vcom);
         craft.prev_aero = forces.iter().map(|f| if f.force.len() > fmax { f.force * (fmax / f.force.len()) } else { f.force }).fold(V3::ZERO, |a, f| a + f);
-        if want_debug {
+        // Only vehicles near the camera; without a camera (none drawn yet) all of them.
+        let size = model.grid.dims.iter().map(|&n| n as f64 * 0.25).fold(0.0, f64::max);
+        if want_debug && eye.is_none_or(|e| (mb.com - e).len() <= DEBUG_RADIUS + size) {
             // Missile fins: their own mesh, not their cells (that would paint the body).
             for (j, _) in craft.stall.iter().enumerate().filter(|(_, &st)| st > 0.5) {
                 let part = model
@@ -1178,6 +1292,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             let fv = [force.x, force.y, force.z, 0.0];
             let rv = [rel.x, rel.y, rel.z, 0.0];
             apply_force(rb, fv.as_ptr(), rv.as_ptr());
+            touch(rb, 1);
             if f.torque != V3::ZERO {
                 let t = f.torque * scale;
                 for (k, c) in [t.x, t.y, t.z].into_iter().enumerate() {
@@ -1200,8 +1315,12 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         crate::paint::publish(stalled);
         crate::paint::publish_flight_tint(std::mem::take(&mut stalled_parts));
     }
+    crate::watch::publish_rows();
     if want_debug {
         *DEBUG.lock().unwrap_or_else(|p| p.into_inner()) = debug;
+    }
+    // Built poses: the arrows and the watch camera place things exactly as the game draws them.
+    if want_debug || crate::watch::watched().is_some() {
         record_builds(st.crafts.values().flat_map(|c| c.bodies.iter().copied()));
     }
 }
@@ -1339,3 +1458,4 @@ fn flight_data(
         props: Vec::new(),
     }
 }
+
