@@ -302,10 +302,10 @@ impl Overlay {
         });
     }
 
-    /// F8: every vehicle the plugin models, nearest the camera first, each with Watch.
+    /// F8: every vehicle the plugin models, nearest the camera's orbit point first, each with Watch.
     fn draw_vehicle_list(&mut self, ui: &Ui) {
-        let eye = crate::flight::main_viewproj().and_then(|vp| crate::math::camera_eye(&vp));
-        let mut rows: Vec<(f64, crate::watch::Row)> = crate::watch::rows().into_iter().map(|r| (eye.map_or(0.0, |e| (r.com - e).len()), r)).collect();
+        let focus = crate::flight::debug_focus();
+        let mut rows: Vec<(f64, crate::watch::Row)> = crate::watch::rows().into_iter().map(|r| (focus.map_or(0.0, |e| (r.com - e).len()), r)).collect();
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
         let watched = crate::watch::watched();
         let fixed = rows.iter().filter(|r| r.1.fixed).count();
@@ -367,7 +367,7 @@ impl Overlay {
                     }
                     let known = |s: String| if r.modelled { s } else { "-".into() };
                     let cells = [
-                        if eye.is_some() { dist(*d) } else { "-".into() },
+                        if focus.is_some() { dist(*d) } else { "-".into() },
                         known(format!("{:.0} km/h", r.vel.len() * 3.6)),
                         format!("{:.0} m", r.com.y),
                         known(if r.mass < 1000.0 { format!("{:.0} kg", r.mass) } else { format!("{:.1} t", r.mass / 1000.0) }),

@@ -381,9 +381,28 @@ pub(crate) fn note_sim_state(g: usize) {
     SIM_STATE_MS.store(crate::editor::now_ms(), Ordering::Relaxed);
 }
 
-/// Flight data, arrows and stall paint only for vehicles whose CoM is within this of the camera,
-/// plus the vehicle's own size (a big aircraft seen from its third-person distance).
+/// Flight data, arrows and stall paint only for vehicles whose CoM is within this of `debug_focus`,
+/// plus the vehicle's own size (a long aircraft's seat is far from its CoM).
 const DEBUG_RADIUS: f64 = 20.0;
+/// Once shown, a vehicle stays until this much further out, so one hovering at the edge does not flicker.
+const DEBUG_HYSTERESIS: f64 = 5.0;
+
+/// Where F9 measures from: the point the camera orbits (seat body or player in third person, the
+/// watched vehicle, the eye in first person), so zooming out never drops the vehicle. Free cam: the eye.
+pub(crate) fn debug_focus() -> Option<V3> {
+    let vp = main_viewproj()?;
+    let c = SIM_STATE.load(Ordering::Relaxed) + crate::watch::OFF_SIM_CAMERA_CTRL;
+    unsafe {
+        // Camera controller (knowledge/camera.md): A pose row 3 at +0x60, free cam flags +0x1A4/+0x1A5.
+        if ptr_ok(c, 0x1A8) && *((c + 0x1A4) as *const u8) == 0 && *((c + 0x1A5) as *const u8) == 0 {
+            let p: [f64; 3] = std::array::from_fn(|k| f64::from_bits(read_usize_at(c + 0x60 + 8 * k) as u64));
+            if p.iter().all(|v| v.is_finite()) {
+                return Some(v3(p[0], p[1], p[2]));
+            }
+        }
+    }
+    crate::math::camera_eye(&vp)
+}
 
 /// Main in-game camera viewproj (world f64, row vectors p·M), if the simulation drew this moment.
 pub(crate) fn main_viewproj() -> Option<[f64; 16]> {
@@ -503,6 +522,8 @@ struct Craft {
     prev_vel: Option<V3>,
     prev_aero: V3,
     thrust: f64,
+    /// Inside the F9 radius (see `DEBUG_HYSTERESIS`).
+    in_debug_range: bool,
     /// Main body CoM last tick and the measured physics step, s.
     prev_com: Option<V3>,
     dt: f64,
@@ -931,7 +952,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     }
     let mut net = std::mem::take(&mut st.net);
     let want_debug = DEBUG_WANTED.load(Ordering::Relaxed);
-    let eye = if want_debug { main_viewproj().and_then(|vp| crate::math::camera_eye(&vp)) } else { None };
+    let focus = if want_debug { debug_focus() } else { None };
     // The game's forces of the last step (applied after our previous tick, before the step).
     let engine_forces = std::mem::take(&mut *ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner()));
     let mut debug = Vec::new();
@@ -968,6 +989,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             prev_vel: None,
             prev_aero: V3::ZERO,
             thrust: 0.0,
+            in_debug_range: false,
             prev_com: None,
             dt: 1.0 / 60.0,
             last_com: [f64::NAN; 3],
@@ -1222,9 +1244,11 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         craft.prev_vel = Some(vcom);
         craft.prev_aero = forces.iter().map(|f| if f.force.len() > fmax { f.force * (fmax / f.force.len()) } else { f.force }).fold(V3::ZERO, |a, f| a + f);
-        // Only vehicles near the camera; without a camera (none drawn yet) all of them.
+        // Only vehicles near the camera's focus; without a camera (none drawn yet) all of them.
         let size = model.grid.dims.iter().map(|&n| n as f64 * 0.25).fold(0.0, f64::max);
-        if want_debug && eye.is_none_or(|e| (mb.com - e).len() <= DEBUG_RADIUS + size) {
+        let reach = DEBUG_RADIUS + size + if craft.in_debug_range { DEBUG_HYSTERESIS } else { 0.0 };
+        craft.in_debug_range = focus.is_none_or(|e| (mb.com - e).len() <= reach);
+        if want_debug && craft.in_debug_range {
             // Missile fins: their own mesh, not their cells (that would paint the body).
             for (j, _) in craft.stall.iter().enumerate().filter(|(_, &st)| st > 0.5) {
                 let part = model

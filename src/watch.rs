@@ -30,7 +30,7 @@ pub(crate) unsafe extern "system" fn set_cursor_detour(w: usize, disabled: usize
 }
 
 /// The camera controller inside the simulation game state (`G`).
-const OFF_SIM_CAMERA_CTRL: usize = 0xCE8;
+pub(crate) const OFF_SIM_CAMERA_CTRL: usize = 0xCE8;
 /// After the watched vehicle is gone: the camera stays at its last place this long (see the impact).
 const HOLD_MS: u64 = 2000;
 /// Not published for this long: the vehicle is gone (destroyed, despawned, out of the flight model).
