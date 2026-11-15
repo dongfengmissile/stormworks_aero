@@ -133,6 +133,16 @@ mod tests {
     }
 }
 
+/// Point `p` through a row-vector 4x4 (`p · m`, translation in the last row).
+pub fn xf_point(m: &[f64; 16], p: V3) -> V3 {
+    v3(p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12], p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13], p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14])
+}
+
+/// Direction `d` through the rotation part of a row-vector 4x4.
+pub fn xf_dir(m: &[f64; 16], d: V3) -> V3 {
+    v3(d.x * m[0] + d.y * m[4] + d.z * m[8], d.x * m[1] + d.y * m[5] + d.z * m[9], d.x * m[2] + d.y * m[6] + d.z * m[10])
+}
+
 /// Row-vector 4x4 product `r · m` with `r` a rotation about unit `axis` by `angle`.
 pub fn rotated4(m: &[f64; 16], axis: [f64; 3], angle: f64) -> [f64; 16] {
     let (s, c) = angle.sin_cos();

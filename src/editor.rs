@@ -21,13 +21,12 @@ pub(crate) struct Snapshot {
 pub(crate) static LATEST: Mutex<Option<Arc<Snapshot>>> = Mutex::new(None);
 /// Set by the overlay while its window is open; reading is skipped otherwise.
 pub(crate) static WANTED: AtomicBool = AtomicBool::new(false);
-/// Workbench paint (Aero wings mode), set by the overlay: (key that changes with the colours, voxel colours per
-/// body index as `Comp::body` numbers them); None = off.
 /// Set by the overlay while it picks blocks on the workbench vehicle with the cursor.
 pub(crate) static PICK_WANTED: AtomicBool = AtomicBool::new(false);
 /// Body frame (aero axes, metres) -> OpenGL clip space of the editor camera, row vectors.
 pub(crate) static WORLD_CLIP: Mutex<Option<[f64; 16]>> = Mutex::new(None);
-/// Workbench paint: key, voxel colours per body, and moving-mesh tints by component position.
+/// Workbench paint (Aero wings mode), set by the overlay: a key that changes with the colours, voxel
+/// colours per body (as `Comp::body` numbers them) and moving-mesh tints by component position. None = off.
 pub(crate) static PAINT: Mutex<Option<(u64, Vec<Arc<crate::paint::VoxelColours>>, Arc<Vec<([i32; 3], u32)>>)>> = Mutex::new(None);
 /// Paint key the tints were last resolved to component pointers for.
 static TINT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -87,23 +86,28 @@ pub(crate) unsafe fn body_comp_count(body: usize) -> u32 {
     read_u32_at(body + OFF_BODY_COMPONENTS + 0x10)
 }
 
+/// A raw component as a `Comp` (definition names are cached). None: its definition has no readable name.
+unsafe fn comp_of(names: &mut HashMap<usize, String>, (def, pos, rot, body, mirror): (usize, [i32; 3], [i32; 9], u32, i32), ptr: usize) -> Option<Comp> {
+    let name = match names.get(&def) {
+        Some(n) => n.clone(),
+        None => {
+            let n = def_name(def)?;
+            names.insert(def, n.clone());
+            n
+        }
+    };
+    let (size, wheel_size) = part_size(ptr, def);
+    Some(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size })
+}
+
 /// Every component of a vehicle with its definition name, and the body pointers.
 /// Components (in `Model::comps` order), body pointers, component pointers.
 pub(crate) unsafe fn vehicle_comps(vehicle: usize) -> Option<(Vec<Comp>, Vec<usize>, Vec<usize>)> {
     let (raw, bodies, ptrs) = read_vehicle_raw(vehicle)?;
     let mut game = GAME.lock().unwrap_or_else(|p| p.into_inner());
     let mut comps = Vec::with_capacity(raw.len());
-    for ((def, pos, rot, body, mirror), &ptr) in raw.into_iter().zip(&ptrs) {
-        let name = match game.names.get(&def) {
-            Some(n) => n.clone(),
-            None => {
-                let n = def_name(def)?;
-                game.names.insert(def, n.clone());
-                n
-            }
-        };
-        let (size, wheel_size) = part_size(ptr, def);
-        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size });
+    for (r, &ptr) in raw.into_iter().zip(&ptrs) {
+        comps.push(comp_of(&mut game.names, r, ptr)?);
     }
     Some((comps, bodies, ptrs))
 }
@@ -289,30 +293,23 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         return;
     }
     let mut comps = Vec::with_capacity(raw.len());
-    for ((def, pos, rot, body, mirror), &ptr) in raw.into_iter().zip(&ptrs) {
-        let name = match game.names.get(&def) {
-            Some(n) => n.clone(),
-            None => {
-                let Some(n) = def_name(def) else {
-                    if REJECTS.fetch_add(1, Ordering::Relaxed) < 3 {
-                        // Evidence for re-checking OFF_DEF_NAME after a game update.
-                        let dump = |o: usize| {
-                            if readable(def + o, 16) {
-                                format!("{:02x?}", std::slice::from_raw_parts((def + o) as *const u8, 16))
-                            } else {
-                                "unreadable".into()
-                            }
-                        };
-                        log_line(&format!("editor: no definition name at def {def:#x}: +0x288 {} +0x298 {}", dump(OFF_DEF_NAME), dump(0x298)));
+    for (r, &ptr) in raw.into_iter().zip(&ptrs) {
+        let def = r.0;
+        let Some(c) = comp_of(&mut game.names, r, ptr) else {
+            if REJECTS.fetch_add(1, Ordering::Relaxed) < 3 {
+                // Evidence for re-checking OFF_DEF_NAME after a game update.
+                let dump = |o: usize| {
+                    if readable(def + o, 16) {
+                        format!("{:02x?}", std::slice::from_raw_parts((def + o) as *const u8, 16))
+                    } else {
+                        "unreadable".into()
                     }
-                    return;
                 };
-                game.names.insert(def, n.clone());
-                n
+                log_line(&format!("editor: no definition name at def {def:#x}: +0x288 {} +0x298 {}", dump(OFF_DEF_NAME), dump(0x298)));
             }
+            return;
         };
-        let (size, wheel_size) = part_size(ptr, def);
-        comps.push(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size });
+        comps.push(c);
     }
     game.last_hash = h;
     drop(game);

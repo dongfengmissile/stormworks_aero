@@ -30,7 +30,6 @@ pub struct Def {
     pub mass: f32,
     /// `rudder_type` of type-18 parts: 0 rudder/fin/control surface, 1 wing, 2 keel.
     pub rudder_type: i32,
-    pub rudder_area: f32,
     /// Solid voxels only (sweep / reserved space of props, wheels, seats left out).
     pub voxels: Vec<DefVoxel>,
     /// `mesh_data_name`, empty when the part's moving pieces have no known rest pose.
@@ -200,7 +199,7 @@ pub const TYPE_ROCKET: i32 = 47;
 
 /// How the game deflects a rocket fin (`solid_rocket_draw` 0x43ECC0 / `rocket_tick` 0x439DF0,
 /// c38c03ff756b): about `axis` (part frame, after the fin's quarter turn) by the angle of fin
-/// pair A (`a`) or C, see `flight::fin_angle`.
+/// pair A (`a`) or C, see `flight::live_angle`.
 #[derive(Clone, Copy, Debug)]
 pub struct FinCtrl {
     pub axis: V3,
@@ -253,7 +252,6 @@ pub fn parse_def(text: &str) -> Def {
         type_: 0,
         mass: 0.0,
         rudder_type: 0,
-        rudder_area: 0.0,
         voxels: Vec::new(),
         mesh: String::new(),
         moving: Vec::new(),
@@ -289,7 +287,6 @@ pub fn parse_def(text: &str) -> Def {
                 def.type_ = tag.int0("type");
                 def.mass = tag.num("mass").unwrap_or(0.0);
                 def.rudder_type = tag.int0("rudder_type");
-                def.rudder_area = tag.num("rudder_surface_area").unwrap_or(0.0);
                 def.block = tag.int0("block_type") > 0;
                 def.mesh = tag.get("mesh_data_name").unwrap_or("").to_string();
                 names = ["mesh_0_name", "mesh_1_name", "mesh_2_name"].map(|k| tag.get(k).unwrap_or("").to_string());
@@ -834,6 +831,14 @@ impl Library {
     }
 }
 
+/// The installed game's part library and its save folder (a Linux Steam install), for unit tests.
+#[cfg(test)]
+pub(crate) fn test_library() -> (Library, PathBuf) {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+    (Library::new(&home.join(".local/share/Steam/steamapps/common/Stormworks"), &appdata), appdata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,8 +941,6 @@ mod tests {
         assert_eq!(bin_mesh(&bin, "m.mesh"), Some(&b[..]));
     }
 
-    /// Every installed definition: solid volume and cell count, for comparing voxelizer changes
-    /// (`cargo test --release audit_defs -- --ignored --nocapture > out`).
     #[test]
     fn mod_part_replaces_stock_part_of_the_same_header_name() {
         let root = std::env::temp_dir().join(format!("aero_named_{}", std::process::id()));
@@ -952,13 +955,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Every installed definition: solid volume and cell count, for comparing voxelizer changes
+    /// (`cargo test --release audit_defs -- --ignored --nocapture > out`).
     #[test]
     #[ignore]
     fn audit_defs() {
-        let home = std::env::var("HOME").unwrap();
-        let game = Path::new(&home).join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = Path::new(&home).join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
-        let mut lib = Library::new(&game, &appdata);
+        let (mut lib, _) = test_library();
         let mut names: Vec<String> = Vec::new();
         for dir in std::iter::once(lib.rom.clone()).chain(lib.bin_dirs.clone()) {
             for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {

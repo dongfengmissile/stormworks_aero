@@ -244,6 +244,7 @@ mod tests {
 }
 
 /// World point -> screen pixels through the main camera (row vectors p·M, OpenGL NDC).
+#[cfg(any(windows, test))]
 pub(crate) fn project(vp: &[f64; 16], p: crate::math::V3, size: [f32; 2]) -> Option<[f32; 2]> {
     let w = p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15];
     if w <= 1e-3 {

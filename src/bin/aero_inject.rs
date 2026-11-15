@@ -149,6 +149,28 @@ mod imp {
         Some(game_dir.join(DEFAULT_DLL_NAME))
     }
 
+    /// The target process, the DLL path written into it and the loader thread: dropped, it closes
+    /// the thread, frees the path and closes the process, in that order.
+    struct Remote {
+        process: *mut c_void,
+        path: *mut c_void,
+        thread: *mut c_void,
+    }
+
+    impl Drop for Remote {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.thread.is_null() {
+                    let _ = CloseHandle(self.thread);
+                }
+                if !self.path.is_null() {
+                    let _ = VirtualFreeEx(self.process, self.path, 0, MEM_RELEASE);
+                }
+                let _ = CloseHandle(self.process);
+            }
+        }
+    }
+
     pub fn run() -> Result<(), String> {
         let options = parse_args();
         let pid = match options.pid {
@@ -198,10 +220,10 @@ mod imp {
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             );
+            // From here every exit frees the remote path and closes the handles.
+            let mut remote = Remote { process, path: remote_path, thread: std::ptr::null_mut() };
             if remote_path.is_null() {
-                let error = last_error_message("VirtualAllocEx");
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(last_error_message("VirtualAllocEx"));
             }
 
             let mut written = 0usize;
@@ -214,24 +236,16 @@ mod imp {
             ) == 0
                 || written != dll_bytes_len
             {
-                let error = last_error_message("WriteProcessMemory");
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(last_error_message("WriteProcessMemory"));
             }
 
             let kernel32 = to_wide(OsStr::new("kernel32.dll"));
             let module = GetModuleHandleW(kernel32.as_ptr());
             if module.is_null() {
-                let error = last_error_message("GetModuleHandleW(kernel32)");
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(last_error_message("GetModuleHandleW(kernel32)"));
             }
             let load_library = GetProcAddress(module, c"LoadLibraryW".as_ptr().cast());
             let Some(load_library) = load_library else {
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
                 return Err("LoadLibraryW not found in kernel32.dll".to_string());
             };
 
@@ -248,33 +262,19 @@ mod imp {
                 std::ptr::null_mut(),
             );
             if thread.is_null() {
-                let error = last_error_message("CreateRemoteThread");
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(last_error_message("CreateRemoteThread"));
             }
+            remote.thread = thread;
 
             if WaitForSingleObject(thread, INJECTION_TIMEOUT_MS) != WAIT_OBJECT_0 {
-                let error = format!(
-                    "remote LoadLibraryW thread did not finish within {INJECTION_TIMEOUT_MS} ms"
-                );
-                let _ = CloseHandle(thread);
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(format!("remote LoadLibraryW thread did not finish within {INJECTION_TIMEOUT_MS} ms"));
             }
 
             let mut exit_code = 0u32;
             if GetExitCodeThread(thread, &mut exit_code) == 0 {
-                let error = last_error_message("GetExitCodeThread");
-                let _ = CloseHandle(thread);
-                let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-                let _ = CloseHandle(process);
-                return Err(error);
+                return Err(last_error_message("GetExitCodeThread"));
             }
-            let _ = CloseHandle(thread);
-            let _ = VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-            let _ = CloseHandle(process);
+            drop(remote);
 
             if exit_code == LOAD_LIBRARY_FAILED_EXIT_CODE {
                 let log_hint = dll_path

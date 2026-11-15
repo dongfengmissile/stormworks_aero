@@ -92,7 +92,7 @@ pub(crate) fn publish_flight_tint(t: HashMap<usize, u32>) {
     *FLIGHT_TINT.lock().unwrap_or_else(|p| p.into_inner()) = (!t.is_empty()).then_some(t);
 }
 
-pub(crate) type ClassDraw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub(crate) use crate::blur::ClassDraw;
 pub(crate) static ORIGINAL_ROCKET_DRAW: OnceLock<ClassDraw> = OnceLock::new();
 pub(crate) static ORIGINAL_RUDDER_DRAW: OnceLock<ClassDraw> = OnceLock::new();
 

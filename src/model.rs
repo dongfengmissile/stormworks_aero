@@ -15,6 +15,36 @@ use crate::wing::{build_panels, panel_forces, skin_friction, Key, Panel, Role, W
 
 pub const G: f64 = 9.81;
 
+/// A vehicle's own on/off settings (None: the global one).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Switches {
+    /// Plugin flight model.
+    pub fly: Option<bool>,
+    /// Vortex ring state.
+    pub vrs: Option<bool>,
+    /// Plugin propellers and rotors (off: the game's own thrust and shaft load).
+    pub props: Option<bool>,
+    /// Ground effect.
+    pub ground: Option<bool>,
+    /// Jet thrust follows airspeed (`flight::JET_RAM`).
+    pub jet: Option<bool>,
+}
+
+impl Switches {
+    /// Each switch with its saved token, in saved order. A new switch is a field and a line here.
+    pub fn tokens(&mut self) -> [(&'static str, &mut Option<bool>); 5] {
+        [("fm", &mut self.fly), ("vrs", &mut self.vrs), ("pm", &mut self.props), ("ge", &mut self.ground), ("js", &mut self.jet)]
+    }
+
+    /// These choices, and `other`'s where there is none.
+    pub fn or(mut self, mut other: Switches) -> Switches {
+        for ((_, a), (_, b)) in self.tokens().into_iter().zip(other.tokens()) {
+            *a = a.or(*b);
+        }
+        self
+    }
+}
+
 /// User choices, keyed by component position (stored per part: `marks`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Designations {
@@ -31,12 +61,7 @@ pub struct Designations {
     /// Wing blocks marked as a separate wing, by wing number (1, 2, ...): each number forms its
     /// own panels and wing (for another aerofoil on part of a wing). Unmarked blocks are wing 0.
     pub splits: HashMap<[i32; 3], u32>,
-    /// Per-vehicle settings (None: the global one): plugin flight model, vortex ring state.
-    pub fly: Option<bool>,
-    pub vrs: Option<bool>,
-    /// Plugin propellers and rotors (off: the game's own thrust and shaft load).
-    pub props: Option<bool>,
-    pub ground: Option<bool>,
+    pub sw: Switches,
     /// Propeller/rotor blade width by component position, x the part's own.
     pub widths: HashMap<[i32; 3], f64>,
     /// Propeller/rotor blade shape chosen by position: true propeller, false rotor (else auto).
@@ -100,8 +125,6 @@ pub fn ground_effect(h: f64, span: f64) -> f64 {
 }
 
 /// A vehicle body's pose and motion in the world, for `Model::live_forces`.
-/// World point of a model point: `(grid metres - origin)·rot + trans` (rows of `rot` are the
-/// images of the grid axes, as in the game's row-vector matrices).
 #[derive(Clone, Copy, Debug)]
 pub struct LiveBody {
     pub origin: V3,
@@ -131,6 +154,8 @@ fn grid_to_aero(g: V3) -> V3 {
 }
 
 impl LiveBody {
+    /// World point of a model point: `(grid metres - origin)·rot + trans` (rows of `rot` are the
+    /// images of the grid axes, as in the game's row-vector matrices).
     pub fn to_world(&self, p: V3) -> V3 {
         self.grid_dir_to_world(aero_to_grid(p) - self.origin) + self.trans
     }
@@ -185,11 +210,7 @@ pub struct Atmo {
 /// shortcut: throttle ratio 1.05, the middle of the book's 1.0 to 1.08 for fighters.
 pub fn jet_thrust_lapse(mach: f64, alt: f64) -> f64 {
     const TR: f64 = 1.05;
-    let (at, sl) = (atmosphere(alt), atmosphere(0.0));
-    let theta = at.temp / sl.temp;
-    let ram = 1.0 + 0.2 * mach * mach;
-    let theta0 = theta * ram;
-    let delta0 = at.rho / sl.rho.max(1e-9) * theta * ram.powf(3.5);
+    let (theta0, delta0) = ram_ratios(mach, alt);
     let hot = if theta0 > TR { 1.5 * (theta0 - TR) / theta0 } else { 0.0 };
     (delta0 * (1.0 - 0.3 * (theta0 - 1.0) - 0.1 * mach.sqrt() - hot)).max(0.0)
 }
@@ -198,13 +219,23 @@ pub fn jet_thrust_lapse(mach: f64, alt: f64) -> f64 {
 /// shortcut: the book fits it to Mach 0.9; past that it keeps falling, to nothing near Mach 1.5.
 pub fn fan_thrust_lapse(mach: f64, alt: f64) -> f64 {
     const TR: f64 = 1.05;
+    let (theta0, delta0) = ram_ratios(mach, alt);
+    let hot = if theta0 > TR { 3.0 * (theta0 - TR) / (1.5 + mach) } else { 0.0 };
+    (delta0 * (1.0 - 0.49 * mach.sqrt() - hot)).max(0.0)
+}
+
+/// Total temperature and pressure at the engine face over sea-level static (θ0, δ0).
+fn ram_ratios(mach: f64, alt: f64) -> (f64, f64) {
     let (at, sl) = (atmosphere(alt), atmosphere(0.0));
     let theta = at.temp / sl.temp;
     let ram = 1.0 + 0.2 * mach * mach;
-    let theta0 = theta * ram;
-    let delta0 = at.rho / sl.rho.max(1e-9) * theta * ram.powf(3.5);
-    let hot = if theta0 > TR { 3.0 * (theta0 - TR) / (1.5 + mach) } else { 0.0 };
-    (delta0 * (1.0 - 0.49 * mach.sqrt() - hot)).max(0.0)
+    (theta * ram, at.rho / sl.rho.max(1e-9) * theta * ram.powf(3.5))
+}
+
+/// The flow a slender body of length `len` sees.
+fn body_flow(mach: f64, re_m: f64, len: f64) -> Flow {
+    let re = re_m * len;
+    Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) }
 }
 
 pub fn atmosphere(alt: f64) -> Atmo {
@@ -254,7 +285,6 @@ pub struct Coeffs {
     pub croll: f64,
     pub wing_cl: f64,
     pub wing_cd: f64,
-    pub wing_cdi: f64,
     pub body_cl: f64,
     pub body_cd: f64,
 }
@@ -336,7 +366,7 @@ pub struct Model {
     pub separate: Vec<u32>,
     /// Panel's wing counted among the unnumbered wings in panel order (0, 1, ...): a colour index.
     pub wing_rank: Vec<usize>,
-    /// Per panel: the rocket fin it is, deflected live by the game (`flight::fin_angle`).
+    /// Per panel: the rocket fin it is, deflected live by the game (`flight::live_angle`).
     pub fin_live: Vec<Option<FinLive>>,
     /// Per panel: the component of a missile fin made from its mesh (default section
     /// `Designations::default_fin`). These panels are not in `panel_of`: they share their cells
@@ -360,8 +390,6 @@ pub struct Model {
     /// column, whether its hull fills any cell along the length.
     pub main_body: usize,
     pub silhouette: Vec<bool>,
-    /// Cells the main fuselage model leaves out (wing panels, bodies with their own model).
-    pub body_skip: Vec<bool>,
 }
 
 /// A body without lifting panels (a landing gear leg, a door, anything on a pivot) as its own
@@ -380,12 +408,6 @@ pub struct Bluff {
     /// A body one cell thick (an airbrake, a door): its grid normal axis, face area m² and aspect
     /// ratio. Across it, it drags as a flat plate, not as the slices of a fuselage.
     plate: Option<(usize, f64, f64)>,
-}
-
-impl Bluff {
-    pub fn debug(&self) -> String {
-        format!("axis {} length {:.2} max_area {:.3} fineness {:.2} sections {} xs areas {:?}", self.axis, self.aero.length, self.aero.max_area, self.aero.fineness, self.aero.sections.len(), self.aero.xs.iter().map(|x| (x.area * 1000.0).round() / 1000.0).collect::<Vec<_>>())
-    }
 }
 
 /// Grid vector or cell turned so that axis `a` becomes the grid's forward axis (a rotation: `unturn` undoes it).
@@ -1128,7 +1150,7 @@ impl Model {
                 _ => 0,
             })
             .collect();
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette, body_skip: skip }
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -1146,9 +1168,7 @@ impl Model {
         let omega = v3(c.rates[0], c.rates[1], c.rates[2]);
         let re_m = reynolds_per_m(&at, mach);
 
-        let len = self.body.length.max(0.25);
-        let re = re_m * len;
-        let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
+        let flow = body_flow(mach, re_m, self.body.length.max(0.25));
         let (mut fb, mut mb) = self.body.forces(&flow, -vel, omega, self.com, at.rho);
         // Bodies without wings (landing gear) as built: counted with the fuselage.
         let frame = LiveBody { origin: V3::ZERO, rot: [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)], trans: V3::ZERO, com: V3::ZERO, vel: V3::ZERO, omega: V3::ZERO, wind: V3::ZERO };
@@ -1174,16 +1194,14 @@ impl Model {
                 p.ctrl_sign * cmd.clamp(-1.0, 1.0) * MAX_DEFLECT
             })
             .collect();
-        let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m, gamma: at.gamma };
+        let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m };
         let com = self.com;
         let pf = panel_forces(&self.panels, &wf, &|_, p| vel + omega.cross(p - com), &deflect, stall);
         let mut fw = V3::ZERO;
         let mut mw = V3::ZERO;
-        let mut cdi = 0.0;
-        for (p, f) in self.panels.iter().zip(&pf) {
+        for f in &pf {
             fw += f.force;
             mw += (f.at - com).cross(f.force);
-            cdi += f.cd_induced * p.area;
         }
         let qs = q * self.s_ref;
         let f = fw + fb;
@@ -1197,7 +1215,6 @@ impl Model {
             cn: m.z / (qs * self.b_ref),
             wing_cl: -fw.dot(zw) / qs,
             wing_cd: -fw.dot(xw) / qs,
-            wing_cdi: cdi / self.s_ref,
             body_cl: -fb.dot(zw) / qs,
             body_cd: -fb.dot(xw) / qs,
         }
@@ -1254,9 +1271,7 @@ impl Model {
         let mut out = Vec::new();
 
         // Fuselage (slender body) in the main body's frame.
-        let len = self.body.length.max(0.25);
-        let re = re_m * len;
-        let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
+        let flow = body_flow(mach, re_m, self.body.length.max(0.25));
         let (fb, mbm) = if v_main.len() >= 1.0 {
             self.body.forces(&flow, -mb.dir_to_aero(v_main), mb.axial_to_aero(mb.omega), self.com, at.rho)
         } else {
@@ -1283,7 +1298,7 @@ impl Model {
                 w
             })
             .collect();
-        let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m, gamma: at.gamma };
+        let wf = WingFlow { mach, rho: at.rho, re_per_m: re_m };
         let zero = vec![0.0; world.len()];
         let deflect = if deflect.len() == world.len() { deflect } else { &zero };
         let pf = panel_forces(&world, &wf, &|i, p| air(&bodies[owner[i]], p) + wash[i], deflect, stall);
@@ -1334,8 +1349,7 @@ impl Model {
             } else {
                 let g = lb.world_dir_to_grid(v);
                 let [x, y, z] = turn([g.x, g.y, g.z], bl.axis);
-                let re = re_m * bl.aero.length.max(VOXEL_M);
-                let flow = Flow { mach, reynolds_per_m: re_m, pseudo_knudsen: mach / (re + mach), cf: skin_friction(re, mach) };
+                let flow = body_flow(mach, re_m, bl.aero.length.max(VOXEL_M));
                 let f = aero_to_grid(bl.aero.forces(&flow, -grid_to_aero(v3(x, y, z)), V3::ZERO, bl.mid, at.rho).0);
                 let [x, y, z] = unturn([f.x, f.y, f.z], bl.axis);
                 lb.dir_to_world(grid_to_aero(v3(x, y, z)))
@@ -1469,20 +1483,12 @@ impl Model {
 
         let k = q * s / (m * u0);
         Stability {
-            mach,
-            alt,
             u0,
-            q,
             cl: nom.cl,
             cd: nom.cd,
-            cm: nom.cm,
             cl_req,
             alpha,
             trim_note,
-            s,
-            mac: c,
-            b,
-            mass: m,
             inertia: [ix, iy, iz, ixy, iyz, ixz],
             // Longitudinal (Etkin, body x fwd z down).
             zw: -k * (da.cl + nom.cd),
@@ -1513,20 +1519,12 @@ impl Model {
 
 #[derive(Clone, Debug, Default)]
 pub struct Stability {
-    pub mach: f64,
-    pub alt: f64,
     pub u0: f64,
-    pub q: f64,
     pub cl: f64,
     pub cd: f64,
-    pub cm: f64,
     pub cl_req: f64,
     pub alpha: f64,
     pub trim_note: &'static str,
-    pub s: f64,
-    pub mac: f64,
-    pub b: f64,
-    pub mass: f64,
     pub inertia: [f64; 6],
     pub zw: f64,
     pub xw: f64,
@@ -1645,10 +1643,7 @@ mod tests {
     fn grid_fins_lift_across_their_face() {
         // A modded grid fin rocket (lattice faces across the flow): four live planar-equivalent
         // panels of the face's area, normal across the rocket axis, with the default fin section.
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
-        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let (mut lib, _) = crate::defs::test_library();
         let name = "solid_rocket_grid_fin_small";
         if lib.get(name).is_none() {
             return;
@@ -1675,10 +1670,7 @@ mod tests {
         // Every vanilla control-surface panel of the saved planes reads its live angle, and the
         // mirror handling holds: mirroring along the hinge keeps the turn, across it reverses it
         // (F·R(a,θ)·F = R(F·a, det F·θ)).
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
-        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let (mut lib, appdata) = crate::defs::test_library();
         let mut checked = 0;
         for name in ["f4e", "beaver", "bf109", "ar234b2", "c27j"] {
             let Ok(text) = std::fs::read_to_string(appdata.join(format!("data/vehicles/{name}.xml"))) else {
@@ -1712,13 +1704,10 @@ mod tests {
     fn rocket_fin_deflection_matches_the_game_rotation() {
         // Saved AIM-9: each live rocket-fin panel, deflected by sign·α, must face where the game's
         // own rotation of the fin mesh (p·M about its axis, in the part frame) puts it.
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
+        let (mut lib, appdata) = crate::defs::test_library();
         let Ok(text) = std::fs::read_to_string(appdata.join("data/vehicles/aim9.xml")) else {
             return;
         };
-        let mut lib = crate::defs::Library::new(&game, &appdata);
         let m = Model::build(crate::vehicle::parse_vehicle_xml(&text), &mut lib, &Designations::default());
         let mut checked = 0;
         for (p, f) in m.panels.iter().zip(&m.fin_live) {
@@ -1752,10 +1741,7 @@ mod tests {
         // A flat slab: wing 1 across the middle (split into left and right panels at the
         // symmetry plane), wing 2 touching its tip, plain wing beyond. One aerofoil mark on
         // wing 1's left half sets its right half too.
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
-        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let (mut lib, _) = crate::defs::test_library();
         if lib.get("01_block").is_none() {
             return;
         }
@@ -1782,10 +1768,7 @@ mod tests {
 
     #[test]
     fn detect_marks_free_slabs_but_no_hull_and_guesses_roles() {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let game = home.join(".local/share/Steam/steamapps/common/Stormworks");
-        let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
-        let mut lib = crate::defs::Library::new(&game, &appdata);
+        let (mut lib, _) = crate::defs::test_library();
         if lib.get("01_block").is_none() {
             return;
         }

@@ -28,10 +28,6 @@ pub fn rotate(p: Plane, m: &[i32; 9]) -> Plane {
     Plane { n: v3(n.x * m[0] + n.y * m[3] + n.z * m[6], n.x * m[1] + n.y * m[4] + n.z * m[7], n.x * m[2] + n.y * m[5] + n.z * m[8]), d: p.d }
 }
 
-pub fn transpose(m: &[i32; 9]) -> [i32; 9] {
-    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
-}
-
 #[derive(Default)]
 pub struct ShapeTable {
     planes: HashMap<i32, Plane>,

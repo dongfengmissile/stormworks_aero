@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use crate::model::Designations;
+use crate::model::{Designations, Switches};
 use crate::vehicle::Comp;
 use crate::wing::{aerofoil_index, Role, AEROFOILS};
 
@@ -20,10 +20,7 @@ pub struct Mark {
     pub foil: Option<usize>,
     pub default_foil: Option<usize>,
     pub default_fin: Option<usize>,
-    pub fly: Option<bool>,
-    pub vrs: Option<bool>,
-    pub props: Option<bool>,
-    pub ground: Option<bool>,
+    pub sw: Switches,
     /// Propeller/rotor blade width, x the part's own (`BLADE_WIDTH_RANGE`).
     pub blade_width: Option<f32>,
     /// Blade shape chosen for a propeller/rotor: true propeller, false rotor (None: auto).
@@ -43,7 +40,7 @@ impl Mark {
     }
 
     /// Attribute value: space-separated `w`, `s` / `s:<n>`, `r:<role>`, `f:<foil>`, `fd:<foil>`, `ff:<foil>`,
-    /// `fm:on|off`, `vrs:on|off`, `pm:on|off`, `ge:on|off`, `bw:<width>`, `sh:prop|rotor`.
+    /// `fm:on|off`, `vrs:on|off`, `pm:on|off`, `ge:on|off`, `js:on|off`, `bw:<width>`, `sh:prop|rotor`.
     pub fn encode(&self) -> String {
         let mut t: Vec<String> = Vec::new();
         if self.wing {
@@ -58,11 +55,8 @@ impl Mark {
         t.extend(self.foil.map(|f| format!("f:{}", foil_id(f))));
         t.extend(self.default_foil.map(|f| format!("fd:{}", foil_id(f))));
         t.extend(self.default_fin.map(|f| format!("ff:{}", foil_id(f))));
-        let on_off = |b: bool| if b { "on" } else { "off" };
-        t.extend(self.fly.map(|b| format!("fm:{}", on_off(b))));
-        t.extend(self.vrs.map(|b| format!("vrs:{}", on_off(b))));
-        t.extend(self.props.map(|b| format!("pm:{}", on_off(b))));
-        t.extend(self.ground.map(|b| format!("ge:{}", on_off(b))));
+        let mut sw = self.sw;
+        t.extend(sw.tokens().into_iter().filter_map(|(k, v)| v.map(|b| format!("{k}:{}", if b { "on" } else { "off" }))));
         t.extend(self.blade_width.map(|w| format!("bw:{w:.2}")));
         t.extend(self.airscrew.map(|a| format!("sh:{}", if a { "prop" } else { "rotor" })));
         t.join(" ")
@@ -80,13 +74,14 @@ impl Mark {
                 Some(("f", v)) => m.foil = aerofoil_index(v),
                 Some(("fd", v)) => m.default_foil = aerofoil_index(v),
                 Some(("ff", v)) => m.default_fin = aerofoil_index(v),
-                Some(("fm", v)) => m.fly = on_off(v),
-                Some(("vrs", v)) => m.vrs = on_off(v),
-                Some(("pm", v)) => m.props = on_off(v),
-                Some(("ge", v)) => m.ground = on_off(v),
                 Some(("sh", "prop")) => m.airscrew = Some(true),
                 Some(("sh", "rotor")) => m.airscrew = Some(false),
                 Some(("bw", v)) => m.blade_width = v.parse::<f32>().ok().filter(|w| w.is_finite()).map(|w| w.clamp(BLADE_WIDTH_RANGE.0, BLADE_WIDTH_RANGE.1)),
+                Some((k, v)) => {
+                    if let Some((_, slot)) = m.sw.tokens().into_iter().find(|(t, _)| *t == k) {
+                        *slot = on_off(v);
+                    }
+                }
                 _ => {}
             }
         }
@@ -117,10 +112,7 @@ pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
             foil: des.foils.get(&c.pos).copied(),
             default_foil: (first && des.default_foil != 0).then_some(des.default_foil),
             default_fin: if first { des.default_fin } else { None },
-            fly: if first { des.fly } else { None },
-            vrs: if first { des.vrs } else { None },
-            props: if first { des.props } else { None },
-            ground: if first { des.ground } else { None },
+            sw: if first { des.sw } else { Switches::default() },
             blade_width: des.widths.get(&c.pos).map(|&w| w as f32),
             airscrew: des.shapes.get(&c.pos).copied(),
         })
@@ -156,10 +148,7 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
     }
     d.default_foil = marks.iter().find_map(|m| m.default_foil).unwrap_or(0);
     d.default_fin = marks.iter().find_map(|m| m.default_fin);
-    d.fly = marks.iter().find_map(|m| m.fly);
-    d.vrs = marks.iter().find_map(|m| m.vrs);
-    d.props = marks.iter().find_map(|m| m.props);
-    d.ground = marks.iter().find_map(|m| m.ground);
+    d.sw = marks.iter().fold(Switches::default(), |a, m| a.or(m.sw));
     Some(d)
 }
 
@@ -207,10 +196,7 @@ pub fn spread_settings(parts: &[(usize, u32)]) {
     for m in parts.iter().filter_map(|(p, _)| t.get(p)) {
         d.default_foil = d.default_foil.or(m.default_foil);
         d.default_fin = d.default_fin.or(m.default_fin);
-        d.fly = d.fly.or(m.fly);
-        d.vrs = d.vrs.or(m.vrs);
-        d.props = d.props.or(m.props);
-        d.ground = d.ground.or(m.ground);
+        d.sw = d.sw.or(m.sw);
     }
     if d.is_empty() {
         return;
@@ -220,7 +206,7 @@ pub fn spread_settings(parts: &[(usize, u32)]) {
         let m = t.entry(*p).or_default();
         m.default_foil = d.default_foil;
         m.default_fin = d.default_fin;
-        (m.fly, m.vrs, m.props, m.ground) = (d.fly, d.vrs, d.props, d.ground);
+        m.sw = d.sw;
     }
 }
 
@@ -266,10 +252,10 @@ mod tests {
     fn spread_settings_reaches_every_body() {
         // Distinct fake pointers; body 1 (the missile) has a wing mark but no switch.
         let base = 0x7000_0000_1000usize;
-        set(base, Some(Mark { fly: Some(true), ..Default::default() }), false);
+        set(base, Some(Mark { sw: Switches { fly: Some(true), ..Default::default() }, ..Default::default() }), false);
         set(base + 16, Some(Mark { wing: true, ..Default::default() }), false);
         spread_settings(&[(base, 0), (base + 8, 0), (base + 16, 1)]);
-        assert_eq!(get(base + 16), Some(Mark { wing: true, fly: Some(true), ..Default::default() }));
+        assert_eq!(get(base + 16), Some(Mark { wing: true, sw: Switches { fly: Some(true), ..Default::default() }, ..Default::default() }));
         assert_eq!(get(base + 8), None);
         [base, base + 16].into_iter().for_each(|p| set(p, None, false));
     }
@@ -280,10 +266,10 @@ mod tests {
         let mut comps: Vec<Comp> = (0..4).map(|i| comp([i, 0, 0])).collect();
         comps[2].body = 1;
         comps[3].body = 1;
-        let d = Designations { fly: Some(true), ..Default::default() };
+        let d = Designations { sw: Switches { fly: Some(true), ..Default::default() }, ..Default::default() };
         let marks = from_designations(&d, &comps);
-        assert_eq!(marks.iter().map(|m| m.fly).collect::<Vec<_>>(), [Some(true), None, Some(true), None]);
-        assert_eq!(to_designations(&comps[2..], &marks[2..]).unwrap().fly, Some(true));
+        assert_eq!(marks.iter().map(|m| m.sw.fly).collect::<Vec<_>>(), [Some(true), None, Some(true), None]);
+        assert_eq!(to_designations(&comps[2..], &marks[2..]).unwrap().sw.fly, Some(true));
     }
 
     #[test]
@@ -297,13 +283,10 @@ mod tests {
         d.foils.insert([1, 0, 0], 2);
         d.default_foil = 4;
         d.default_fin = Some(9);
-        d.fly = Some(false);
-        d.vrs = Some(true);
-        d.props = Some(false);
-        d.ground = Some(false);
+        d.sw = Switches { fly: Some(false), vrs: Some(true), props: Some(false), ground: Some(false), jet: Some(true) };
         let marks = from_designations(&d, &comps);
         let text: Vec<String> = marks.iter().map(Mark::encode).collect();
-        assert_eq!(text[0], "fd:naca0012 ff:fin_hex4 fm:off vrs:on pm:off ge:off");
+        assert_eq!(text[0], "fd:naca0012 ff:fin_hex4 fm:off vrs:on pm:off ge:off js:on");
         assert_eq!(text[2], "w s");
         let back: Vec<Mark> = text.iter().map(|s| Mark::decode(s)).collect();
         assert_eq!(back, marks);

@@ -230,60 +230,33 @@ pub struct Flow {
 }
 
 impl BodyAero {
-    /// `no_skin[i]`: grid cell i belongs to a wing panel, whose skin friction the wing
-    /// model already counts (2·Cf in its Cd0), so its faces are left out of the wetted area.
-    /// `no_skin`: cells whose skin is a wing panel's. `skip`: cells left out altogether (they
-    /// belong to a body with its own model). Both may be empty.
+    /// `no_skin`: cells of a wing panel, whose skin friction the wing model already counts (2·Cf
+    /// in its Cd0), so their faces are left out of the wetted area. `skip`: cells left out
+    /// altogether (they belong to a body with its own model). Both may be empty.
     pub fn build(grid: &Grid, no_skin: &[bool], skip: &[bool]) -> BodyAero {
         let hollow = hollow_cells(grid);
-        let mut xs = cross_sections(grid, no_skin, skip, &hollow);
+        let xs = cross_sections(grid, no_skin, skip, &hollow);
         let (blunt_per, blunt) = blunt_faces(grid, skip, &hollow);
-        let thickness = VOXEL_M;
-        let filled: Vec<usize> = (0..xs.len()).filter(|&i| xs[i].area > 0.0).collect();
+        // Fewer than three filled slices: no body.
+        let mut body =
+            BodyAero { xs, front: 0, back: 0, thickness: VOXEL_M, length: 0.0, max_area: 0.0, fineness: 0.0, critical_mach: 1.0, sonic_drag_area: 0.0, sections: Vec::new(), blunt, skin_area: 0.0 };
+        let filled: Vec<usize> = (0..body.xs.len()).filter(|&i| body.xs[i].area > 0.0).collect();
         let (front, back) = match (filled.first(), filled.last()) {
             (Some(&f), Some(&b)) if b > f + 1 => (f, b),
-            _ => {
-                return BodyAero {
-                    xs,
-                    front: 0,
-                    back: 0,
-                    thickness,
-                    length: 0.0,
-                    max_area: 0.0,
-                    fineness: 0.0,
-                    critical_mach: 1.0,
-                    sonic_drag_area: 0.0,
-                    sections: Vec::new(),
-                    blunt,
-                    skin_area: 0.0,
-                }
-            }
+            _ => return body,
         };
-        raw_second_derivs(&mut xs, front, back, thickness);
-        let mut max_area = xs[front..=back].iter().map(|s| s.area).fold(0.0, f64::max);
-        let mut body = BodyAero {
-            xs,
-            front,
-            back,
-            thickness,
-            length: 0.0,
-            max_area,
-            fineness: 0.0,
-            critical_mach: 1.0,
-            sonic_drag_area: 0.0,
-            sections: Vec::new(),
-            blunt,
-            skin_area: 0.0,
-        };
+        raw_second_derivs(&mut body.xs, front, back, body.thickness);
+        (body.front, body.back) = (front, back);
+        body.max_area = body.xs[front..=back].iter().map(|s| s.area).fold(0.0, f64::max);
         let inner = [0, 1, 2].map(|a| (grid.dims[a] - 2) as f64);
         let voxel_volume = inner[0] * inner[1] * inner[2] * VOXEL_M.powi(3);
-        body.properties(voxel_volume, &mut max_area, &blunt_per);
+        body.properties(voxel_volume, &blunt_per);
         body
     }
 
     /// FAR `CalculateVesselAeroProperties` (minus intake ducting).
-    fn properties(&mut self, voxel_volume: f64, max_area: &mut f64, blunt_per: &[(f64, f64)]) {
-        let (front, back, t) = (self.front, self.back, self.thickness);
+    fn properties(&mut self, voxel_volume: f64, blunt_per: &[(f64, f64)]) {
+        let (front, back, t, max_area) = (self.front, self.back, self.thickness, self.max_area);
         let num_sections = back - front;
         let length = t * num_sections as f64;
         self.length = length;
@@ -292,7 +265,7 @@ impl BodyAero {
         let grid_filledness = filled_volume / voxel_volume * 25.0;
         let std_dev_cutoff = (3.0 * grid_filledness).clamp(0.5, 3.0);
 
-        let fineness = length * 0.5 / (*max_area / PI).sqrt();
+        let fineness = length * 0.5 / (max_area / PI).sqrt();
         let extra_deriv = (((5.0 - fineness) * 0.5).round() as i32 * DERIV_SMOOTHING_PASSES).max(0);
         let extra_area = (((grid_filledness / 25.0 - 0.5) * 4.0).round() as i32).max(0);
 
@@ -320,7 +293,6 @@ impl BodyAero {
         );
         sonic_pressure(&mut self.xs, front, back, t);
 
-        let fineness = length * 0.5 / (*max_area / PI).sqrt();
         self.fineness = fineness;
         // DATCOM 4.2.3.1 body form factor on each slice's own wetted area. FAR also divides
         // by the section count, which makes subsonic skin drag N times smaller than at Mach 2;
@@ -328,7 +300,7 @@ impl BodyAero {
         // Below a fineness of about 2 the formula runs away (60/f³: a cube's skin drag ×200).
         let ff = fineness.max(2.0);
         // Its 60/f³ is the pressure drag of a rounded shape: not for the share that is flat faces.
-        let rounded = 1.0 - ((self.blunt.front + self.blunt.back) / (2.0 * *max_area).max(1e-9)).min(1.0);
+        let rounded = 1.0 - ((self.blunt.front + self.blunt.back) / (2.0 * max_area).max(1e-9)).min(1.0);
         let viscous_drag_factor = 60.0 / ff.powi(3) * rounded + 0.0025 * ff + 1.0;
         self.skin_area = self.xs[front..=back].iter().map(|s| s.surface).sum::<f64>() * viscous_drag_factor;
         let crit = critical_mach_number(fineness) * self.crit_factor_unsmooth(fineness);
@@ -511,24 +483,7 @@ impl BodyAero {
 
     /// Sum of all section forces and torques (about `com`), body frame, newtons.
     /// `air_vel`: air velocity relative to the vehicle CoM (= −vehicle velocity), m/s.
-    /// `omega`: body rotation rate, rad/s. `q_scale`: multiplies ½ρV² (ρ passed in through it).
-    /// Drag areas (m²) flying straight ahead: skin friction, pressure along the area curve (wave
-    /// drag), flat faces, base. For diagnosis: `forces` is what flies.
-    pub fn axial_breakdown(&self, flow: &Flow) -> [f64; 4] {
-        let skin: f64 = self.sections.iter().map(|s| flow.cf * s.skin.eval(flow.mach)).sum();
-        let pressure: f64 = self.sections.iter().map(|s| -s.xforce_aoa0.eval(flow.mach)).sum();
-        let b = &self.blunt;
-        let face = b.front * blunt_face_cd(flow.mach);
-        let fore = (face + flow.cf * self.skin_area) / b.back.max(1e-9);
-        let base = b.back * blunt_base_cd(flow.mach, fore, self.length.max(self.thickness) / (4.0 * self.max_area.max(b.back) / PI).sqrt());
-        [skin, pressure, face, base]
-    }
-
-    /// Per section: station along the body (m, nose positive) and its pressure drag area at `mach`.
-    pub fn wave_by_section(&self, mach: f64) -> Vec<(f64, f64)> {
-        self.sections.iter().map(|s| (s.centroid.x, -s.xforce_aoa0.eval(mach))).collect()
-    }
-
+    /// `omega`: body rotation rate, rad/s. `rho`: air density, kg/m³.
     pub fn forces(&self, flow: &Flow, air_vel: V3, omega: V3, com: V3, rho: f64) -> (V3, V3) {
         let mut force = V3::ZERO;
         let mut torque = V3::ZERO;
@@ -730,7 +685,6 @@ fn rotate_from_to(from: V3, to: V3, v: V3) -> V3 {
     v * c + k.cross(v) * s + k * (k.dot(v) * (1.0 - c))
 }
 
-/// Slices along the main axis (grid Z, nose first) with area, centroid, flatness, exposure.
 /// Air that counts as body for the area curve, as in FAR: empty cells their own slice's outline
 /// closes in. A hollow fuselage open at an intake or exhaust is still a solid shape to the air
 /// round it (`Grid::solidify` only fills what is sealed on every side). Not where one can see
@@ -807,6 +761,7 @@ pub fn hollow_cells(g: &Grid) -> Vec<bool> {
     out
 }
 
+/// Slices along the main axis (grid Z, nose first) with area, centroid, flatness, exposure.
 fn cross_sections(g: &Grid, no_skin: &[bool], skip: &[bool], hollow: &[bool]) -> Vec<Xsec> {
     let [nx, ny, nz] = g.dims;
     let cell_area = VOXEL_M * VOXEL_M;

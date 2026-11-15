@@ -189,7 +189,7 @@ fn foil_range(cat: usize) -> std::ops::Range<usize> {
     let first = AEROFOILS.iter().position(|a| a.kind == kind).unwrap_or(0);
     first..first + AEROFOILS[first..].iter().take_while(|a| a.kind == kind).count()
 }
-/// Wing blocks tool: 0 toggle one block, 1 fill slab, 2 fill body, 3 remove slab, 4 new wing.
+/// Wing blocks tool: 0 mark blocks, 1 fill body, 2 merge wings.
 pub(crate) static WING_MODE: AtomicUsize = AtomicUsize::new(0);
 const ID_WING: i32 = 231;
 const ID_UNDO: i32 = 241;

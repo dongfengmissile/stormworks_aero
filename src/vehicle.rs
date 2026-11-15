@@ -43,8 +43,6 @@ pub struct PropSet {
 pub const IDENTITY: [i32; 9] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 
 impl Comp {
-    /// Grid cell of a definition-local voxel offset (offset as a row vector times `rot`;
-    /// the same convention the infrared plugin verified in game).
     /// Part-frame point in metres -> aero body frame (x fwd, y right, z down), metres.
     pub fn part_to_aero(&self, p: crate::math::V3) -> crate::math::V3 {
         let r = self.rot.map(|v| v as f64);
@@ -57,6 +55,8 @@ impl Comp {
         crate::math::v3(g[2] * 0.25, g[0] * 0.25, -g[1] * 0.25)
     }
 
+    /// Grid cell of a definition-local voxel offset (offset as a row vector times `rot`;
+    /// the same convention the infrared plugin verified in game).
     pub fn cell(&self, o: [i32; 3]) -> [i32; 3] {
         let r = &self.rot;
         [

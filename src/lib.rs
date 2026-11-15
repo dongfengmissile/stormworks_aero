@@ -1,9 +1,8 @@
 //! Stormworks aerodynamics plugin: a FAR-style (Ferram Aerospace Research) voxel
 //! aerodynamics model and workbench analysis menu.
 //!
-//! Platform-independent core (tested on the host): [`defs`], [`vehicle`], [`voxel`],
-//! [`body`], [`wing`], [`model`], [`view`]. Windows-only plugin: bootstrap, editor hook,
-//! ImGui overlay.
+//! Platform-independent core (tested on the host): the `pub mod`s below. Windows-only plugin
+//! (`#[cfg(windows)]`): bootstrap, game hooks, ImGui overlay.
 
 #![allow(non_snake_case)] // crate name matches the DLL name
 
@@ -54,3 +53,5 @@ mod watch;
 mod state;
 #[cfg(windows)]
 mod toolbar;
+#[cfg(windows)]
+mod ui;

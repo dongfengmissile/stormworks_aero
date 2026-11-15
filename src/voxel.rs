@@ -173,7 +173,7 @@ impl Grid {
         grid
     }
 
-    /// Grid from (cell, fill, owner); solids are plain cubes (tests).
+    /// Grid from (cell, fill, owner); solids are plain cubes (a body of its own, tests).
     pub fn from_cells(cells: &[([i32; 3], f32, u32)]) -> Grid {
         let mut lo = [i32::MAX; 3];
         let mut hi = [i32::MIN; 3];
@@ -437,14 +437,7 @@ mod slab_tests {
 
 // Chunk-mesh triangles -> voxels, for painting stalled voxels in the game render (paint.rs).
 
-/// Voxels of each triangle: its centroid moved 4 mm into the block, the centroid moved 1/16 m (a
-/// mesh reaching a little past its cell), then points halfway to each corner moved 1/16 m, each
-/// rounded to the voxel·0.25 grid (`colour_runs` says when which counts). 4 mm first: a thin wedge
-/// tip's slope lies just above the cell floor, and 1/16 m pushed it into the block below.
-/// "Into the block" uses the triangle's own plane, turned to agree with the vertex normals: those
-/// can be smoothed across an edge. The workbench block grid's lines (thin triangles in the grid
-/// colour, built into the mesh while the grid is on) get no voxel, so paint leaves them. Pure so
-/// it can be tested.
+/// A triangle's candidate voxels (`triangle_voxels`).
 pub type TriVoxels = [[i32; 3]; 5];
 
 /// Vertex colour of the workbench grid's lines (u8 RGBA as read little-endian; logged in game,
@@ -453,6 +446,14 @@ pub const GRID_LINE_RGBA: u32 = 0xff28_2828;
 /// `triangle_voxels` of a grid line triangle.
 pub const GRID_TRI: [i32; 3] = [i32::MIN, 1, 0];
 
+/// Voxels of each triangle: its centroid moved 4 mm into the block, the centroid moved 1/16 m (a
+/// mesh reaching a little past its cell), then points halfway to each corner moved 1/16 m, each
+/// rounded to the voxel·0.25 grid (`colour_runs` says when which counts). 4 mm first: a thin wedge
+/// tip's slope lies just above the cell floor, and 1/16 m pushed it into the block below.
+/// "Into the block" uses the triangle's own plane, turned to agree with the vertex normals: those
+/// can be smoothed across an edge. The workbench block grid's lines (thin triangles in the grid
+/// colour, built into the mesh while the grid is on) get no voxel, so paint leaves them. Pure so
+/// it can be tested.
 pub fn triangle_voxels(verts: &[u8], stride: usize, indices: &[u16]) -> Vec<TriVoxels> {
     let vcount = verts.len() / stride;
     let f = |v: usize, o: usize| f32::from_le_bytes(verts[v * stride + o..v * stride + o + 4].try_into().unwrap()) as f64;

@@ -104,15 +104,18 @@ unsafe fn ground_factors(physics_scene: usize, c_scene: usize, m: &Model, lbs: &
             1.0 - (1.0 - crate::model::ground_effect(h, span)) * level
         })
         .collect();
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::editor::now_ms();
-    if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 10_000 {
-        LAST.store(now, Ordering::Relaxed);
-        let min_phi = phis.iter().copied().fold(1.0, f64::min);
-        log_line(&format!(
-            "ground effect: lowest level panel {:?} m above the surface (span {span:.1} m), strongest induced-drag factor {min_phi:.2}",
-            lowest.map(|h| (h * 100.0).round() / 100.0)
-        ));
+    #[cfg(feature = "logging")]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::editor::now_ms();
+        if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 10_000 {
+            LAST.store(now, Ordering::Relaxed);
+            let min_phi = phis.iter().copied().fold(1.0, f64::min);
+            log_line(&format!(
+                "ground effect: lowest level panel {:?} m above the surface (span {span:.1} m), strongest induced-drag factor {min_phi:.2}",
+                lowest.map(|h| (h * 100.0).round() / 100.0)
+            ));
+        }
     }
     (phis, lowest)
 }
@@ -156,7 +159,7 @@ pub(crate) unsafe fn jet_sample(this: usize, phys_obj: usize, f: [f32; 3], rel: 
     let linear = (1.0 - h * 1.5 / 40_000.0).clamp(0.0, 1.0);
     let density = crate::model::atmosphere(h).rho / f64::from_bits(crate::model::SEA_LEVEL_RHO.load(Ordering::Relaxed)).max(1e-6);
     // With speed too: ram air packs more through the engine (`jet_thrust_lapse`).
-    let lapse = if JET_RAM.load(Ordering::Relaxed) && ptr_ok(rb + OFF_RB_LIN_VEL, 24) {
+    let lapse = if jet_ram_obj(phys_obj) && ptr_ok(rb + OFF_RB_LIN_VEL, 24) {
         crate::model::jet_thrust_lapse(v3_f64(rb + OFF_RB_LIN_VEL).len() / crate::model::atmosphere(h).a, h)
     } else {
         density
@@ -182,10 +185,13 @@ pub(crate) unsafe fn jet_sample(this: usize, phys_obj: usize, f: [f32; 3], rel: 
     j.called = true;
     j.seen_ms = now;
     let out = j.spool.output();
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 10_000 {
-        LAST.store(now, Ordering::Relaxed);
-        log_line(&format!("jet spool: nozzle {this:#x} shaft {rps:.1} RPS, game thrust {n:.0} N, applied {out:.0} N"));
+    #[cfg(feature = "logging")]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 10_000 {
+            LAST.store(now, Ordering::Relaxed);
+            log_line(&format!("jet spool: nozzle {this:#x} shaft {rps:.1} RPS, game thrust {n:.0} N, applied {out:.0} N"));
+        }
     }
     Some(j.dir.map(|d| (d * out) as f32))
 }
@@ -194,7 +200,7 @@ pub(crate) unsafe fn jet_sample(this: usize, phys_obj: usize, f: [f32; 3], rel: 
 /// altitude in place of the game's linear altitude factor.
 pub(crate) unsafe fn fan_scale(phys_obj: usize) -> f64 {
     use crate::editor::ptr_ok;
-    if !JET_RAM.load(Ordering::Relaxed) || !ptr_ok(phys_obj + OFF_OBJ_RIGID_BODY, 8) {
+    if !jet_ram_obj(phys_obj) || !ptr_ok(phys_obj + OFF_OBJ_RIGID_BODY, 8) {
         return 1.0;
     }
     let rb = read_usize_at(phys_obj + OFF_OBJ_RIGID_BODY);
@@ -485,6 +491,7 @@ pub(crate) static DEBUG: Mutex<Vec<VehicleDebug>> = Mutex::new(Vec::new());
 
 struct Craft {
     key: u64,
+    #[cfg(feature = "logging")]
     touched: u8,
     bodies: Vec<usize>,
     /// Component pointers in `Model::comps` order (live fin angles).
@@ -504,20 +511,17 @@ struct Craft {
     warned: bool,
     /// Per `Model::props`: mean inflow state (m/s), and the load calibration by (blades, length).
     prop_v: Vec<f64>,
-    /// Vehicle key whose marks `fly` / `vrs` were read from (they gate the build).
+    /// Vehicle key whose marks `sw` was read from (they gate the build).
     read_key: u64,
-    /// The vehicle's own settings (None: the global `ENABLED` / `VRS` / `PROPS`).
-    fly: Option<bool>,
-    vrs: Option<bool>,
-    props: Option<bool>,
-    ground: Option<bool>,
+    /// The vehicle's own settings (None: the global `ENABLED` / `VRS` / `PROPS` / ...).
+    sw: crate::model::Switches,
 }
 
 /// Physics object (`body + OFF_BODY_PHYS_OBJ`) -> the plugin flies its vehicle, from the last
 /// tick. The force hooks drop the game's air forces only for these.
 /// Read from the game's worker threads (hull air), so a read-write lock.
-/// Value: (the plugin flies it, with the plugin's propellers and rotors).
-static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, (bool, bool)>>> = LazyLock::new(Default::default);
+/// Value: (the plugin flies it, with the plugin's propellers and rotors, jet thrust follows airspeed).
+static FLOWN: LazyLock<std::sync::RwLock<HashMap<usize, (bool, bool, bool)>>> = LazyLock::new(Default::default);
 /// The game's hull air forces are skipped per body (`fluid_air_node_forces` hook), so the
 /// settings air constants stay vanilla.
 pub(crate) static AIR_PER_BODY: AtomicBool = AtomicBool::new(false);
@@ -525,9 +529,13 @@ pub(crate) static AIR_PER_BODY: AtomicBool = AtomicBool::new(false);
 /// Diagnosis: physics objects / rigid bodies the plugin acted on since the last tick, by what it did
 /// (1 our force, 2 damping zeroed, 4 hull air skipped, 8 fin/rudder force dropped, 16 prop thrust
 /// dropped, 32 rotor couple dropped, 64 jet reshaped). Checked against vehicles the model is off for.
+#[cfg(feature = "logging")]
 static TOUCHED: LazyLock<Mutex<HashMap<usize, u8>>> = LazyLock::new(Default::default);
-pub(crate) fn touch(ptr: usize, bit: u8) {
-    *TOUCHED.lock().unwrap_or_else(|p| p.into_inner()).entry(ptr).or_insert(0) |= bit;
+pub(crate) fn touch(_ptr: usize, _bit: u8) {
+    #[cfg(feature = "logging")]
+    {
+        *TOUCHED.lock().unwrap_or_else(|p| p.into_inner()).entry(_ptr).or_insert(0) |= _bit;
+    }
 }
 
 /// The plugin flies this physics object's vehicle (unknown objects: the global setting).
@@ -538,6 +546,11 @@ pub(crate) fn flies_obj(obj: usize) -> bool {
 /// This physics object's vehicle uses the plugin's propellers and rotors (unknown objects: the global settings).
 pub(crate) fn props_obj(obj: usize) -> bool {
     FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).map_or_else(|| ENABLED.load(Ordering::Relaxed) && PROPS.load(Ordering::Relaxed), |f| f.1)
+}
+
+/// This physics object's vehicle has jet thrust follow airspeed (unknown objects: the global setting).
+fn jet_ram_obj(obj: usize) -> bool {
+    FLOWN.read().unwrap_or_else(|p| p.into_inner()).get(&obj).map_or_else(|| JET_RAM.load(Ordering::Relaxed), |f| f.2)
 }
 
 /// Propellers and rotors blade by blade. Off: the game's own thrust and shaft load, with the
@@ -740,6 +753,7 @@ unsafe fn fluid_mass(body: usize, body_mass: f64) -> f64 {
 
 /// Watched vehicle, 5 lines a second: attitude, rates and our air moment in its own frame, and the
 /// game's rotational inertia beside the model's (a tumble diagnosis).
+#[cfg(feature = "logging")]
 fn watch_log(id: u32, mb: &LiveBody, rb: usize, model: &Model, forces: &[crate::model::LiveForce], dt: f64, fmax: f64, deflect: &[f64]) {
     // Step lag check: Bullet should turn the moment we apply now into the next spin change,
     // dω = I⁻¹·M·dt. Compare the measured dω with this tick's and the previous tick's moment.
@@ -883,7 +897,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     prop_loads().retain(|_, l| l.step + 30 >= step);
     let mut st = STATE.lock().unwrap_or_else(|p| p.into_inner());
     air_constants(&mut st, enabled && !AIR_PER_BODY.load(Ordering::Relaxed));
-    let mut flown: HashMap<usize, (bool, bool)> = HashMap::new();
+    let mut flown: HashMap<usize, (bool, bool, bool)> = HashMap::new();
+    #[cfg(feature = "logging")]
     let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|p| p.into_inner()));
     TICKS.fetch_add(1, Ordering::Relaxed);
     let _fault = crate::fault::enter(crate::fault::stage::FLIGHT);
@@ -959,10 +974,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             warned: false,
             prop_v: Vec::new(),
             read_key: 0,
-            fly: None,
-            vrs: None,
-            props: None,
-            ground: None,
+            sw: Default::default(),
+            #[cfg(feature = "logging")]
             touched: 0,
         });
         // The vehicle's own settings ride on its parts' marks.
@@ -970,16 +983,13 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             if let Some((comps, _, ptrs)) = vehicle_comps(read_usize_at(rec + 8)) {
                 craft.read_key = key;
                 let d = crate::marks::designations(&comps, &ptrs);
-                craft.fly = d.as_ref().and_then(|d| d.fly);
-                craft.vrs = d.as_ref().and_then(|d| d.vrs);
-                craft.props = d.as_ref().and_then(|d| d.props);
-                craft.ground = d.as_ref().and_then(|d| d.ground);
+                craft.sw = d.as_ref().map(|d| d.sw).unwrap_or_default();
                 log_line(&format!(
                     "flight: vehicle {id}: {} parts, {} bodies; plugin flight model {} ({})",
                     comps.len(),
                     bodies.len(),
-                    if craft.fly.unwrap_or(enabled) { "ON" } else { "off" },
-                    match (craft.fly, d.is_some()) {
+                    if craft.sw.fly.unwrap_or(enabled) { "ON" } else { "off" },
+                    match (craft.sw.fly, d.is_some()) {
                         (Some(_), _) => "its own saved setting",
                         (None, true) => "global setting; it has aero marks but no saved switch",
                         (None, false) => "global setting; no aero marks",
@@ -987,22 +997,26 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
                 ));
             }
         }
-        let fly = craft.fly.unwrap_or(enabled);
-        let props_on = PROPS_HOOKED.load(Ordering::Relaxed) && craft.props.unwrap_or_else(|| PROPS.load(Ordering::Relaxed));
+        let fly = craft.sw.fly.unwrap_or(enabled);
+        let props_on = PROPS_HOOKED.load(Ordering::Relaxed) && craft.sw.props.unwrap_or_else(|| PROPS.load(Ordering::Relaxed));
+        let jet = craft.sw.jet.unwrap_or_else(|| JET_RAM.load(Ordering::Relaxed));
         for &b in &bodies {
             if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) {
-                flown.insert(read_usize_at(b + OFF_BODY_PHYS_OBJ), (fly, fly && props_on));
+                flown.insert(read_usize_at(b + OFF_BODY_PHYS_OBJ), (fly, fly && props_on, jet));
             }
         }
         if !fly {
-            let bits = bodies.iter().fold(0u8, |a, &b| {
-                let obj = if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) { read_usize_at(b + OFF_BODY_PHYS_OBJ) } else { 0 };
-                let rb = if ptr_ok(obj, OFF_OBJ_RIGID_BODY + 8) { read_usize_at(obj + OFF_OBJ_RIGID_BODY) } else { 0 };
-                a | touched.get(&obj).copied().unwrap_or(0) | touched.get(&rb).copied().unwrap_or(0)
-            });
-            if bits & !craft.touched != 0 {
-                craft.touched |= bits;
-                log_line(&format!("flight: vehicle {id} has the plugin model OFF but the plugin acted on it: bits {bits:#04x} (1 force, 2 damping, 4 hull air, 8 fin force, 16 prop thrust, 32 couple, 64 jet)"));
+            #[cfg(feature = "logging")]
+            {
+                let bits = bodies.iter().fold(0u8, |a, &b| {
+                    let obj = if ptr_ok(b + OFF_BODY_PHYS_OBJ, 8) { read_usize_at(b + OFF_BODY_PHYS_OBJ) } else { 0 };
+                    let rb = if ptr_ok(obj, OFF_OBJ_RIGID_BODY + 8) { read_usize_at(obj + OFF_OBJ_RIGID_BODY) } else { 0 };
+                    a | touched.get(&obj).copied().unwrap_or(0) | touched.get(&rb).copied().unwrap_or(0)
+                });
+                if bits & !craft.touched != 0 {
+                    craft.touched |= bits;
+                    log_line(&format!("flight: vehicle {id} has the plugin model OFF but the plugin acted on it: bits {bits:#04x} (1 force, 2 damping, 4 hull air, 8 fin force, 16 prop thrust, 32 couple, 64 jet)"));
+                }
             }
             continue;
         }
@@ -1064,6 +1078,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             }
             continue;
         }
+        #[cfg(feature = "logging")]
         if !craft.warned {
             // Once per model: where each body's parts land vs its physics CoM (frame check).
             craft.warned = true;
@@ -1081,8 +1096,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             // Arrow frame check: the body render matrix must place the model CoM where physics does.
             let r = body_render_matrix(bodies[main]).unwrap_or([0.0; 16]);
             let g = mb.world_to_grid(mb.to_world(model.com));
-            let p =
-                v3(g.x * r[0] + g.y * r[4] + g.z * r[8] + r[12], g.x * r[1] + g.y * r[5] + g.z * r[9] + r[13], g.x * r[2] + g.y * r[6] + g.z * r[10] + r[14]);
+            let p = crate::math::xf_point(&r, g);
             log_line(&format!(
                 "flight: vehicle {id}: render matrix places the CoM {:.2} m from physics (arrows fall back to tick positions above 20 m)",
                 (p - mb.to_world(model.com)).len()
@@ -1102,7 +1116,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         let fmax = 60.0 * 9.81 * total_mass.max(1.0);
         let rbs: HashSet<usize> = live.iter().flatten().map(|l| l.1).collect();
         let jet_fill = fill_jets(&rbs, apply_force);
-        let (ground, wing_height) = if craft.ground.unwrap_or_else(|| GROUND.load(Ordering::Relaxed)) {
+        let (ground, wing_height) = if craft.sw.ground.unwrap_or_else(|| GROUND.load(Ordering::Relaxed)) {
             ground_factors(physics_scene, scene, &model, &lbs, main, &bodies)
         } else {
             (Vec::new(), None)
@@ -1124,9 +1138,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         // Wings and fuselage only: the flight data's lift, drag and coefficients leave out rotor thrust.
         let n_aero = forces.len();
         // Propellers and rotors: blade-element forces at each one's live speed and pitch.
-        craft.prop_v.resize(model.props.len(), 0.0);
         let step = STEP.load(Ordering::Relaxed);
-        let vrs = craft.vrs.unwrap_or_else(|| VRS.load(Ordering::Relaxed));
+        let vrs = craft.sw.vrs.unwrap_or_else(|| VRS.load(Ordering::Relaxed));
         let mut prop_out: Vec<(usize, crate::model::PropOut, f64)> = Vec::new();
         if !props_on {
             // Switched off: hand thrust and shaft load back to the game this tick, not when the entries age out.
@@ -1195,6 +1208,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         craft.prev_com = Some(mb.com);
         crate::watch::note(id, mb.com, bodies.get(main).copied().unwrap_or(0), mb.world_to_grid(mb.com));
         crate::watch::add_row(crate::watch::Row { id, com: mb.com, vel: mb.vel, mass: total_mass, parts: model.comps.len(), modelled: true, loaded: true, fixed: false });
+        #[cfg(feature = "logging")]
         if crate::watch::watched() == Some(id) && !client {
             watch_log(id, &mb, live.get(main).copied().flatten().map_or(0, |l| l.1), &model, &forces, craft.dt, fmax, &deflect);
         }
@@ -1273,18 +1287,21 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             } else {
                 (None, "est. from acceleration".into())
             };
-            static LAST_LOG: AtomicU64 = AtomicU64::new(0);
-            let now = crate::editor::now_ms();
-            if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) > 10_000 {
-                LAST_LOG.store(now, Ordering::Relaxed);
-                log_line(&format!(
-                    "thrust: vehicle {id}: {ecalls} engine force calls last step ({}), {:.0} N along nose; weight {:.0} N (tank fluid {:.0} kg), estimate {:.0} N",
-                    d.thrust_source,
-                    ef.dot(nose),
-                    weight_mass * 9.81,
-                    weight_mass - total_mass,
-                    craft.thrust
-                ));
+            #[cfg(feature = "logging")]
+            {
+                static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+                let now = crate::editor::now_ms();
+                if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) > 10_000 {
+                    LAST_LOG.store(now, Ordering::Relaxed);
+                    log_line(&format!(
+                        "thrust: vehicle {id}: {ecalls} engine force calls last step ({}), {:.0} N along nose; weight {:.0} N (tank fluid {:.0} kg), estimate {:.0} N",
+                        d.thrust_source,
+                        ef.dot(nose),
+                        weight_mass * 9.81,
+                        weight_mass - total_mass,
+                        craft.thrust
+                    ));
+                }
             }
             d.thrust = craft.thrust;
             // Live CG (the game's own centre of mass; tank fluid is not in it, the game hangs its weight on

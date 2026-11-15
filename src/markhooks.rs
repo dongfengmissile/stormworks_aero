@@ -60,7 +60,6 @@ const P_UNDO_APPLY: [u8; 24] =
 const OFF_SER_MODE: usize = 0x20; // 0 XML, 1 binary
 const OFF_SER_WRITE: usize = 0x24; // 1 write, 0 read
 const OFF_DEF_NAME_LEN: usize = 0x290;
-const OFF_DEF_MIRROR_BYTE: usize = 0x40;
 const ATTR: &[u8] = b"aero\0";
 
 #[repr(C)]
@@ -183,7 +182,7 @@ unsafe fn same_def(src: usize, comp: usize) -> bool {
         && readable(a, alen)
         && readable(b, blen)
         && std::slice::from_raw_parts(a as *const u8, alen) == std::slice::from_raw_parts(b as *const u8, blen)
-        && *((src + 0x10) as *const u8) == *((def + OFF_DEF_MIRROR_BYTE) as *const u8)
+        && *((src + 0x10) as *const u8) == *((def + OFF_DEF_MIRROR) as *const u8)
 }
 
 unsafe extern "system" fn def_ref_ser_detour(src: usize, a2: usize, ser: usize, node: usize, compact: usize) -> usize {

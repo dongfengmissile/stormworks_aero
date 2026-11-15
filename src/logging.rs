@@ -16,12 +16,15 @@ use crate::state::LOG_PATH;
 #[cfg(feature = "logging")]
 static START: OnceLock<Instant> = OnceLock::new();
 
+/// Line prefix: the time since bootstrap in the verbose build, nothing in the player build.
+/// One place, so no call site can forget it (or drift on its own clock).
 #[cfg(feature = "logging")]
-fn elapsed_ms() -> u64 {
-    START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis() as u64
+fn stamp() -> String {
+    format!("[{} ms] ", START.get_or_init(Instant::now).elapsed().as_millis())
+}
+#[cfg(not(feature = "logging"))]
+fn stamp() -> &'static str {
+    ""
 }
 
 /// Hard cap on the verbose log. Every probe is individually budgeted, but a
@@ -55,21 +58,7 @@ pub(crate) fn log_line(message: &str) {
         if LOG_BYTES.load(Ordering::Relaxed) >= LOG_BUDGET_BYTES {
             if !LOG_CAPPED.swap(true, Ordering::Relaxed) {
                 if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                    #[cfg(feature = "logging")]
-                    let _ = writeln!(
-                        file,
-                        "[{} ms] log budget of {} MB reached; further logging is disabled for this \
-launch. This is the verbose build - the player build logs almost nothing.",
-                        elapsed_ms(),
-                        LOG_BUDGET_BYTES / (1024 * 1024)
-                    );
-                    #[cfg(not(feature = "logging"))]
-                    let _ = writeln!(
-                        file,
-                        "log budget of {} MB reached; further logging is disabled for this \
-launch. This is the verbose build - the player build logs almost nothing.",
-                        LOG_BUDGET_BYTES / (1024 * 1024)
-                    );
+                    let _ = writeln!(file, "{}log budget of {} MB reached; further logging is disabled for this launch.", stamp(), LOG_BUDGET_BYTES / (1024 * 1024));
                 }
             }
             return;
@@ -79,12 +68,7 @@ launch. This is the verbose build - the player build logs almost nothing.",
         // last line before a crash is on disk. The explicit flush documents
         // that requirement (it is a no-op for an unbuffered `File`).
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            // Every verbose line carries the time since bootstrap. One place,
-            // so no call site can forget it (or drift on its own clock).
-            #[cfg(feature = "logging")]
-            let _ = writeln!(file, "[{} ms] {message}", elapsed_ms());
-            #[cfg(not(feature = "logging"))]
-            let _ = writeln!(file, "{message}");
+            let _ = writeln!(file, "{}{message}", stamp());
             let _ = file.flush();
             LOG_BYTES.fetch_add(message.len() + 24, Ordering::Relaxed);
         }

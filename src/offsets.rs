@@ -1,4 +1,5 @@
-//! Every fact about `stormworks64.exe` lives here, so a game update is a one-file diff.
+//! Facts about `stormworks64.exe` shared between modules. A hook's own addresses and prologues sit
+//! beside it (`markhooks.rs`, `watch.rs`, `toolbar.rs`, `hooks.rs`).
 //! Source: re-workbench pass on a fresh IDA database (`stormworks_aero_idapro/`).
 
 /// stormworks64.exe sha256 c38c03ff756b4f42bbc9f11cdbb034977ad0f968e45741c5cf410732f22a338d

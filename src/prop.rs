@@ -199,8 +199,6 @@ pub fn induced(vz: f64, vx: f64, vrs: bool) -> (f64, f64) {
     (base + delta, depth * fade)
 }
 
-/// Section lift and drag coefficients at any angle (rad, wrapped), Mach and Reynolds number:
-/// thin-aerofoil lift to the stall, flat plate beyond, with the section's drag rise.
 /// Zero-lift angle, lift slope (per rad) and stall angle past it (rad) at `mach`.
 fn stall_angle(foil: usize, mach: f64) -> (f64, f64, f64) {
     let f = &AEROFOILS[foil.min(AEROFOILS.len() - 1)];
@@ -216,6 +214,8 @@ fn cl_max(foil: usize, mach: f64) -> f64 {
     AEROFOILS[foil.min(AEROFOILS.len() - 1)].cl_max * (1.0 - 0.35 * (mach - 0.3).max(0.0)).max(0.5)
 }
 
+/// Section lift and drag coefficients at any angle (rad, wrapped), Mach and Reynolds number:
+/// thin-aerofoil lift to the stall, flat plate beyond, with the section's drag rise.
 pub fn section(foil: usize, alpha: f64, mach: f64, re: f64) -> (f64, f64) {
     let f = &AEROFOILS[foil.min(AEROFOILS.len() - 1)];
     let alpha = (alpha + PI).rem_euclid(2.0 * PI) - PI;

@@ -337,23 +337,40 @@ pub(crate) fn eigen3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [V3; 3]) {
 
 /// Principal axes of a point set: (axes sorted thinnest first, mean); None for under 3 points.
 fn principal(pts: &[V3]) -> Option<([V3; 3], V3)> {
-    if pts.len() < 3 {
-        return None;
-    }
-    let mean = pts.iter().fold(V3::ZERO, |a, p| a + *p) * (1.0 / pts.len() as f64);
+    (pts.len() >= 3).then(|| {
+        let (mean, _, axes) = weighted_axes(pts, &vec![1.0; pts.len()], 0.0);
+        (axes, mean)
+    })
+}
+
+/// Weighted mean of a point set, and its spread along its principal axes with those axes, both
+/// thinnest first. `own`: the spread of each point's own cell, along every axis.
+fn weighted_axes(pts: &[V3], w: &[f64], own: f64) -> (V3, [f64; 3], [V3; 3]) {
+    let wsum: f64 = w.iter().sum();
+    let mean = pts.iter().zip(w).fold(V3::ZERO, |a, (p, w)| a + *p * *w) * (1.0 / wsum);
     let mut cov = [[0.0; 3]; 3];
-    for p in pts {
+    for (p, wi) in pts.iter().zip(w) {
         let d = *p - mean;
         for i in 0..3 {
             for j in 0..3 {
-                cov[i][j] += d.get(i) * d.get(j);
+                cov[i][j] += wi * (d.get(i) * d.get(j) + if i == j { own } else { 0.0 });
             }
         }
     }
     let (vals, vecs) = eigen3(cov);
     let mut order = [0, 1, 2];
     order.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-    Some((order.map(|k| vecs[k]), mean))
+    (mean, order.map(|k| vals[k]), order.map(|k| vecs[k]))
+}
+
+/// Least-squares line through (x, y): (slope, mean x, mean y). Slope 0 when the xs coincide (`eps`).
+fn fit_line(pts: impl Iterator<Item = (f64, f64)>, eps: f64) -> (f64, f64, f64) {
+    let (mut n, mut sx, mut sxx, mut sy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (x, y) in pts {
+        (n, sx, sxx, sy, sxy) = (n + 1.0, sx + x, sxx + x * x, sy + y, sxy + x * y);
+    }
+    let den = n * sxx - sx * sx;
+    (if den.abs() > eps { (n * sxy - sx * sy) / den } else { 0.0 }, sx / n, sy / n)
 }
 
 /// Extents of a point set along its principal axes, thinnest first.
@@ -413,7 +430,7 @@ pub fn plate_panel(pts: &[V3], tris: &[[V3; 3]], cells: Vec<usize>, role: Role, 
     let ds = b / N as f64;
     let nmean = mean.dot(n);
     let (mut area, mut centroid) = (0.0, V3::ZERO);
-    let (mut sx, mut sxx, mut sc, mut sxc, mut sm, mut sxm, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let mut strips = Vec::new(); // (span position, chord, mid-chord)
     for k in 0..N {
         let x = (k as f64 + 0.5) * ds;
         let Some((cl, ch)) = slice_2d(&outline, x) else {
@@ -422,20 +439,13 @@ pub fn plate_panel(pts: &[V3], tris: &[[V3; 3]], cells: Vec<usize>, role: Role, 
         let (chord, mid) = (ch - cl, 0.5 * (cl + ch));
         area += chord * ds;
         centroid += (u * mid + s * (x + lo) + n * nmean) * (chord * ds);
-        sx += x;
-        sxx += x * x;
-        sc += chord;
-        sxc += x * chord;
-        sm += mid;
-        sxm += x * mid;
-        cnt += 1.0;
+        strips.push((x, chord, mid));
     }
-    if area < 1e-6 || cnt < 2.0 {
+    if area < 1e-6 || strips.len() < 2 {
         return None;
     }
-    let den = cnt * sxx - sx * sx;
-    let (chord_slope, mid_slope) = if den.abs() > 1e-12 { ((cnt * sxc - sx * sc) / den, (cnt * sxm - sx * sm) / den) } else { (0.0, 0.0) };
-    let (mean_x, mean_c) = (sx / cnt, sc / cnt);
+    let (chord_slope, mean_x, mean_c) = fit_line(strips.iter().map(|t| (t.0, t.1)), 1e-12);
+    let mid_slope = fit_line(strips.iter().map(|t| (t.0, t.2)), 1e-12).0;
     let root_c = (mean_c - chord_slope * mean_x).max(1e-3);
     let tip_c = (mean_c + chord_slope * (b - mean_x)).max(0.0);
     let mut p = Panel {
@@ -508,26 +518,11 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
     }
     let pts: Vec<V3> = cells.iter().map(|&i| aero_pos(grid.cell(i))).collect();
     let w: Vec<f64> = cells.iter().map(|&i| grid.fill[i] as f64).collect();
-    let wsum: f64 = w.iter().sum();
-    let mean = pts.iter().zip(&w).fold(V3::ZERO, |a, (p, w)| a + *p * *w) * (1.0 / wsum);
-    let own = VOXEL_M * VOXEL_M / 12.0;
-    let mut cov = [[0.0; 3]; 3];
-    for (p, wi) in pts.iter().zip(&w) {
-        let d = *p - mean;
-        for i in 0..3 {
-            for j in 0..3 {
-                cov[i][j] += wi * (d.get(i) * d.get(j) + if i == j { own } else { 0.0 });
-            }
-        }
-    }
-    let (vals, vecs) = eigen3(cov);
-    let mut order = [0, 1, 2];
-    order.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-    let mut n = vecs[order[0]];
-    let mut short = vecs[order[1]]; // shorter in-plane axis
-                                    // A strip one voxel thick and one voxel wide is ambiguous: prefer a horizontal surface.
-    if vals[order[1]] < vals[order[0]] * 1.1 && vecs[order[1]].z.abs() > n.z.abs() {
-        (n, short) = (vecs[order[1]], vecs[order[0]]);
+    let (mean, vals, vecs) = weighted_axes(&pts, &w, VOXEL_M * VOXEL_M / 12.0);
+    let (mut n, mut short) = (vecs[0], vecs[1]); // normal, shorter in-plane axis
+    // A strip one voxel thick and one voxel wide is ambiguous: prefer a horizontal surface.
+    if vals[1] < vals[0] * 1.1 && vecs[1].z.abs() > n.z.abs() {
+        (n, short) = (vecs[1], vecs[0]);
     }
     let fwd = v3(1.0, 0.0, 0.0);
     // A plate facing the flow (Starship-style drag flaps) has no chord from the airflow: the chord
@@ -559,8 +554,7 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
     let b = (keys[keys.len() - 1] - s0 + 1) as f64 * VOXEL_M;
     let mut area = 0.0;
     let mut centroid = V3::ZERO;
-    // Least squares of chord and mid-chord against span position.
-    let (mut sx, mut sxx, mut sc, mut sxc, mut sm, mut sxm, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let mut fit = Vec::new(); // (span position, chord, mid-chord)
     let nmean = mean.dot(n);
     for k in &keys {
         let (umin, umax, _) = strips[k];
@@ -569,19 +563,11 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
         let x = (*k - s0) as f64 * VOXEL_M;
         area += chord * VOXEL_M;
         centroid += (u * mid + s * (*k as f64 * VOXEL_M) + n * nmean) * (chord * VOXEL_M);
-        sx += x;
-        sxx += x * x;
-        sc += chord;
-        sxc += x * chord;
-        sm += mid;
-        sxm += x * mid;
-        cnt += 1.0;
+        fit.push((x, chord, mid));
     }
     centroid = centroid * (1.0 / area);
-    let den = cnt * sxx - sx * sx;
-    let (chord_slope, mid_slope) = if den.abs() > 1e-9 { ((cnt * sxc - sx * sc) / den, (cnt * sxm - sx * sm) / den) } else { (0.0, 0.0) };
-    let mean_x = sx / cnt;
-    let mean_c = sc / cnt;
+    let (chord_slope, mean_x, mean_c) = fit_line(fit.iter().map(|t| (t.0, t.1)), 1e-9);
+    let mid_slope = fit_line(fit.iter().map(|t| (t.0, t.2)), 1e-9).0;
     let root_c = (mean_c - chord_slope * mean_x).max(VOXEL_M * 0.5);
     let tip_c = (mean_c + chord_slope * (b - VOXEL_M - mean_x)).max(VOXEL_M * 0.5);
     Ok(Panel {
@@ -742,7 +728,6 @@ pub struct WingFlow {
     pub rho: f64,
     /// Skin friction per panel is from its own MAC Reynolds number: Re = re_per_m · MAC.
     pub re_per_m: f64,
-    pub gamma: f64,
 }
 
 /// Per-panel results of the first (raw) pass, read by neighbours.
@@ -761,7 +746,6 @@ pub struct PanelForce {
     pub at: V3,
     pub cl: f64,
     pub cd: f64,
-    pub cd_induced: f64,
 }
 
 /// Forces on every panel. `vel(panel, at)`: velocity of a point of that panel through the air.
@@ -845,7 +829,7 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
         let speed = v.len();
         if speed < 0.1 {
             stall[i] = 0.0;
-            out.push(PanelForce { force: V3::ZERO, at: p.centroid, cl: 0.0, cd: 0.0, cd_induced: 0.0 });
+            out.push(PanelForce { force: V3::ZERO, at: p.centroid, cl: 0.0, cd: 0.0 });
             continue;
         }
         let vn = v * (1.0 / speed);
@@ -908,14 +892,7 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
         // Skin friction from this panel's Reynolds number (×1.1 for thickness, FAR).
         let af = &AEROFOILS[p.foil.min(AEROFOILS.len() - 1)];
         let cf = skin_friction(flow.re_per_m * p.mac, mach) * af.form_factor();
-        let beta = {
-            let b = (mach * mach - 1.0).sqrt();
-            if b.is_nan() || b < 0.663_324_958_07 {
-                0.663_324_958_07
-            } else {
-                b
-            }
-        };
+        let beta = (mach * mach - 1.0).sqrt().max(0.663_324_958_07); // `max` drops the subsonic NaN
         let tan_sweep = (1.0 - cos_sweep * cos_sweep).clamp(0.0, 1.0).sqrt() / cos_sweep.max(1e-6);
         let cd0_own = cd_compressibility(mach, cos_sweep, af);
         let cd0 = if up_infl > 0.99 { up_cd0 } else { cd0_own * (1.0 - up_infl.min(1.0)) + up_cd0 } + 2.0 * cf;
@@ -984,7 +961,7 @@ pub fn panel_forces(panels: &[Panel], flow: &WingFlow, vel: &dyn Fn(usize, V3) -
         cl *= p.interference;
         let q = 0.5 * flow.rho * speed * speed;
         let force = (lift_dir * cl - vn * cd) * (q * p.area);
-        out.push(PanelForce { force, at, cl, cd, cd_induced: cdi });
+        out.push(PanelForce { force, at, cl, cd });
     }
     out
 }
@@ -1096,7 +1073,6 @@ fn le_factor(ar: f64, beta: f64, tan_sweep: f64) -> f64 {
 fn cd_compressibility(mach: f64, cos_sweep: f64, af: &Aerofoil) -> f64 {
     let cos_sweep = cos_sweep.max(1e-6);
     let beta = (mach * mach - 1.0).sqrt().max(0.663_324_96);
-    let beta = if beta.is_nan() { 0.663_324_96 } else { beta };
     let tan_sweep = (1.0 - cos_sweep * cos_sweep).max(0.0).sqrt() / cos_sweep;
     let bt = beta / tan_sweep.max(1e-9);
     let wave = af.k_wave * af.t_c * af.t_c;
@@ -1129,7 +1105,7 @@ pub fn flat_plate_cd(mach: f64, ar: f64) -> f64 {
     let beta = (mach * mach - 1.0).sqrt().max(0.663_324_958_07);
     let ar = ar.max(1e-3);
     let ar = ar.max(1.0 / ar);
-    cd_max_flat_plate(mach, if beta.is_nan() { 0.663_324_958_07 } else { beta }) * (0.60 + 0.40 * (-20.0 / ar).exp())
+    cd_max_flat_plate(mach, beta) * (0.60 + 0.40 * (-20.0 / ar).exp())
 }
 
 fn cd_max_flat_plate(mach: f64, beta: f64) -> f64 {
@@ -1222,7 +1198,7 @@ mod tests {
             com,
         );
         assert!(panels.iter().any(|p| p.role == Role::Flap) && panels.iter().any(|p| !p.aft.is_empty() || !p.fwd.is_empty()));
-        let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6, gamma: 1.4 };
+        let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6 };
         let lift = |flap_deg: f64| {
             let a = 8f64.to_radians();
             let v = v3(a.cos(), 0.0, a.sin()) * 68.0;
@@ -1268,7 +1244,7 @@ mod tests {
     fn lift_up_at_positive_aoa_and_stall_hysteresis() {
         let (g, com) = flat_wing();
         let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), com);
-        let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6, gamma: 1.4 };
+        let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6 };
         let mut stall = vec![0.0; panels.len()];
         let defl = vec![0.0; panels.len()];
         let at = |deg: f64, stall: &mut Vec<f64>| {
@@ -1302,7 +1278,7 @@ mod tests {
             let mut panels = base.clone();
             panels.iter_mut().for_each(|p| p.foil = aerofoil_index(foil).unwrap());
             let speed = mach * 340.0;
-            let flow = WingFlow { mach, rho: 1.225, re_per_m: 4.6e6, gamma: 1.4 };
+            let flow = WingFlow { mach, rho: 1.225, re_per_m: 4.6e6 };
             let a = f64::to_radians(deg);
             let v = v3(a.cos(), 0.0, a.sin()) * speed;
             let mut stall = vec![0.0; panels.len()];

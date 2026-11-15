@@ -12,8 +12,9 @@ use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 use crate::defs::Library;
 use crate::editor::{self, Snapshot};
 use crate::logging::log_line;
-use crate::math::V3;
+use crate::math::{xf_dir, xf_point, V3};
 use crate::model::{Coeffs, Cond, Designations, Model, Stability};
+use crate::ui::*;
 use crate::vehicle::Comp;
 use crate::view::{self, Camera, Face, Image};
 use crate::voxel::{EMPTY, INTERIOR};
@@ -21,20 +22,6 @@ use crate::wing::{Role, AEROFOILS};
 
 const VIEW_W: usize = 760;
 const VIEW_H: usize = 460;
-
-const CL_COLOR: [f32; 4] = [0.30, 0.80, 0.95, 1.0];
-const CD_COLOR: [f32; 4] = [0.95, 0.40, 0.35, 1.0];
-const CM_COLOR: [f32; 4] = [0.95, 0.80, 0.30, 1.0];
-const LD_COLOR: [f32; 4] = [0.45, 0.85, 0.45, 1.0];
-const DIM: [f32; 4] = [0.60, 0.62, 0.66, 1.0];
-const GOOD: [f32; 4] = [0.45, 0.85, 0.45, 1.0];
-/// A tooltip wrapped to a readable width (imgui tooltips are one line per paragraph otherwise).
-fn hover_tip(ui: &Ui, text: impl AsRef<str>) {
-    ui.tooltip(|| {
-        let _wrap = ui.push_text_wrap_pos_with_pos(ui.current_font_size() * 30.0);
-        ui.text(text.as_ref());
-    });
-}
 
 /// Airspeeds (m/s) of the F7 propeller thrust curve.
 const CURVE_SPEEDS: [f64; 61] = {
@@ -47,14 +34,6 @@ const CURVE_SPEEDS: [f64; 61] = {
     v
 };
 const CURVE_COLORS: [[f32; 4]; 4] = [CL_COLOR, CM_COLOR, LD_COLOR, CD_COLOR];
-const BAD: [f32; 4] = [0.95, 0.40, 0.35, 1.0];
-const WARN: [f32; 4] = [0.95, 0.70, 0.30, 1.0];
-/// Controls column width, and where its fields start.
-const LEFT_W: f32 = 210.0;
-const FIELD_X: f32 = 92.0;
-/// Plot area inset from the plot's own left and right edges (tick labels).
-const PLOT_PAD_L: f32 = 44.0;
-const PLOT_PAD_R: f32 = 14.0;
 const FLAPS: [&str; 4] = ["Up", "Climb", "Takeoff", "Landing"];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -175,7 +154,6 @@ pub(crate) struct Overlay {
     upload: bool,
     view_dirty: bool,
     hover_face: Option<usize>,
-    dragged: bool,
     /// Designations before each wing / role edit (Ctrl+Z).
     undo: Vec<Designations>,
     /// Designations undone, for redo (cleared by a new edit).
@@ -185,7 +163,7 @@ pub(crate) struct Overlay {
     world: bool,
     /// The game's "Aero wings" toolbar mode is on (picking on the real vehicle).
     bench: bool,
-    /// What the published paint was computed from: (model, aerofoil colours, designated wing count).
+    /// What the published paint was computed from: (model, colouring, marked block count, wing being marked).
     paint_key: Option<(usize, u8, usize, u32)>,
     /// Merge wings: the blocks and body of the wing chosen by the first click.
     merge_from: Option<(std::collections::HashSet<[i32; 3]>, u32)>,
@@ -261,7 +239,6 @@ impl Overlay {
             upload: false,
             view_dirty: true,
             hover_face: None,
-            dragged: false,
             undo: Vec::new(),
             redo: Vec::new(),
             world: false,
@@ -373,12 +350,7 @@ impl Overlay {
                 for &(name, w) in &cols {
                     ui.table_setup_column_with(TableColumnSetup { flags: TableColumnFlags::WIDTH_STRETCH, init_width_or_weight: w, ..TableColumnSetup::new(name) });
                 }
-                // Headers aligned like their columns: numbers right, the name left.
-                ui.table_next_row_with_flags(imgui::TableRowFlags::HEADERS);
-                for (k, &(name, _)) in cols.iter().enumerate() {
-                    ui.table_set_column_index(k);
-                    if k == 0 { ui.text_colored(DIM, name) } else { right(ui, name, Some(DIM)) }
-                }
+                headers(ui, &cols, 1);
                 let dist = |d: f64| if d < 1000.0 { format!("{d:.0} m") } else { format!("{:.1} km", d / 1000.0) };
                 for (d, r) in &rows {
                     ui.table_next_row();
@@ -1016,7 +988,6 @@ impl Overlay {
         plot(ui, "area", [avail[0], avail[1] - 6.0], &xs, &series, n, "Position, tail to nose (m)");
     }
 
-    /// Tool choice with its role / aerofoil pickers.
     /// Face of the workbench vehicle under a view point (normalised, x right, y down, -1..1),
     /// through the editor camera: a CPU id render at half resolution, kept while the camera and
     /// the model stay. Without `now` (the hover preview) a moved camera is not rendered until it
@@ -1092,7 +1063,6 @@ impl Overlay {
             if ui.is_mouse_dragging(MouseButton::Left) && (d[0] != 0.0 || d[1] != 0.0) {
                 self.cam.yaw += d[0] as f64 * 0.01;
                 self.cam.pitch = (self.cam.pitch + d[1] as f64 * 0.01).clamp(-1.55, 1.55);
-                self.dragged = true;
                 self.view_dirty = true;
             }
             if ui.is_mouse_dragging(MouseButton::Right) && (d[0] != 0.0 || d[1] != 0.0) {
@@ -1110,9 +1080,6 @@ impl Overlay {
             if hover != self.hover_face {
                 self.hover_face = hover;
                 self.view_dirty = true;
-            }
-            if ui.is_mouse_released(MouseButton::Left) {
-                self.dragged = false;
             }
         } else if self.hover_face.is_some() {
             self.hover_face = None;
@@ -1238,10 +1205,8 @@ impl Overlay {
                     self.status = "that block is not part of a lifting panel".into();
                     return;
                 };
-                let p = &m.panels[pi];
                 // The whole wing: its panels and the surfaces on it.
                 let targets: Vec<usize> = (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).collect();
-                let _ = p;
                 for j in targets {
                     // One mark per panel: drop the old ones, then mark one of its blocks.
                     let owners: Vec<[i32; 3]> = match m.fin_comp[j] {
@@ -1282,11 +1247,7 @@ impl Overlay {
     /// Keep a change: one undo step (`before`), marks stored on the parts, model rebuilt.
     fn commit(&mut self, before: Designations) {
         if self.des != before {
-            self.redo.clear();
-            self.undo.push(before);
-            if self.undo.len() > 200 {
-                self.undo.remove(0);
-            }
+            self.push_undo(before);
             self.designations_changed();
         }
     }
@@ -1353,12 +1314,7 @@ impl Overlay {
     fn affected(&self, m: &Model, face: usize, pick: bool) -> std::collections::HashSet<[i32; 3]> {
         let Some(f) = self.faces.get(face) else { return Default::default() };
         let comp = &m.comps[f.comp as usize];
-        let owners = |cells: &[usize]| cells.iter().filter_map(|&c| m.comps.get(m.grid.owner[c] as usize)).map(|o| o.pos).collect::<Vec<_>>();
-        // The whole wing of the block: its panels and the surfaces on it.
-        let wing = || match face_panel(m, f) {
-            Some(pi) => (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).flat_map(|j| owners(&m.panels[j].cells)).collect(),
-            None => Vec::new(),
-        };
+        let wing = || wing_blocks(m, f);
         let body = || m.comps.iter().filter(|c| c.body == comp.body).map(|c| c.pos).collect::<Vec<_>>();
         let out = match self.tool {
             Tool::Inspect => Vec::new(),
@@ -1463,7 +1419,7 @@ impl Overlay {
     /// Propellers and rotors: what the player sets on the left (one group per part, keyed by its
     /// colour), what each gives at its best pitch on the right.
     fn tab_props(&mut self, ui: &Ui, m: &Arc<Model>) {
-        if !self.des.props.unwrap_or_else(|| crate::flight::PROPS.load(Ordering::Relaxed)) {
+        if !self.des.sw.props.unwrap_or_else(|| crate::flight::PROPS.load(Ordering::Relaxed)) {
             ui.text_colored(WARN, "This vehicle flies with the game's own propellers and rotors (Settings): these figures do not apply.");
         }
         let n = m.props.len();
@@ -1605,8 +1561,8 @@ impl Overlay {
         let vehicle = self.snapshot.is_some() && editor::editor_active();
         let on = |f: &AtomicBool| f.load(Ordering::Relaxed);
         // What is in force for all vehicles, and for this one: a setting under one that is off does nothing.
-        let fly = (hooked && on(&ENABLED), hooked && self.des.fly.unwrap_or(on(&ENABLED)));
-        let props = (props_hooked && fly.0 && on(&PROPS), props_hooked && fly.1 && self.des.props.unwrap_or(on(&PROPS)));
+        let fly = (hooked && on(&ENABLED), hooked && self.des.sw.fly.unwrap_or(on(&ENABLED)));
+        let props = (props_hooked && fly.0 && on(&PROPS), props_hooked && fly.1 && self.des.sw.props.unwrap_or(on(&PROPS)));
         let mut des = self.des.clone();
         let mut saved = false;
 
@@ -1615,17 +1571,17 @@ impl Overlay {
             headers(ui, &SETTING_COLS, 3);
             let fly_tip = if hooked { FLY_TIP } else { "Unavailable: the game's flight code could not be hooked, see aero.log." };
             let props_tip = if props_hooked { PROPS_TIP } else { "Unavailable: the game's propeller code could not be hooked, see aero.log. The game's own propellers and rotors are in use." };
-            saved |= setting_row(ui, 0, "Plugin flight model", "The plugin's air forces instead of the game's.", fly_tip, &ENABLED, (hooked, hooked && vehicle), Some(&mut des.fly));
-            saved |= setting_row(ui, 1, "Propeller and rotor model", "Blade by blade, with engine load and propwash.", props_tip, &PROPS, (props_hooked && fly.0, props_hooked && fly.1 && vehicle), Some(&mut des.props));
-            saved |= setting_row(ui, 2, "Vortex ring state", "Rotors lose lift sinking into their downwash.", VRS_TIP, &VRS, (props.0, props.1 && vehicle), Some(&mut des.vrs));
-            saved |= setting_row(ui, 1, "Ground effect", "Less drag within a wingspan of the surface.", GROUND_TIP, &GROUND, (fly.0, fly.1 && vehicle), Some(&mut des.ground));
-            saved |= setting_row(ui, 0, "Jets push harder at speed", "Jet thrust grows with airspeed, like a real engine.", "A real jet gets more air rammed into it the faster it flies, so it makes more thrust: about a fifth more near the speed of sound at low level. Very fast and low, the engine runs too hot and the gain fades. Thrust still falls with altitude as the air thins. The large intake's fan does the opposite and fades as speed builds. Off: thrust depends on altitude only.", &crate::flight::JET_RAM, (hooked, false), None);
+            saved |= setting_row(ui, 0, "Plugin flight model", fly_tip, &ENABLED, (hooked, hooked && vehicle), Some(&mut des.sw.fly));
+            saved |= setting_row(ui, 1, "Propeller and rotor model", props_tip, &PROPS, (props_hooked && fly.0, props_hooked && fly.1 && vehicle), Some(&mut des.sw.props));
+            saved |= setting_row(ui, 2, "Vortex ring state", VRS_TIP, &VRS, (props.0, props.1 && vehicle), Some(&mut des.sw.vrs));
+            saved |= setting_row(ui, 1, "Ground effect", GROUND_TIP, &GROUND, (fly.0, fly.1 && vehicle), Some(&mut des.sw.ground));
+            saved |= setting_row(ui, 1, "Jet engine tweaks", "A jet engine gets more air rammed into the faster it flies, so it makes more thrust. Off: thrust depends on altitude only.", &crate::flight::JET_RAM, (fly.0, fly.1 && vehicle), Some(&mut des.sw.jet));
         }
         ui.dummy([0.0, 6.0]);
         heading(ui, "Display");
         if let Some(_t) = table(ui, "##display", &SETTING_COLS) {
-            saved |= setting_row(ui, 0, "Rotor blur", "Fast blades drawn as a smear over their sweep.", BLUR_TIP, &crate::blur::ENABLED, (true, false), None);
-            saved |= setting_row(ui, 0, "Jet exhaust smoke", "Jet engines trail the game's exhaust smoke.", "Off: jet engines make no exhaust smoke, trail or surface splash. Piston engines, rockets and fires keep theirs, and thrust, sound and heat are unchanged.", &crate::hooks::JET_SMOKE, (true, false), None);
+            saved |= setting_row(ui, 0, "Rotor blur", BLUR_TIP, &crate::blur::ENABLED, (true, false), None);
+            saved |= setting_row(ui, 0, "Jet exhaust smoke", "Off: jet engines make no exhaust smoke, trail or surface splash. Piston engines, rockets and fires keep theirs, and thrust, sound and heat are unchanged.", &crate::hooks::JET_SMOKE, (true, false), None);
         }
 
         if saved {
@@ -1633,15 +1589,15 @@ impl Overlay {
             log_line(&format!("settings: flight model {}, propellers {}, vortex ring {}, ground effect {}", on(&ENABLED), on(&PROPS), on(&VRS), on(&GROUND)));
         }
         if des != self.des {
-            self.push_undo();
+            self.push_undo(self.des.clone());
             self.des = des;
             self.designations_changed();
         }
     }
 
-    fn push_undo(&mut self) {
+    fn push_undo(&mut self, before: Designations) {
         self.redo.clear();
-        self.undo.push(self.des.clone());
+        self.undo.push(before);
         if self.undo.len() > 200 {
             self.undo.remove(0);
         }
@@ -1741,16 +1697,6 @@ fn wing_blocks(m: &Model, f: &Face) -> Vec<[i32; 3]> {
     (0..m.panels.len()).filter(|&j| m.wing_of[j] == m.wing_of[pi]).flat_map(owners).collect()
 }
 
-/// F9 table: every table the same width, columns split by weight.
-fn f9_table<'a>(ui: &'a Ui, id: &str, cols: &[(&str, f32)]) -> Option<imgui::TableToken<'a>> {
-    let flags = TableFlags::ROW_BG | TableFlags::BORDERS_INNER_H | TableFlags::PAD_OUTER_X | TableFlags::SIZING_STRETCH_PROP;
-    let t = ui.begin_table_with_sizing(id, cols.len(), flags, [560.0, 0.0], 0.0)?;
-    for &(name, w) in cols {
-        ui.table_setup_column_with(TableColumnSetup { flags: TableColumnFlags::WIDTH_STRETCH, init_width_or_weight: w, ..TableColumnSetup::new(name) });
-    }
-    Some(t)
-}
-
 /// One vehicle's block in the F9 flight data: label / value pairs in two columns, then its
 /// propellers and rotors.
 fn flight_vehicle(ui: &Ui, n: usize, v: &crate::flight::VehicleDebug) {
@@ -1848,127 +1794,6 @@ fn flight_vehicle(ui: &Ui, n: usize, v: &crate::flight::VehicleDebug) {
 
 // ---------- layout helpers ----------
 
-/// Section title with a rule to the right edge.
-fn heading(ui: &Ui, title: &str) {
-    ui.dummy([0.0, 2.0]);
-    ui.text(title);
-    rule(ui);
-}
-
-/// Settings tab columns: the setting, its value for all vehicles, the workbench vehicle's own.
-const SETTING_COLS: [(&str, f32); 3] = [("", 360.0), ("All vehicles", 100.0), ("This vehicle", 150.0)];
-
-/// One setting: its name with a line on what it does (the full story on hover), the box for all
-/// vehicles and, with `own`, the vehicle's Global / On / Off choice. `depth` indents a setting
-/// under the one it needs; `enabled`: (the box, the vehicle's choice). True when the box changed.
-#[allow(clippy::too_many_arguments)]
-fn setting_row(ui: &Ui, depth: u8, name: &str, line: &str, tip: &str, flag: &AtomicBool, enabled: (bool, bool), own: Option<&mut Option<bool>>) -> bool {
-    ui.table_next_row();
-    ui.table_set_column_index(0);
-    let x = ui.cursor_pos()[0] + 14.0 * depth as f32;
-    ui.set_cursor_pos([x, ui.cursor_pos()[1]]);
-    ui.align_text_to_frame_padding();
-    if enabled.0 || enabled.1 {
-        ui.text(name);
-    } else {
-        ui.text_colored(DIM, name);
-    }
-    let hovered = ui.is_item_hovered();
-    ui.set_cursor_pos([x, ui.cursor_pos()[1] - 3.0]);
-    ui.text_colored(DIM, line);
-    if hovered || ui.is_item_hovered() {
-        hover_tip(ui, tip);
-    }
-    ui.dummy([0.0, 1.0]);
-    ui.table_set_column_index(1);
-    let mut v = flag.load(Ordering::Relaxed);
-    let changed = {
-        let _d = ui.begin_disabled(!enabled.0);
-        ui.checkbox(format!("##{name}"), &mut v)
-    };
-    if changed {
-        flag.store(v, Ordering::Relaxed);
-    }
-    if let Some(own) = own {
-        ui.table_set_column_index(2);
-        let _d = ui.begin_disabled(!enabled.1);
-        let names = [if v { "Global (on)" } else { "Global (off)" }, "On", "Off"];
-        let mut i = match *own {
-            None => 0,
-            Some(true) => 1,
-            Some(false) => 2,
-        };
-        ui.set_next_item_width(-1.0);
-        if ui.combo_simple_string(format!("##own {name}"), &mut i, &names) {
-            *own = [None, Some(true), Some(false)][i];
-        }
-    }
-    changed
-}
-
-/// Hairline from the last item to the pane's right edge.
-fn rule(ui: &Ui) {
-    let (l, r) = (ui.item_rect_min(), ui.item_rect_max());
-    let right = ui.window_pos()[0] + ui.window_content_region_max()[0];
-    let y = (l[1] + r[1]) * 0.5;
-    ui.get_window_draw_list().add_line([r[0] + 8.0, y], [right, y], [0.35, 0.37, 0.42, 1.0]).build();
-}
-
-/// Label on the left, value right-aligned in a colour.
-fn kv_col(ui: &Ui, k: &str, v: &str, col: Option<[f32; 4]>) {
-    ui.text_colored(DIM, k);
-    ui.same_line_with_pos(ui.window_content_region_max()[0] - ui.calc_text_size(v)[0]);
-    ui.text_colored(col.unwrap_or(ui.style_color(imgui::StyleColor::Text)), v);
-}
-
-
-/// Small colour square, then the label.
-fn swatch(ui: &Ui, col: [f32; 4], label: &str) {
-    let p = ui.cursor_screen_pos();
-    let h = ui.text_line_height();
-    ui.get_window_draw_list().add_rect([p[0], p[1] + 3.0], [p[0] + h - 6.0, p[1] + h - 3.0], col).filled(true).build();
-    ui.dummy([h - 6.0, h]);
-    ui.same_line_with_spacing(0.0, 6.0);
-    ui.text(label);
-}
-
-fn rgb(c: [u8; 3]) -> [f32; 4] {
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0]
-}
-
-/// Label on the left, the next item from a fixed column to the right edge.
-fn field(ui: &Ui, label: &str) {
-    ui.align_text_to_frame_padding();
-    ui.text_colored(DIM, label);
-    ui.same_line_with_pos(FIELD_X);
-    ui.set_next_item_width(-1.0);
-}
-
-fn input_f(ui: &Ui, label: &str, v: &mut f32, fmt: &str) -> bool {
-    field(ui, label);
-    ui.input_float(format!("##{label}"), v).display_format(fmt).build()
-}
-
-/// Label on the left, value right-aligned.
-fn kv(ui: &Ui, k: &str, v: &str) {
-    kv_col(ui, k, v, None);
-}
-
-fn sci(v: f64) -> String {
-    if v.abs() >= 1e5 {
-        let e = v.abs().log10().floor() as i32;
-        format!("{:.3}e{e}", v / 10f64.powi(e))
-    } else {
-        format!("{v:.0}")
-    }
-}
-
-/// The tab's one action, full width.
-fn primary(ui: &Ui, label: &str) -> bool {
-    ui.dummy([0.0, 6.0]);
-    ui.button_with_size(label, [-1.0, 26.0])
-}
-
 /// Controls column on the left; `right_pane` after it takes the rest of the row.
 fn left_pane(ui: &Ui) -> Option<imgui::ChildWindowToken<'_>> {
     let h = ui.content_region_avail()[1];
@@ -1979,45 +1804,6 @@ fn right_pane(ui: &Ui) -> Option<imgui::ChildWindowToken<'_>> {
     ui.same_line_with_spacing(0.0, 14.0);
     let h = ui.content_region_avail()[1];
     ui.child_window("##results").size([0.0, h]).begin()
-}
-
-/// Text right-aligned in the current table cell.
-fn right(ui: &Ui, s: &str, col: Option<[f32; 4]>) {
-    let w = ui.calc_text_size(s)[0];
-    ui.set_cursor_pos([ui.cursor_pos()[0] + ui.content_region_avail()[0] - w, ui.cursor_pos()[1]]);
-    match col {
-        Some(c) => ui.text_colored(c, s),
-        None => ui.text(s),
-    }
-}
-
-/// Table with the given columns: a width > 0 is fixed, 0 stretches.
-fn table<'a>(ui: &'a Ui, id: &str, cols: &[(&str, f32)]) -> Option<imgui::TableToken<'a>> {
-    let t = ui.begin_table_with_flags(id, cols.len(), TableFlags::ROW_BG | TableFlags::BORDERS_INNER_H | TableFlags::SIZING_FIXED_FIT | TableFlags::PAD_OUTER_X)?;
-    for &(name, w) in cols {
-        let mut c = TableColumnSetup::new(name);
-        if w > 0.0 {
-            c.flags = TableColumnFlags::WIDTH_FIXED;
-            c.init_width_or_weight = w;
-        } else {
-            c.flags = TableColumnFlags::WIDTH_STRETCH;
-        }
-        ui.table_setup_column_with(c);
-    }
-    Some(t)
-}
-
-/// Header row: the first `left_cols` titles left-aligned, the rest right-aligned.
-fn headers(ui: &Ui, cols: &[(&str, f32)], left_cols: usize) {
-    ui.table_next_row_with_flags(TableRowFlags::HEADERS);
-    for (i, (name, _)) in cols.iter().enumerate() {
-        ui.table_set_column_index(i);
-        if i < left_cols {
-            ui.text_colored(DIM, name);
-        } else {
-            right(ui, name, Some(DIM));
-        }
-    }
 }
 
 /// Key points of an AoA sweep, under its plot and as wide as the plot area.
@@ -2056,146 +1842,6 @@ fn sweep_readout(ui: &Ui, x: &[f64], up: &[Coeffs]) {
     for (i, v) in vals.iter().enumerate() {
         ui.table_set_column_index(i);
         right(ui, v, None);
-    }
-}
-
-type Deriv = (&'static str, f64, i32, &'static str, &'static str);
-
-/// Stability derivatives: rows are the force or moment, columns the cause. Green when the
-/// sign is the stabilising one, red when not; the tooltip names and explains each.
-fn deriv_table<const N: usize>(ui: &Ui, id: &str, heads: &[&str], rows: &[(&str, [Deriv; N])]) {
-    let cols: Vec<(&str, f32)> = heads.iter().enumerate().map(|(i, h)| (*h, if i == 0 { 80.0 } else { 0.0 })).collect();
-    let Some(_t) = ui.begin_table_with_flags(id, cols.len(), TableFlags::ROW_BG | TableFlags::BORDERS_INNER_H | TableFlags::PAD_OUTER_X) else {
-        return;
-    };
-    for (i, (h, w)) in cols.iter().enumerate() {
-        let mut c = TableColumnSetup::new(*h);
-        c.flags = if i == 0 { TableColumnFlags::WIDTH_FIXED } else { TableColumnFlags::WIDTH_STRETCH };
-        c.init_width_or_weight = *w;
-        ui.table_setup_column_with(c);
-    }
-    headers(ui, &cols, 1);
-    for (label, vals) in rows {
-        ui.table_next_row();
-        ui.table_set_column_index(0);
-        ui.text(label);
-        for (j, &(name, v, sign, unit, tip)) in vals.iter().enumerate() {
-            ui.table_set_column_index(j + 1);
-            let col = if !v.is_finite() || (sign != 0 && v.signum() as i32 != sign) {
-                Some(BAD)
-            } else if sign != 0 {
-                Some(GOOD)
-            } else {
-                None
-            };
-            right(ui, &format!("{v:+.4}"), col);
-            if ui.is_item_hovered() {
-                hover_tip(ui, format!("{name} = {v:.4} {unit}\n{tip}"));
-            }
-        }
-    }
-}
-
-/// Line plot: grid, zero line, legend along the top, hover readout. Series past `legend`
-/// are drawn but not named. Non-finite values break the line.
-fn plot(ui: &Ui, id: &str, size: [f32; 2], x: &[f64], series: &[(&str, [f32; 4], Vec<f64>)], legend: usize, xlabel: &str) {
-    if x.len() < 2 {
-        return;
-    }
-    let p0 = ui.cursor_screen_pos();
-    ui.invisible_button(format!("##plot_{id}"), size);
-    let hovered = ui.is_item_hovered();
-    let dl = ui.get_window_draw_list();
-    let (pad_b, pad_t) = (30.0, 6.0);
-    let (x0, x1) = (x[0], x[x.len() - 1]);
-    let ys = series.iter().flat_map(|s| s.2.iter().copied()).filter(|v| v.is_finite());
-    let (mut y0, mut y1) = ys.fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(v), b.max(v)));
-    if y0 > y1 {
-        y0 = -1.0;
-        y1 = 1.0;
-    }
-    if y1 - y0 < 1e-9 {
-        y0 -= 1.0;
-        y1 += 1.0;
-    }
-    let step = |lo: f64, hi: f64| {
-        let raw = (hi - lo) / 6.0;
-        let mag = 10f64.powf(raw.log10().floor());
-        [1.0, 2.0, 5.0, 10.0].iter().map(|k| k * mag).find(|s| *s >= raw).unwrap_or(raw)
-    };
-    let ysx = step(y0, y1);
-    y0 = (y0 / ysx).floor() * ysx;
-    y1 = (y1 / ysx).ceil() * ysx;
-    let lo = [p0[0] + PLOT_PAD_L, p0[1] + pad_t];
-    let hi = [p0[0] + size[0] - PLOT_PAD_R, p0[1] + size[1] - pad_b];
-    let sx = |v: f64| lo[0] + ((v - x0) / (x1 - x0)) as f32 * (hi[0] - lo[0]);
-    let sy = |v: f64| hi[1] - ((v - y0) / (y1 - y0)) as f32 * (hi[1] - lo[1]);
-    dl.add_rect(lo, hi, [0.10, 0.11, 0.13, 1.0]).filled(true).build();
-    let grid = [0.22, 0.24, 0.28, 1.0];
-    let tick = [0.62, 0.64, 0.68, 1.0];
-    let xs = step(x0, x1);
-    let mut v = (x0 / xs).ceil() * xs;
-    while v <= x1 + 1e-9 {
-        dl.add_line([sx(v), lo[1]], [sx(v), hi[1]], grid).build();
-        let t = fmt_tick(v);
-        let w = ui.calc_text_size(&t)[0];
-        dl.add_text([sx(v) - w * 0.5, hi[1] + 4.0], tick, &t);
-        v += xs;
-    }
-    let mut v = y0;
-    while v <= y1 + 1e-9 {
-        let c = if v.abs() < 1e-9 { [0.45, 0.47, 0.52, 1.0] } else { grid };
-        dl.add_line([lo[0], sy(v)], [hi[0], sy(v)], c).build();
-        let t = fmt_tick(v);
-        let w = ui.calc_text_size(&t)[0];
-        dl.add_text([lo[0] - 6.0 - w, sy(v) - 7.0], tick, &t);
-        v += ysx;
-    }
-    let w = ui.calc_text_size(xlabel)[0];
-    dl.add_text([(lo[0] + hi[0]) * 0.5 - w * 0.5, hi[1] + 17.0], DIM, xlabel);
-    // Back to front, so the named series sit on top of the dimmed ones.
-    for (_, col, ys) in series.iter().rev() {
-        let mut run: Vec<[f32; 2]> = Vec::new();
-        for (xv, yv) in x.iter().zip(ys) {
-            if yv.is_finite() {
-                run.push([sx(*xv), sy(yv.clamp(y0, y1))]);
-            } else if run.len() > 1 {
-                dl.add_polyline(std::mem::take(&mut run), *col).thickness(1.5).build();
-            } else {
-                run.clear();
-            }
-        }
-        if run.len() > 1 {
-            dl.add_polyline(run, *col).thickness(1.5).build();
-        }
-    }
-    let mut lx = lo[0] + 10.0;
-    for (name, col, _) in series.iter().take(legend) {
-        dl.add_line([lx, lo[1] + 12.0], [lx + 14.0, lo[1] + 12.0], *col).thickness(2.0).build();
-        dl.add_text([lx + 19.0, lo[1] + 5.0], [0.85, 0.86, 0.88, 1.0], name);
-        lx += 19.0 + ui.calc_text_size(name)[0] + 18.0;
-    }
-    if hovered {
-        let mx = ui.io().mouse_pos[0];
-        let t = ((mx - lo[0]) / (hi[0] - lo[0])).clamp(0.0, 1.0) as f64;
-        let i = ((t * (x.len() - 1) as f64).round() as usize).min(x.len() - 1);
-        dl.add_line([sx(x[i]), lo[1]], [sx(x[i]), hi[1]], [1.0, 1.0, 1.0, 0.4]).build();
-        drop(dl);
-        let mut text = format!("{xlabel}: {:.3}", x[i]);
-        for (name, _, ys) in series.iter().take(legend) {
-            text += &format!("\n{name}: {:.4}", ys[i]);
-        }
-        hover_tip(ui, text);
-    }
-}
-
-fn fmt_tick(v: f64) -> String {
-    if v.abs() >= 100.0 || (v - v.round()).abs() < 1e-9 {
-        format!("{v:.0}")
-    } else if (v * 10.0 - (v * 10.0).round()).abs() < 1e-9 {
-        format!("{v:.1}")
-    } else {
-        format!("{v:.2}")
     }
 }
 
@@ -2356,7 +2002,6 @@ fn face_panel(m: &Model, f: &view::Face) -> Option<usize> {
     m.panel_of.get(f.cell).copied().filter(|&p| p != usize::MAX)
 }
 
-/// Panel colour per aerofoil (index into `AEROFOILS`) in the aerofoil tool.
 /// Colour of a wing: a wing the player started (number `n` > 0) keeps one of the warm colours;
 /// the plain ones (wings by not touching another) take blue shades in the model's order (`rank`).
 fn wing_color(n: u32, rank: usize) -> [u8; 3] {
@@ -2368,6 +2013,7 @@ fn wing_color(n: u32, rank: usize) -> [u8; 3] {
     }
 }
 
+/// Panel colour per aerofoil (index into `AEROFOILS`) in the aerofoil tool.
 const FOIL_COLORS: [[u8; 3]; 9] =
     [[90, 150, 230], [230, 120, 40], [80, 200, 90], [200, 80, 200], [230, 220, 60], [60, 210, 210], [255, 255, 255], [240, 90, 110], [170, 170, 255]];
 
@@ -2416,23 +2062,12 @@ fn draw_force_arrows(ui: &Ui) {
         };
         // Grid-local point on `body`, placed with the matrix the game drew it with (world fallback).
         let place_on = |body: usize, local: V3, world: V3| {
-            smoothed_matrix(body, frame)
-                .map(|m| V3 {
-                    x: local.x * m[0] + local.y * m[4] + local.z * m[8] + m[12],
-                    y: local.x * m[1] + local.y * m[5] + local.z * m[9] + m[13],
-                    z: local.x * m[2] + local.y * m[6] + local.z * m[10] + m[14],
-                })
-                .filter(|p| (*p - world).len() < 100.0)
-                .unwrap_or(world)
+            smoothed_matrix(body, frame).map(|m| xf_point(&m, local)).filter(|p| (*p - world).len() < 100.0).unwrap_or(world)
         };
         // The CoM rides on the main body (the fuselage arrow's), shifted by the same render offset.
         let mut com_shift = V3::ZERO;
         for a in &v.arrows {
-            let placed = smoothed_matrix(a.body, frame).map(|m| {
-                let row = |r: usize| V3 { x: m[4 * r], y: m[4 * r + 1], z: m[4 * r + 2] };
-                let dir = |d: V3| row(0) * d.x + row(1) * d.y + row(2) * d.z;
-                (dir(a.local_at) + row(3), dir(a.local_lift), dir(a.local_drag))
-            });
+            let placed = smoothed_matrix(a.body, frame).map(|m| (xf_point(&m, a.local_at), xf_dir(&m, a.local_lift), xf_dir(&m, a.local_drag)));
             // Fall back to the physics-tick placement if the render matrix disagrees wildly (wrong frame).
             let (at, lift, drag) = match placed {
                 Some(p) if (p.0 - a.at).len() < 100.0 => p, // the drawn pose trails physics by up to one tick
@@ -2467,11 +2102,8 @@ fn draw_force_arrows(ui: &Ui) {
         }
         for p in &v.props {
             // Point and direction on the propeller's body as the game drew it (world fallback, as above).
-            let mat = smoothed_matrix(p.body, frame).filter(|m| {
-                let h = p.hub.1;
-                (V3 { x: h.x * m[0] + h.y * m[4] + h.z * m[8] + m[12], y: h.x * m[1] + h.y * m[5] + h.z * m[9] + m[13], z: h.x * m[2] + h.y * m[6] + h.z * m[10] + m[14] } - p.hub.0).len() < 100.0
-            });
-            let dir = |(world, d): (V3, V3)| mat.map_or(world, |m| V3 { x: d.x * m[0] + d.y * m[4] + d.z * m[8], y: d.x * m[1] + d.y * m[5] + d.z * m[9], z: d.x * m[2] + d.y * m[6] + d.z * m[10] });
+            let mat = smoothed_matrix(p.body, frame).filter(|m| (xf_point(m, p.hub.1) - p.hub.0).len() < 100.0);
+            let dir = |(world, d): (V3, V3)| mat.map_or(world, |m| xf_dir(&m, d));
             let hub = place_on(p.body, p.hub.1, p.hub.0);
             // Each propeller's own force: red when it drags (windmilling, braking); its thrust only
             // when there are several, since one propeller's is the centre-of-thrust arrow.
@@ -2602,12 +2234,4 @@ fn publish_track(data: &[crate::flight::VehicleDebug]) {
         }
     }
     *crate::drawcap::TRACK.lock().unwrap_or_else(|p| p.into_inner()) = track;
-}
-
-/// A small button right-aligned in the current table cell.
-fn right_button(ui: &Ui, label: &str) -> bool {
-    let shown = label.split("##").next().unwrap_or(label);
-    let w = ui.calc_text_size(shown)[0] + ui.clone_style().frame_padding[0] * 2.0;
-    ui.set_cursor_pos([ui.cursor_pos()[0] + ui.content_region_avail()[0] - w, ui.cursor_pos()[1]]);
-    ui.small_button(label)
 }

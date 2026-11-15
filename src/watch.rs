@@ -164,12 +164,7 @@ fn built_anchor(body: usize, local: V3) -> Option<(V3, V3)> {
         None if h.last().is_some_and(|(t, _)| *t < ts) => (h.last()?.1, crate::flight::body_built_matrix(body)?),
         None => return None,
     };
-    let place = |m: [f64; 16]| crate::math::v3(
-        local.x * m[0] + local.y * m[4] + local.z * m[8] + m[12],
-        local.x * m[1] + local.y * m[5] + local.z * m[9] + m[13],
-        local.x * m[2] + local.y * m[6] + local.z * m[10] + m[14],
-    );
-    Some((place(cur), place(prev)))
+    Some((crate::math::xf_point(&cur, local), crate::math::xf_point(&prev, local)))
 }
 
 /// The anchor for this frame: (now, tick before). Ends the watch once the hold is over.

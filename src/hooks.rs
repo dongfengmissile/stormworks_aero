@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use minhook::MinHook;
 
 use crate::logging::log_line;
-use crate::memory::bytes_match;
+use crate::memory::{bytes_match, read_usize_at};
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
 use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
@@ -133,22 +133,27 @@ unsafe extern "system" fn air_node_detour(ctx: usize, a2: usize, a3: usize, a4: 
     }
 }
 
+/// Hook `at` when its bytes are the expected `prologue` (none: not checked): keep the original
+/// in `slot`, then enable. `Err`: the log line for the step that failed.
+unsafe fn install<T>(name: &str, at: usize, prologue: &[u8], detour: *mut c_void, slot: &OnceLock<T>) -> Result<(), String> {
+    const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut c_void>()) };
+    if !bytes_match(at, prologue) {
+        return Err(format!("{name} prologue mismatch at {at:#x}"));
+    }
+    let o = MinHook::create_hook(at as *mut c_void, detour).map_err(|e| format!("create {name} hook: {e:?}"))?;
+    let _ = slot.set(std::mem::transmute_copy::<*mut c_void, T>(&o));
+    MinHook::enable_hook(at as *mut c_void).map_err(|e| format!("enable {name} hook: {e:?}"))
+}
+
 /// Per-body switch for the game's hull air forces; without it the air constants are zeroed for all.
 unsafe fn install_air_node_hook() {
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_AIR_NODE_FORCES;
-    if !bytes_match(at, &AIR_NODE_FORCES_PROLOGUE) {
-        log_line(&format!("fluid_air_node_forces prologue mismatch at {at:#x}: vehicle settings cannot keep the game's hull air forces"));
-        return;
-    }
-    match MinHook::create_hook(at as *mut c_void, air_node_detour as *mut c_void) {
-        Ok(o) => {
-            let _ = ORIGINAL_AIR_NODE.set(std::mem::transmute::<*mut c_void, AirNodeForces>(o));
-            if MinHook::enable_hook(at as *mut c_void).is_ok() {
-                crate::flight::AIR_PER_BODY.store(true, Ordering::Relaxed);
-                log_line(&format!("hull air forces switched per vehicle at {at:#x}"));
-            }
+    match install("fluid_air_node_forces", at, &AIR_NODE_FORCES_PROLOGUE, air_node_detour as *mut c_void, &ORIGINAL_AIR_NODE) {
+        Ok(()) => {
+            crate::flight::AIR_PER_BODY.store(true, Ordering::Relaxed);
+            log_line(&format!("hull air forces switched per vehicle at {at:#x}"));
         }
-        Err(e) => log_line(&format!("create air node hook: {e:?}")),
+        Err(e) => log_line(&format!("{e}: vehicle settings cannot keep the game's hull air forces")),
     }
 }
 
@@ -170,7 +175,9 @@ unsafe extern "system" fn sim_render_detour(g: usize, a2: usize, a3: usize, a4: 
     r
 }
 
-/// Main-camera hook for the in-flight force arrows; failure only loses the arrows.
+/// Main-camera hook for the in-flight force arrows, then the hooks that draw with it (watch camera,
+/// cursor, jet smoke, paint, rotor blur), each of which may fail on its own. `Err`: no camera hook,
+/// so none of those either.
 pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_SIM_RENDER_SLOT7;
     if !bytes_match(at, &SIM_RENDER_SLOT7_PROLOGUE) {
@@ -251,19 +258,9 @@ unsafe fn install_watch_hooks() {
 unsafe fn install_watch_lod_hook() {
     use crate::watch::*;
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_BUILD_FRAME;
-    if !bytes_match(at, &BUILD_FRAME_PROLOGUE) {
-        log_line(&format!("build_frame prologue mismatch at {at:#x}; watched vehicles lose part detail past 750 m"));
-        return;
-    }
-    match MinHook::create_hook(at as *mut c_void, build_frame_detour as *mut c_void) {
-        Ok(o) => {
-            let _ = ORIGINAL_BUILD_FRAME.set(std::mem::transmute::<*mut c_void, BuildFrame>(o));
-            match MinHook::enable_hook(at as *mut c_void) {
-                Ok(()) => log_line("watch detail hook installed"),
-                Err(e) => log_line(&format!("enable build_frame hook: {e:?}")),
-            }
-        }
-        Err(e) => log_line(&format!("create build_frame hook: {e:?}")),
+    match install("build_frame", at, &BUILD_FRAME_PROLOGUE, build_frame_detour as *mut c_void, &ORIGINAL_BUILD_FRAME) {
+        Ok(()) => log_line("watch detail hook installed"),
+        Err(e) => log_line(&format!("{e}; watched vehicles lose part detail past 750 m")),
     }
 }
 
@@ -271,19 +268,9 @@ unsafe fn install_watch_lod_hook() {
 unsafe fn install_cursor_hook() {
     use crate::watch::*;
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_SET_CURSOR_DISABLED;
-    if !bytes_match(at, &SET_CURSOR_DISABLED_PROLOGUE) {
-        log_line(&format!("set_cursor_disabled prologue mismatch at {at:#x}; F8 list keeps the game's cursor"));
-        return;
-    }
-    match MinHook::create_hook(at as *mut c_void, set_cursor_detour as *mut c_void) {
-        Ok(o) => {
-            let _ = ORIGINAL_SET_CURSOR.set(std::mem::transmute::<*mut c_void, SetCursorDisabled>(o));
-            match MinHook::enable_hook(at as *mut c_void) {
-                Ok(()) => log_line("cursor hook installed"),
-                Err(e) => log_line(&format!("enable cursor hook: {e:?}")),
-            }
-        }
-        Err(e) => log_line(&format!("create cursor hook: {e:?}")),
+    match install("set_cursor_disabled", at, &SET_CURSOR_DISABLED_PROLOGUE, set_cursor_detour as *mut c_void, &ORIGINAL_SET_CURSOR) {
+        Ok(()) => log_line("cursor hook installed"),
+        Err(e) => log_line(&format!("{e}; F8 list keeps the game's cursor")),
     }
 }
 
@@ -344,25 +331,13 @@ unsafe fn install_paint_hook() {
     let gl32 = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(c"opengl32.dll".as_ptr().cast());
     let de = if gl32.is_null() { None } else { windows_sys::Win32::System::LibraryLoader::GetProcAddress(gl32, c"glDrawElements".as_ptr().cast()) };
     if let Some(de) = de {
-        match MinHook::create_hook(de as *mut c_void, crate::paint::draw_elements_detour as *mut c_void) {
-            Ok(o) => {
-                let _ = crate::paint::ORIGINAL_DRAW_ELEMENTS.set(std::mem::transmute::<*mut c_void, _>(o));
-                if let Err(e) = MinHook::enable_hook(de as *mut c_void) {
-                    log_line(&format!("enable glDrawElements hook: {e:?}"));
-                }
-            }
-            Err(e) => log_line(&format!("create glDrawElements hook: {e:?}")),
+        if let Err(e) = install("glDrawElements", de as usize, &[], crate::paint::draw_elements_detour as *mut c_void, &crate::paint::ORIGINAL_DRAW_ELEMENTS) {
+            log_line(&e);
         }
     }
-    match MinHook::create_hook(at as *mut c_void, crate::paint::chunk_draw_detour as *mut c_void) {
-        Ok(o) => {
-            let _ = crate::paint::ORIGINAL.set(std::mem::transmute::<*mut c_void, crate::paint::ChunkDraw>(o));
-            match MinHook::enable_hook(at as *mut c_void) {
-                Ok(()) => log_line(&format!("stall paint hook installed ({at:#x})")),
-                Err(e) => log_line(&format!("enable stall paint hook: {e:?}")),
-            }
-        }
-        Err(e) => log_line(&format!("create stall paint hook: {e:?}")),
+    match install("stall paint", at, &[], crate::paint::chunk_draw_detour as *mut c_void, &crate::paint::ORIGINAL) {
+        Ok(()) => log_line(&format!("stall paint hook installed ({at:#x})")),
+        Err(e) => log_line(&e),
     }
 }
 
@@ -440,19 +415,8 @@ unsafe fn install_tint_hooks() {
         ),
         ("rudder_draw", RVA_RUDDER_DRAW, &RUDDER_DRAW_PROLOGUE[..], crate::paint::rudder_draw_detour as *mut c_void, &crate::paint::ORIGINAL_RUDDER_DRAW),
     ] {
-        let at = base + rva;
-        if !bytes_match(at, prologue) {
-            log_line(&format!("{name} prologue mismatch at {at:#x}; its moving mesh is not painted"));
-            continue;
-        }
-        match MinHook::create_hook(at as *mut c_void, detour) {
-            Ok(o) => {
-                let _ = orig.set(std::mem::transmute::<*mut c_void, crate::paint::ClassDraw>(o));
-                if let Err(e) = MinHook::enable_hook(at as *mut c_void) {
-                    log_line(&format!("enable {name} hook: {e:?}"));
-                }
-            }
-            Err(e) => log_line(&format!("create {name} hook: {e:?}")),
+        if let Err(e) = install(name, base + rva, prologue, detour, orig) {
+            log_line(&format!("{e}; its moving mesh is not painted"));
         }
     }
 }
@@ -539,7 +503,6 @@ unsafe extern "system" fn clamped_detour(a1: usize, a2: usize, a3: usize, a4: us
     ORIGINAL_CLAMPED.get().map_or(0, |o| o(a1, a2, a3, a4, a5, a6, a7))
 }
 
-/// Engine thrust capture; failure leaves the applyForce sum / estimate in F9.
 type PropTick = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 static ORIGINAL_PROP_TICK: OnceLock<PropTick> = OnceLock::new();
 
@@ -550,7 +513,7 @@ unsafe extern "system" fn prop_tick_detour(comp: usize, a2: usize, a3: usize, a4
         return 0;
     };
     let w_in = if crate::editor::ptr_ok(comp, OFF_PROP_FORCE_ACC) {
-        let from = if read_usize(comp + OFF_PROP_LINK) != 0 { OFF_PROP_SHAFT } else { OFF_PROP_SPEED };
+        let from = if read_usize_at(comp + OFF_PROP_LINK) != 0 { OFF_PROP_SHAFT } else { OFF_PROP_SPEED };
         Some(f32::from_bits(crate::memory::read_u32_at(comp + from)))
     } else {
         None
@@ -572,7 +535,7 @@ unsafe extern "system" fn prop_tick_detour(comp: usize, a2: usize, a3: usize, a4
 /// turns them by `w_prev·rotation_speed·0.5/60`, 4π too slow, and `w_prev` is the speed after
 /// the load, not the shaft's: use the shaft speed the tick started from.
 unsafe fn true_spin(comp: usize, before: f32, w_in: f32) {
-    let def = read_usize(comp + OFF_COMP_DEF);
+    let def = read_usize_at(comp + OFF_COMP_DEF);
     if !crate::editor::ptr_ok(def + OFF_DEF_PROP_FLAGS, 4) || crate::memory::read_u32_at(def + OFF_DEF_PROP_FLAGS) & 2 != 0 {
         return;
     }
@@ -588,52 +551,29 @@ unsafe fn true_spin(comp: usize, before: f32, w_in: f32) {
     }
 }
 
-unsafe fn read_usize(at: usize) -> usize {
-    crate::memory::read_usize_at(at)
-}
-
 unsafe fn install_prop_hook() {
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_PROP_TICK;
-    if !bytes_match(at, &PROP_TICK_PROLOGUE) {
-        log_line(&format!("force_emitter tick prologue mismatch at {at:#x}; propellers keep the game's forces"));
-        return;
-    }
-    match MinHook::create_hook(at as *mut c_void, prop_tick_detour as *mut c_void) {
-        Ok(o) => {
-            let _ = ORIGINAL_PROP_TICK.set(std::mem::transmute::<*mut c_void, PropTick>(o));
-            match MinHook::enable_hook(at as *mut c_void) {
-                Ok(()) => crate::flight::PROPS_HOOKED.store(true, Ordering::Relaxed),
-                Err(e) => log_line(&format!("enable force_emitter tick hook: {e:?}")),
-            }
-        }
-        Err(e) => log_line(&format!("create force_emitter tick hook: {e:?}")),
+    match install("force_emitter tick", at, &PROP_TICK_PROLOGUE, prop_tick_detour as *mut c_void, &ORIGINAL_PROP_TICK) {
+        Ok(()) => crate::flight::PROPS_HOOKED.store(true, Ordering::Relaxed),
+        Err(e) => log_line(&format!("{e}; propellers keep the game's forces")),
     }
 }
 
+/// Engine thrust capture; failure leaves the applyForce sum / estimate in F9.
 unsafe fn install_thrust_hooks() {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     for (name, rva, prologue, shim, orig) in [
         ("apply_force_threshold", RVA_APPLY_FORCE_THRESHOLD, &APPLY_FORCE_THRESHOLD_PROLOGUE[..], threshold_shim as *mut c_void, &ORIGINAL_THRESHOLD),
         ("apply_force_clamped", RVA_APPLY_FORCE_CLAMPED, &APPLY_FORCE_CLAMPED_PROLOGUE[..], clamped_shim as *mut c_void, &ORIGINAL_CLAMPED),
     ] {
-        let at = base + rva;
-        if !bytes_match(at, prologue) {
-            log_line(&format!("{name} prologue mismatch at {at:#x}; engine thrust not captured from it"));
-            continue;
-        }
-        match MinHook::create_hook(at as *mut c_void, shim) {
-            Ok(o) => {
-                let _ = orig.set(std::mem::transmute::<*mut c_void, QueueForce>(o));
-                if let Err(e) = MinHook::enable_hook(at as *mut c_void) {
-                    log_line(&format!("enable {name} hook: {e:?}"));
-                }
-            }
-            Err(e) => log_line(&format!("create {name} hook: {e:?}")),
+        if let Err(e) = install(name, base + rva, prologue, shim, orig) {
+            log_line(&format!("{e}; engine thrust not captured from it"));
         }
     }
 }
 
-/// In-game flight forces: post-step-sync tick, damping override, applyForce. All or nothing.
+/// In-game flight forces: post-step-sync tick and damping override, both or neither. The hull air,
+/// thrust and propeller hooks after them may each fail on their own.
 pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     let (sync, damping, apply) = (base + RVA_POST_STEP_SYNC, base + RVA_SET_DAMPING, base + RVA_APPLY_FORCE);
