@@ -387,7 +387,7 @@ pub struct Model {
     /// Bodies without lifting panels, each its own small fuselage (`bluff_forces`).
     pub bluff: Vec<Bluff>,
     /// The main body (the one with the most parts) and its head-on silhouette: per grid (x, y)
-    /// column, whether its hull fills any cell along the length.
+    /// column, whether its hull or a body with wings on it fills any cell along the length.
     pub main_body: usize,
     pub silhouette: Vec<bool>,
 }
@@ -1065,6 +1065,13 @@ impl Model {
             })
             .collect();
         bluff.sort_by_key(|b| b.body);
+        // Wings on their own bodies (on pivots) also hide gear stowed in them from the flow.
+        // shortcut: their cells as built in the main body's frame, wrong for a wing that swings in flight.
+        for (c, &o) in grid.owner.iter().enumerate() {
+            if comps.get(o as usize).is_some_and(|k| lifting.contains(&(k.body as usize))) {
+                silhouette[c % column] = true;
+            }
+        }
         // Wing panel cells are the wing model's alone: as fuselage volume too, a wing of square
         // blocks dragged as a blunt slab whatever its aerofoil, and twice when broadside.
         for (s, &w) in skip.iter_mut().zip(&no_skin) {

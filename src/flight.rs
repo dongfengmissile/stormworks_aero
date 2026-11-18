@@ -1229,7 +1229,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         craft.prev_com = Some(mb.com);
         crate::watch::note(id, mb.com, bodies.get(main).copied().unwrap_or(0), mb.world_to_grid(mb.com));
-        crate::watch::add_row(crate::watch::Row { id, com: mb.com, vel: mb.vel, mass: total_mass, parts: model.comps.len(), modelled: true, loaded: true, fixed: false });
+        // The vehicle's own CoM: a payload on a hardpoint reports its carrier's rigid-body CoM.
+        let own_com = mb.to_world(model.com);
+        crate::watch::add_row(crate::watch::Row { id, com: own_com, vel: mb.vel, mass: total_mass, parts: model.comps.len(), modelled: true, loaded: true, fixed: false });
         #[cfg(feature = "logging")]
         if crate::watch::watched() == Some(id) && !client {
             watch_log(id, &mb, live.get(main).copied().flatten().map_or(0, |l| l.1), &model, &forces, craft.dt, fmax, &deflect);
@@ -1247,7 +1249,7 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         // Only vehicles near the camera's focus; without a camera (none drawn yet) all of them.
         let size = model.grid.dims.iter().map(|&n| n as f64 * 0.25).fold(0.0, f64::max);
         let reach = DEBUG_RADIUS + size + if craft.in_debug_range { DEBUG_HYSTERESIS } else { 0.0 };
-        craft.in_debug_range = focus.is_none_or(|e| (mb.com - e).len() <= reach);
+        craft.in_debug_range = focus.is_none_or(|e| (own_com - e).len() <= reach);
         if want_debug && craft.in_debug_range {
             // Missile fins: their own mesh, not their cells (that would paint the body).
             for (j, _) in craft.stall.iter().enumerate().filter(|(_, &st)| st > 0.5) {

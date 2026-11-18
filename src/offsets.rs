@@ -4,7 +4,7 @@
 
 /// stormworks64.exe sha256 c38c03ff756b4f42bbc9f11cdbb034977ad0f968e45741c5cf410732f22a338d
 /// (v1.15.25 hotfix).
-pub(crate) const GAME_BUILD_LABEL: &str = "c38c03ff756b";
+pub(crate) const GAME_BUILD_LABEL: &str = "22e792753489";
 
 /// Compile-time stamp of THIS binary, logged at bootstrap: tells which DLL the game loaded.
 pub(crate) const PLUGIN_BUILD_LABEL: &str = env!("AERO_BUILD_STAMP");
@@ -156,7 +156,7 @@ pub(crate) const APPLY_FORCE_PROLOGUE: [u8; 32] = [
 /// Game settings singleton (`get_game_settings` 0x296940): the vanilla air-force constants,
 /// f32, re-read every tick by `air_face_force` 0x490b50: linear/quadratic pressure drag,
 /// linear/quadratic suction drag, viscous air resistance, lift. Water uses other fields.
-pub(crate) const RVA_GAME_SETTINGS: usize = 0x00d0_5830;
+pub(crate) const RVA_GAME_SETTINGS: usize = 0x00d0_6810;
 pub(crate) const AIR_CONSTANTS: [usize; 6] = [0x60, 0x64, 0x68, 0x6C, 0xE8, 0xEC];
 /// Solid rocket (type 47) component: current fin angles f32 rad (pitch / yaw channel, clamped to
 /// the def's min/max rotation) and their inversion bytes (`rocket_tick` 0x439DF0, written before
@@ -199,7 +199,7 @@ pub(crate) const SIM_RENDER_SLOT7_PROLOGUE: [u8; 32] = [
     0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8d, 0x9a, 0xa0, 0x01, 0x00,
     0x00, 0x48, 0x8b, 0xf2, 0x48, 0x8b,
 ];
-pub(crate) const RVA_SIM_STATE_VTABLE: usize = 0x00b1_a988;
+pub(crate) const RVA_SIM_STATE_VTABLE: usize = 0x00b1_b778;
 pub(crate) const OFF_SIM_MAIN_CAMERA: usize = 0x1010;
 pub(crate) const OFF_CAM_VIEWPROJ_F64: usize = 0x1C8;
 pub(crate) const OFF_BODY_VEHICLE: usize = 0x250; // vehicle*
@@ -221,7 +221,7 @@ pub(crate) const OFF_BODY_RENDER_BUILT: usize = 0x308; // f32[16]
 /// `jet_engine_tick` (vtable slot 107 of every jet part), 25 arguments, rcx = component.
 pub(crate) const RVA_JET_TICK: usize = 0x0035_34c0;
 /// The jet engine class's vtable entry for its tick (slot 107): the exe's only pointer to the tick.
-pub(crate) const RVA_JET_TICK_SLOT: usize = 0x00B9_3380;
+pub(crate) const RVA_JET_TICK_SLOT: usize = 0x00B9_42C0;
 pub(crate) const RVA_APPLY_FORCE_THRESHOLD: usize = 0x001a_7b20;
 pub(crate) const APPLY_FORCE_THRESHOLD_PROLOGUE: [u8; 20] =
     [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x60];
@@ -241,7 +241,7 @@ pub(crate) const THRUST_SOURCE_NAMES: [&str; 5] = ["jet", "rocket", "propeller/r
 // *(this+0x58)+0xED4 (u32: 0 fan, 1 compressor, 2 combustor, 3 turbine, 4 nozzle); shaft RPS f32 at +0x1BC on
 // types 1-3; upstream neighbours ring at +0x408 ({items, mod, offset, count}).
 pub(crate) const JET_NOZZLE_RETURN: usize = 0x0035_451f;
-pub(crate) const JET_FAN_RETURN: usize = 0x356442; // large intake fan force, build c38c03ff756b
+pub(crate) const JET_FAN_RETURN: usize = 0x356442; // large intake fan force, builds c38c03ff756b and 22e792753489
 pub(crate) const JET_THIS_FROM_ARG4: usize = 0x510;
 pub(crate) const OFF_JET_DEF_TYPE: usize = 0xED4;
 pub(crate) const OFF_JET_RPS: usize = 0x1BC;
@@ -277,6 +277,6 @@ pub(crate) const CHUNK_DRAW_PROLOGUE: [u8; 32] = [
 ];
 
 // Net role (knowledge/multiplayer.md, c38c03ff756b): u8 globals. Net client = multiplayer != 0 && authoritative == 0.
-pub(crate) const RVA_NET_IS_MULTIPLAYER: usize = 0x00ce_e66e;
-pub(crate) const RVA_NET_IS_AUTHORITATIVE: usize = 0x00ce_e66f;
+pub(crate) const RVA_NET_IS_MULTIPLAYER: usize = 0x00ce_f64e;
+pub(crate) const RVA_NET_IS_AUTHORITATIVE: usize = 0x00ce_f64f;
 pub(crate) const OFF_BODY_NET_STAMP: usize = 0x218; // u32 tick of the last replicated pose (clients)
