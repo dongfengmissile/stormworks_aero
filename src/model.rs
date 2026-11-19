@@ -916,6 +916,7 @@ impl Model {
         let index: HashMap<[i32; 3], u32> = comps.iter().enumerate().map(|(i, c)| (c.pos, i as u32)).collect();
         let mut is_cs = vec![false; comps.len()];
         let mut is_wing = vec![false; comps.len()];
+        let mut hinge: Vec<Option<V3>> = vec![None; comps.len()];
         // Parts whose flat mesh pieces lift as their own panels (missile fins far below voxel
         // size): rocket fins always, other non-block parts once marked as wing. Vanilla wing
         // parts stay voxel panels, so they keep joining into whole wings.
@@ -923,6 +924,8 @@ impl Model {
         for (i, c) in comps.iter().enumerate() {
             if let Some(d) = lib.get(&c.def) {
                 is_cs[i] = d.is_control_surface();
+                let h = c.part_to_aero(d.hinge) - c.part_to_aero(V3::ZERO);
+                hinge[i] = (is_cs[i] && h.len() > 1e-9).then(|| h.norm());
                 is_wing[i] = d.is_wing();
                 // A marked joint half (the pivot head on a flap) is a wing block like its neighbours,
                 // not its own fins.
@@ -956,7 +959,7 @@ impl Model {
             }
             Some((des.splits.get(&c.pos).map_or(Key::Wing(c.body), |&g| Key::Split(c.body, g)), Role::None))
         };
-        let mut panels = build_panels(&grid, &key_of, com);
+        let mut panels = build_panels(&grid, &key_of, &|o| hinge[o as usize], com);
         // Section per panel: the aerofoil set on any of its components, else its wing's (below),
         // else the default.
         let mut marked_foil = vec![false; panels.len()];

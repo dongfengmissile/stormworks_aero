@@ -158,7 +158,8 @@ pub enum Key {
 }
 
 /// Build panels. `key_of(component index)` says whether a component's cells are wing cells.
-pub fn build_panels(grid: &Grid, key_of: &dyn Fn(u32) -> Option<(Key, Role)>, com: V3) -> Vec<Panel> {
+/// `hinge_of(component index)`: a control surface's hinge (aero frame), which lies in its plane.
+pub fn build_panels(grid: &Grid, key_of: &dyn Fn(u32) -> Option<(Key, Role)>, hinge_of: &dyn Fn(u32) -> Option<V3>, com: V3) -> Vec<Panel> {
     let n = grid.fill.len();
     let mut key: Vec<Option<(Key, Role)>> = vec![None; n];
     for i in 0..n {
@@ -219,8 +220,9 @@ pub fn build_panels(grid: &Grid, key_of: &dyn Fn(u32) -> Option<(Key, Role)>, co
     }
     let mut out: Vec<Panel> = Vec::new();
     let mut drops: Vec<(&'static str, usize)> = Vec::new();
-    for (_, role, cells) in split {
-        match panel_geometry(grid, cells, role, com) {
+    for (k, role, cells) in split {
+        let hinge = if let Key::Comp(o) = k { hinge_of(o) } else { None };
+        match panel_geometry(grid, cells, role, com, hinge) {
             Ok(p) => out.push(p),
             Err(why) => match drops.iter_mut().find(|d| d.0 == why) {
                 Some(d) => d.1 += 1,
@@ -512,7 +514,7 @@ fn slice_2d(poly: &[[f64; 2]], x: f64) -> Option<(f64, f64)> {
     (hi > lo).then_some((lo, hi))
 }
 
-fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result<Panel, &'static str> {
+fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3, hinge: Option<V3>) -> Result<Panel, &'static str> {
     if cells.len() < 2 {
         return Err("single-cell group");
     }
@@ -520,9 +522,16 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
     let w: Vec<f64> = cells.iter().map(|&i| grid.fill[i] as f64).collect();
     let (mean, vals, vecs) = weighted_axes(&pts, &w, VOXEL_M * VOXEL_M / 12.0);
     let (mut n, mut short) = (vecs[0], vecs[1]); // normal, shorter in-plane axis
-    // A strip one voxel thick and one voxel wide is ambiguous: prefer a horizontal surface.
-    if vals[1] < vals[0] * 1.1 && vecs[1].z.abs() > n.z.abs() {
-        (n, short) = (vecs[1], vecs[0]);
+    // A strip one voxel thick and one voxel wide is ambiguous: a control surface lies along its
+    // hinge (a stretched fin on a missile's top), anything else is taken as horizontal.
+    if vals[1] < vals[0] * 1.1 {
+        let swap = match hinge {
+            Some(h) => vecs[1].dot(h).abs() < n.dot(h).abs(),
+            None => vecs[1].z.abs() > n.z.abs(),
+        };
+        if swap {
+            (n, short) = (vecs[1], vecs[0]);
+        }
     }
     let fwd = v3(1.0, 0.0, 0.0);
     // A plate facing the flow (Starship-style drag flaps) has no chord from the airflow: the chord
@@ -1197,6 +1206,7 @@ mod tests {
                 2 => Some((Key::Comp(2), Role::Flap)),
                 _ => None,
             },
+            &|_| None,
             com,
         );
         assert!(panels.iter().any(|p| p.role == Role::Flap) && panels.iter().any(|p| !p.aft.is_empty() || !p.fwd.is_empty()));
@@ -1227,7 +1237,7 @@ mod tests {
     #[test]
     fn rectangular_wing_panels() {
         let (g, com) = flat_wing();
-        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), com);
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), &|_| None, com);
         assert_eq!(panels.len(), 2, "split at the fuselage into two halves");
         let p = &panels[0];
         assert!((p.b - 5.5).abs() < 1e-9, "semispan {}", p.b);
@@ -1245,7 +1255,7 @@ mod tests {
     #[test]
     fn lift_up_at_positive_aoa_and_stall_hysteresis() {
         let (g, com) = flat_wing();
-        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), com);
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), &|_| None, com);
         let flow = WingFlow { mach: 0.2, rho: 1.225, re_per_m: 4.6e6 };
         let mut stall = vec![0.0; panels.len()];
         let defl = vec![0.0; panels.len()];
@@ -1274,7 +1284,7 @@ mod tests {
     #[test]
     fn aerofoils_trade_lift_for_drag() {
         let (g, com) = flat_wing();
-        let base = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), com);
+        let base = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), &|_| None, com);
         // (CL, CD) of the whole wing with section `foil` at α (deg) and Mach.
         let coeffs = |foil: &str, deg: f64, mach: f64| {
             let mut panels = base.clone();
@@ -1321,7 +1331,7 @@ mod tests {
         // A flying wing: the body is the wing, 3 voxels thick (grid z = aero x), 8 chord, 8 span.
         let cells: Vec<([i32; 3], f32, u32)> = (0..8).flat_map(|y| (0..8).flat_map(move |x| (0..3).map(move |z| ([y + 3, z, x], 1.0, 0u32)))).collect();
         let g = Grid::from_cells(&cells);
-        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), &|_| None, v3(0.0, 0.0, 0.0));
         assert_eq!(panels.len(), 1);
         let p = &panels[0];
         // Planform is chord x span of whole voxels, whatever the thickness.
@@ -1335,13 +1345,26 @@ mod tests {
         // Cells are [grid x, grid y, grid z] = [aero y, -aero z, aero x].
         let cells: Vec<([i32; 3], f32, u32)> = (3..15).flat_map(|y| (0..6).map(move |z| ([y, z, 0], 1.0, 0u32))).collect();
         let g = Grid::from_cells(&cells);
-        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), v3(0.0, 0.0, 0.0));
+        let panels = build_panels(&g, &|o| (o == 0).then_some((Key::Wing(0), Role::None)), &|_| None, v3(0.0, 0.0, 0.0));
         assert_eq!(panels.len(), 1, "a plate facing the flow is still a wing");
         let p = &panels[0];
         let v = VOXEL_M * VOXEL_M;
         assert!((p.area / v - 72.0).abs() < 1e-6, "area {} voxels", p.area / v);
         assert!((p.b / VOXEL_M - 12.0).abs() < 1e-6, "span {}", p.b / VOXEL_M);
         assert!(p.n.x.abs() > 0.9, "normal {:?} should face the flow", p.n);
+    }
+
+    #[test]
+    fn one_voxel_strip_control_surface_lies_along_its_hinge() {
+        // A fin one voxel wide and thick, three long (a stretched missile fin), on top of a body:
+        // its hinge is vertical, so it is a vertical fin, not the default horizontal strip.
+        let cells: Vec<([i32; 3], f32, u32)> = (0..3).map(|z| ([0, 2, z], 1.0, 0)).collect();
+        let g = Grid::from_cells(&cells);
+        let key = |o: u32| (o == 0).then_some((Key::Comp(0), Role::None));
+        let up = build_panels(&g, &key, &|_| Some(v3(0.0, 0.0, 1.0)), V3::ZERO);
+        assert!(up.len() == 1 && up[0].n.y.abs() > 0.99, "normal {:?}", up.first().map(|p| p.n));
+        let flat = build_panels(&g, &key, &|_| None, V3::ZERO);
+        assert!(flat[0].n.z.abs() > 0.99);
     }
 
     #[test]
@@ -1361,7 +1384,7 @@ mod tests {
             2 => Some((Key::Wing(1), Role::None)),
             _ => None,
         };
-        let panels = build_panels(&g, &key, com);
+        let panels = build_panels(&g, &key, &|_| None, com);
         assert_eq!(panels.iter().filter(|p| (p.b - VOXEL_M).abs() < 1e-9).count(), 2);
         for p in &panels {
             assert!(p.s.y * p.centroid.y > 0.0, "span {:?} at {:?}", p.s, p.centroid);
@@ -1386,7 +1409,7 @@ mod tests {
             2 => Some((Key::Wing(1), Role::None)),
             _ => None,
         };
-        let panels = build_panels(&g, &key, com);
+        let panels = build_panels(&g, &key, &|_| None, com);
         assert_eq!(panels.len(), 4);
         for p in &panels {
             assert!((p.ar - 5.5).abs() < 1e-9, "whole-wing AR 5.5, got {} (b {})", p.ar, p.b);
