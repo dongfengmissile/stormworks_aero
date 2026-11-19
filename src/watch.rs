@@ -150,7 +150,7 @@ pub(crate) fn note(id: u32, com: V3, body: usize, local: V3) {
 
 /// The CoM in the two builds the game blends for the frame being drawn (as the body itself is
 /// drawn): the camera then moves exactly with the vehicle, without the tick lag.
-fn built_anchor(body: usize, local: V3) -> Option<(V3, V3)> {
+pub(crate) fn built_anchor(body: usize, local: V3) -> Option<(V3, V3)> {
     // Read here, inside slot 7 after the game swapped in this frame's build: read before slot 7
     // it is still the previous build whenever a new one arrived (the double image).
     let ts = crate::flight::frame_build_ts(crate::flight::sim_state())?;

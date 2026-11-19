@@ -1,4 +1,4 @@
-//! Exact per-body draw transforms for the force arrows. While the game draws the main view (inside
+//! Exact per-body draw transforms for the force arrows and the effects. While the game draws the main view (inside
 //! slot 7 on the render thread) every chunk item's `mat_world` comes out of `matrix_interp_prev_cur`;
 //! a detour on it matches the item's `cur` matrix against the bodies the arrows ride on and keeps the
 //! game's output, so the arrows use exactly what was drawn (no timing model of ours involved).
@@ -15,8 +15,9 @@ use crate::offsets::OFF_SIM_FRAME;
 pub(crate) type MatrixInterp = unsafe extern "system" fn(*const f32, *const f32, f32, *mut f32);
 pub(crate) static ORIGINAL: OnceLock<MatrixInterp> = OnceLock::new();
 
-/// Bodies to look for, published by the overlay.
+/// Bodies to look for, published by the overlay (arrows) and the effects (`fxdraw`).
 pub(crate) static TRACK: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+pub(crate) static TRACK_FX: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Candidates per body: the recorded builds (oldest first, up to 4), then the built and live poses,
 /// all read at the draw's first item.
 const CANDS: usize = 6;
@@ -47,8 +48,8 @@ thread_local! {
 
 /// Before the game draws the frame.
 pub(crate) fn begin(g: usize) {
-    if !crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) {
-        return; // arrows hidden: no work in the draw
+    if !crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) && TRACK_FX.lock().is_ok_and(|t| t.is_empty()) {
+        return; // no arrows or effects: no work in the draw
     }
     CTX.with(|c| {
         let mut c = c.borrow_mut();
@@ -72,10 +73,16 @@ fn setup(c: &mut Ctx) {
     c.origin = [f64_at(0), f64_at(8), f64_at(16)];
     let hist = crate::flight::BUILT_HISTORY.lock().map(|h| h.clone()).unwrap_or_default();
     // The items' matrices are one of these to f32 precision.
-    c.track = TRACK
-        .lock()
-        .map(|t| t.clone())
-        .unwrap_or_default()
+    let mut bodies = TRACK.lock().map(|t| t.clone()).unwrap_or_default();
+    if !crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) {
+        bodies.clear();
+    }
+    for b in TRACK_FX.lock().map(|t| t.clone()).unwrap_or_default() {
+        if !bodies.contains(&b) {
+            bodies.push(b);
+        }
+    }
+    c.track = bodies
         .into_iter()
         .filter_map(|b| {
             let live = crate::flight::body_render_matrix(b)?;
@@ -111,6 +118,15 @@ pub(crate) fn drawn(body: usize) -> Option<[f64; 16]> {
         return None;
     }
     c.1.iter().find(|(b, _)| *b == body).map(|(_, m)| *m)
+}
+
+/// The world matrix `body` is drawn with in the frame being drawn now, if one of its items was
+/// matched so far (render thread, inside the draw: after the G-buffer pass, for the effects).
+pub(crate) fn drawn_now(body: usize) -> Option<[f64; 16]> {
+    if !IN_DRAW.with(|d| d.get()) {
+        return None;
+    }
+    CTX.with(|c| c.borrow().best.get(&body).map(|b| b.world))
 }
 
 /// Distance between a game item matrix (f32, origin-relative) and a world candidate: metres of

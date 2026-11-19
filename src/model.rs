@@ -390,6 +390,8 @@ pub struct Model {
     /// column, whether its hull or a body with wings on it fills any cell along the length.
     pub main_body: usize,
     pub silhouette: Vec<bool>,
+    /// Free wing tips, where the condensation trails start (`fx`).
+    pub tips: Vec<crate::fx::TipSpec>,
 }
 
 /// A body without lifting panels (a landing gear leg, a door, anything on a pivot) as its own
@@ -1157,7 +1159,9 @@ impl Model {
                 _ => 0,
             })
             .collect();
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette }
+        let panel_body = |i: usize| panels[i].cells.iter().map(|&c| grid.owner[c]).find(|&o| (o as usize) < comps.len()).map_or(0, |o| comps[o as usize].body as usize);
+        let tips = crate::fx::free_tips(&panels, &wing_of, &panel_body);
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette, tips }
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.

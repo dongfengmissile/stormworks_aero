@@ -34,6 +34,21 @@ pub(crate) type Raycast = unsafe extern "system" fn(usize, *const f64, *mut f64,
 pub(crate) type WaterHeight = unsafe extern "system" fn(usize, *const f64) -> f32;
 pub(crate) static RAYCAST: OnceLock<Raycast> = OnceLock::new();
 pub(crate) static WATER_HEIGHT: OnceLock<WaterHeight> = OnceLock::new();
+pub(crate) type WeatherSample = unsafe extern "system" fn(usize, *mut f32, *const f64, u8);
+pub(crate) static WEATHER_SAMPLE: OnceLock<WeatherSample> = OnceLock::new();
+
+/// Fog and rain (0..1) at `p`, as the game's humidity and rain sensors read them.
+unsafe fn weather_at(c_scene: usize, p: V3) -> (f64, f64) {
+    let grid = c_scene + OFF_SCENE_WEATHER;
+    let Some(sample) = WEATHER_SAMPLE.get() else { return (0.0, 0.0) };
+    if read_u32_at(grid + 4) >> 16 < 2 {
+        return (0.0, 0.0); // grid not built yet
+    }
+    let mut out = [0f32; 8];
+    sample(grid, out.as_mut_ptr(), [p.x, p.y, p.z].as_ptr(), 1);
+    let ok = |v: f32| if v.is_finite() { v as f64 } else { 0.0 };
+    (ok(out[2]), ok(out[1]))
+}
 
 /// Height of world point `p` above whatever is below it (ground, buildings, water) within `max` metres,
 /// ignoring the vehicle's own bodies (`own` physics objects). None = nothing that close.
@@ -534,6 +549,9 @@ struct Craft {
     prop_v: Vec<f64>,
     /// Vehicle key whose marks `sw` was read from (they gate the build).
     read_key: u64,
+    /// Wingtip condensation trails (`fx`).
+    trails: crate::fx::Trails,
+    mist: crate::fxwing::Mist,
     /// The vehicle's own settings (None: the global `ENABLED` / `VRS` / `PROPS` / ...).
     sw: crate::model::Switches,
 }
@@ -952,6 +970,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     }
     let mut net = std::mem::take(&mut st.net);
     let want_debug = DEBUG_WANTED.load(Ordering::Relaxed);
+    // Effects only while the simulation draws, for vehicles near its camera.
+    let fx_eye = if crate::fx::ENABLED.load(Ordering::Relaxed) { main_viewproj().and_then(|vp| crate::math::camera_eye(&vp)) } else { None };
+    let mut fx_out: Vec<crate::fx::Snapshot> = Vec::new();
     let focus = if want_debug { debug_focus() } else { None };
     // The game's forces of the last step (applied after our previous tick, before the step).
     let engine_forces = std::mem::take(&mut *ENGINE_FORCES.lock().unwrap_or_else(|p| p.into_inner()));
@@ -996,6 +1017,8 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
             warned: false,
             prop_v: Vec::new(),
             read_key: 0,
+            trails: crate::fx::Trails::default(),
+            mist: crate::fxwing::Mist::default(),
             sw: Default::default(),
             #[cfg(feature = "logging")]
             touched: 0,
@@ -1246,6 +1269,48 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         }
         craft.prev_vel = Some(vcom);
         craft.prev_aero = forces.iter().map(|f| if f.force.len() > fmax { f.force * (fmax / f.force.len()) } else { f.force }).fold(V3::ZERO, |a, f| a + f);
+        if fx_eye.is_some_and(|e| (own_com - e).len() < crate::fx::RANGE) {
+            let (fog, rain) = weather_at(scene, own_com);
+            let rh = crate::fx::humidity(fog, rain);
+            let vortices = crate::fx::tip_vortices(&model, &lbs, &forces[..n_aero], rh);
+            craft.trails.step(craft.dt, &vortices, model.tips.len());
+            let mut clouds = crate::fxwing::wing_clouds(&model, &lbs, &forces[..n_aero], rh, craft.dt, &mut craft.mist);
+            for c in &mut clouds {
+                c.body = bodies.get(c.body).copied().unwrap_or(0);
+            }
+            // Every 5 s while a tip condenses: the weather and how big the trails are.
+            static FX_LOG_MS: AtomicU64 = AtomicU64::new(0);
+            let ms = crate::editor::now_ms();
+            let condensing = vortices.iter().any(|v| crate::fx::condensed_radius(v.gamma, v.core, v.rho, v.dp_sat) > 0.0);
+            if (condensing || !clouds.is_empty()) && ms.saturating_sub(FX_LOG_MS.load(Ordering::Relaxed)) > 5000 {
+                FX_LOG_MS.store(ms, Ordering::Relaxed);
+                let tips: Vec<String> = vortices
+                    .iter()
+                    .map(|v| format!("G{:.0} core {:.2} R {:.2}", v.gamma, v.core, crate::fx::condensed_radius(v.gamma, v.core, v.rho, v.dp_sat)))
+                    .collect();
+                log_line(&format!("effects: vehicle {id}: fog {fog:.2} rain {rain:.2} humidity {rh:.2} at {:.0} m, {:.0} m/s; tips {tips:?}; {} wing panels condensing", own_com.y, vcom.len(), clouds.len()));
+            }
+            if !craft.trails.is_empty() || !clouds.is_empty() {
+                let trails = craft
+                    .trails
+                    .tips
+                    .iter()
+                    .enumerate()
+                    .map(|(k, tr)| {
+                        let head = vortices.iter().find(|v| v.tip == k).map(|v| {
+                            let b = model.tips[k].body.min(lbs.len() - 1);
+                            crate::fx::Head { body: bodies.get(b).copied().unwrap_or(0), local: lbs[b].world_to_grid(v.at), at: v.at }
+                        });
+                        (tr.iter().copied().collect(), head)
+                    })
+                    .collect();
+                let mb = model.main_body.min(lbs.len() - 1);
+                let pace = bodies.get(mb).map(|&b| (b, lbs[mb].world_to_grid(lbs[mb].com), lbs[mb].com, lbs[mb].vel));
+                fx_out.push(crate::fx::Snapshot { id, now: craft.trails.now, dt: craft.dt, trails, clouds, pace });
+            }
+        } else {
+            craft.trails = crate::fx::Trails::default();
+        }
         // Only vehicles near the camera's focus; without a camera (none drawn yet) all of them.
         let size = model.grid.dims.iter().map(|&n| n as f64 * 0.25).fold(0.0, f64::max);
         let reach = DEBUG_RADIUS + size + if craft.in_debug_range { DEBUG_HYSTERESIS } else { 0.0 };
@@ -1378,7 +1443,9 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
         net.clear(); // bodies of despawned vehicles
     }
     st.net = net;
-    st.crafts.retain(|id, _| seen.contains(id));
+    st.crafts.retain(|id, _| {
+        seen.contains(id)
+    });
     VEHICLES.store(st.crafts.len() as u64, Ordering::Relaxed);
     // Empty while F9 is closed, so the render thread stops painting; kept on a repeat sync call.
     if stepped || !want_debug || st.crafts.is_empty() {
@@ -1391,8 +1458,11 @@ pub(crate) unsafe fn on_post_step_sync(physics_scene: usize) {
     if want_debug && (stepped || client || !debug.is_empty() || st.crafts.is_empty()) {
         *DEBUG.lock().unwrap_or_else(|p| p.into_inner()) = debug;
     }
-    // Built poses: the arrows and the watch camera place things exactly as the game draws them.
-    if want_debug || crate::watch::watched().is_some() {
+    if stepped || fx_eye.is_none() || st.crafts.is_empty() {
+        *crate::fx::SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = fx_out;
+    }
+    // Built poses: the arrows, the watch camera and the trails place things exactly as the game draws them.
+    if want_debug || crate::watch::watched().is_some() || fx_eye.is_some() {
         record_builds(st.crafts.values().flat_map(|c| c.bodies.iter().copied()));
     }
 }

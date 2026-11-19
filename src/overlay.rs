@@ -1555,7 +1555,7 @@ impl Overlay {
         const PROPS_TIP: &str = "Propellers and rotors work blade by blade: pitch matters, blades stall, the engine feels the load, and the propwash blows over the wings and tail. Off: the game's own propellers and rotors, with the plugin's wings and fuselage.";
         const VRS_TIP: &str = "Rotors sinking slowly and almost straight down into their own downwash lose lift: the descent speeds up, and more collective makes it worse. Fly out forwards or sideways to recover. Off: rotors stay steady in any descent.";
         const GROUND_TIP: &str = "Wings within about a wingspan of the ground or water make less induced drag: the aircraft floats along the runway on landing and lifts off sooner. Off: the same lift and drag at any height.";
-        const BLUR_TIP: &str = "Fast propeller and rotor blades are drawn as a faint stippled smear over the arc they sweep in about 1/20 s, like a camera or your eye sees them. Off: sharp blades.";
+        const BLUR_TIP: &str = "Fast propeller and rotor blades are drawn as a faint stippled smear, like a camera or your eye sees them. Off: sharp blades.";
         let hooked = crate::flight::HOOKED.load(Ordering::Relaxed);
         let props_hooked = crate::flight::PROPS_HOOKED.load(Ordering::Relaxed);
         let vehicle = self.snapshot.is_some() && editor::editor_active();
@@ -1581,7 +1581,9 @@ impl Overlay {
         heading(ui, "Display");
         if let Some(_t) = table(ui, "##display", &SETTING_COLS) {
             saved |= setting_row(ui, 0, "Rotor blur", BLUR_TIP, &crate::blur::ENABLED, (true, false), None);
-            saved |= setting_row(ui, 0, "Jet exhaust smoke", "Off: jet engines make no exhaust smoke, trail or surface splash. Piston engines, rockets and fires keep theirs, and thrust, sound and heat are unchanged.", &crate::hooks::JET_SMOKE, (true, false), None);
+            saved |= setting_row(ui, 0, "Jet exhaust smoke", "Off: jet engines make no exhaust smoke", &crate::hooks::JET_SMOKE, (true, false), None);
+            saved |= setting_row(ui, 0, "Aerodynamic effects", "Condensation in humid air: trails from the wingtips when the wings pull hard, and mist over the wings when the air over them speeds up enough (hard pulls, or near the speed of sound)", &crate::fx::ENABLED, (true, false), None);
+            saved |= setting_row(ui, 1, "Condensation in any weather", "Humidity will be set to the maximum for condensation effects. Off: game's humidity level is used, use the humidity sensor to see it or adjust the fog/rain setting in custom settings.", &crate::fx::ANY_WEATHER, (crate::fx::ENABLED.load(Ordering::Relaxed), false), None);
         }
 
         if saved {
@@ -1646,29 +1648,14 @@ impl Overlay {
                 let c = wing_color(n, m.wing_rank.get(p).copied().unwrap_or(0));
                 if n != 0 && n == self.target { c.map(|v| 255 - (255 - v) / 2) } else { c }
             }
-            _ => match m.panels[p].role {
-                Role::None => [90, 150, 230],
-                Role::Pitch => [240, 140, 40],
-                Role::Roll => [220, 70, 220],
-                Role::Yaw => [70, 210, 90],
-                Role::Flap => [230, 220, 60],
-            },
+            _ => view::role_color(m.panels[p].role),
         }
     }
 
     fn face_color(&self, m: &Model, face: usize, hover_comp: Option<u32>) -> [u8; 3] {
-        let cell = self.faces[face].cell;
-        let o = self.faces[face].comp;
-        let fin = self.faces.get(face).and_then(|f| m.fin_of.get(&f.comp).filter(|&&(_, moving)| f.moving || !moving)).map(|&(p, _)| self.panel_color(m, p, 0));
-        let mut c = fin.or_else(|| self.cell_color(m, cell, 0)).unwrap_or_else(|| {
-            let b = if o != EMPTY && o != INTERIOR { m.comps[o as usize].body } else { 0 };
-            if b == 0 {
-                [150, 150, 150]
-            } else {
-                [135, 145, 160]
-            }
-        });
-        if hover_comp == Some(o) {
+        let f = &self.faces[face];
+        let mut c = view::face_color(m, &self.des, f);
+        if hover_comp == Some(f.comp) {
             c = c.map(|v: u8| v.saturating_add(70));
         }
         c

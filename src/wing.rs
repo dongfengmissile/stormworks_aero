@@ -536,7 +536,9 @@ fn panel_geometry(grid: &Grid, cells: Vec<usize>, role: Role, com: V3) -> Result
         let sel: Vec<&V3> = pts.iter().filter(|p| (p.dot(s) - end).abs() < 0.13).collect();
         sel.iter().map(|p| off(**p)).sum::<f64>() / sel.len().max(1) as f64
     };
-    if near_end(smax) < near_end(smin) {
+    let (out, inn) = (near_end(smax), near_end(smin));
+    // One strip wide, both ends are the same cells: the span points away from the CoM line.
+    if out < inn || (out == inn && (mean - com).dot(s) < 0.0) {
         s = -s;
     }
     // Spanwise strips: chord extent per strip of cells.
@@ -1340,6 +1342,30 @@ mod tests {
         assert!((p.area / v - 72.0).abs() < 1e-6, "area {} voxels", p.area / v);
         assert!((p.b / VOXEL_M - 12.0).abs() < 1e-6, "span {}", p.b / VOXEL_M);
         assert!(p.n.x.abs() > 0.9, "normal {:?} should face the flow", p.n);
+    }
+
+    #[test]
+    fn one_strip_panels_point_outward_on_both_sides() {
+        // The flat wing's strips next to the fuselage (|x| = 3) as a separate part, one voxel wide.
+        let (g, com) = flat_wing();
+        let cells: Vec<([i32; 3], f32, u32)> = (0..g.fill.len())
+            .filter(|&i| g.owner[i] != EMPTY)
+            .map(|i| {
+                let c = g.cell(i);
+                (c, g.fill[i], if g.owner[i] == 0 && c[0].abs() == 3 { 2 } else { g.owner[i] })
+            })
+            .collect();
+        let g = Grid::from_cells(&cells);
+        let key = |o: u32| match o {
+            0 => Some((Key::Wing(0), Role::None)),
+            2 => Some((Key::Wing(1), Role::None)),
+            _ => None,
+        };
+        let panels = build_panels(&g, &key, com);
+        assert_eq!(panels.iter().filter(|p| (p.b - VOXEL_M).abs() < 1e-9).count(), 2);
+        for p in &panels {
+            assert!(p.s.y * p.centroid.y > 0.0, "span {:?} at {:?}", p.s, p.centroid);
+        }
     }
 
     #[test]

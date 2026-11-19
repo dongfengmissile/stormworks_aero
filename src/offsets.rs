@@ -256,6 +256,46 @@ pub(crate) const RAYCAST_CLOSEST_PROLOGUE: [u8; 21] =
 pub(crate) const RVA_WATER_HEIGHT: usize = 0x002b_ebf0;
 pub(crate) const WATER_HEIGHT_PROLOGUE: [u8; 17] = [0x4c, 0x8b, 0xdc, 0x48, 0x83, 0xec, 0x68, 0x0f, 0x57, 0xc0, 0x49, 0x8d, 0x43, 0x18, 0x4c, 0x8b, 0xc2];
 pub(crate) const OFF_SCENE_WATER_FIELD: usize = 0x68A0;
+// Weather at a world point, as the humidity and rain sensors read it (knowledge/heat-model.md):
+// void f(c_scene + 0xBADE8, f32 out[8], const f64 pos[3], u8 storm_cells). out[1] rain, out[2] fog, 0..1.
+pub(crate) const RVA_WEATHER_SAMPLE: usize = 0x002c_3d40;
+pub(crate) const WEATHER_SAMPLE_PROLOGUE: [u8; 32] = [
+    0x48, 0x8b, 0xc4, 0x53, 0x56, 0x57, 0x41, 0x57, 0x48, 0x81, 0xec, 0xd8, 0x00, 0x00, 0x00, 0xf2, 0x41, 0x0f, 0x10, 0x00, 0x4d, 0x8b, 0xf8, 0xf2, 0x41, 0x0f,
+    0x10, 0x48, 0x10, 0x48, 0x8b, 0xda,
+];
+pub(crate) const OFF_SCENE_WEATHER: usize = 0xBADE8;
+
+// Effects pass (knowledge/rendering.md, "Main-view translucent insertion point"): the call
+// `gl_set_depth_test_mask(glctx, 1, 0)` after the game's translucent passes, scene colour bound.
+pub(crate) const RVA_GL_SET_DEPTH_TEST_MASK: usize = 0x001b_de00;
+/// Up to the first rip-relative call.
+pub(crate) const GL_SET_DEPTH_TEST_MASK_PROLOGUE: [u8; 19] = [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x41, 0x0f, 0xb6, 0xd8, 0xb9, 0x71, 0x0b, 0x00, 0x00, 0x84, 0xd2, 0x74, 0x08];
+/// `xor r8d, r8d; mov dl, 1; mov rcx, r14; call` (rel32 follows) in `render_scene_with_cameras`.
+pub(crate) const RVA_FX_CALL_SITE: usize = 0x006d_d362;
+pub(crate) const FX_CALL_SITE_BYTES: [u8; 9] = [0x45, 0x33, 0xc0, 0xb2, 0x01, 0x49, 0x8b, 0xce, 0xe8];
+/// Renderer: the main view's render target set (`[0]` G-buffer, `[1]` scene colour).
+pub(crate) const OFF_RENDERER_MAIN_TARGETS: usize = 0x2628;
+/// Render target: width, height (u32).
+pub(crate) const OFF_TARGET_WIDTH: usize = 0x2C;
+pub(crate) const OFF_TARGET_HEIGHT: usize = 0x30;
+/// G-buffer target: depth texture id (u32), log depth as in depth_utils.glslh.
+pub(crate) const OFF_GBUFFER_DEPTH_TEX: usize = 0x60;
+/// View state: camera feed (u64, 0 = main view), editor preview (u8), fog density (f32) [medium].
+pub(crate) const OFF_VIEW_FEED: usize = 0x828;
+pub(crate) const OFF_VIEW_EDITOR: usize = 0x83B;
+pub(crate) const OFF_VIEW_FOG_DENSITY: usize = 0x770;
+/// View state lights as `light_pass_uniforms` uploads them (`22e792753489` [high], light-RE): sun
+/// colour vec3, intensity (× 1 − (1 − f32[+0x8E4])·f32[+0x8E8]), moon colour vec3 and intensity,
+/// ambient low/high (u8x4, /255).
+pub(crate) const OFF_VIEW_SUN_COLOR: usize = 0x730;
+pub(crate) const OFF_VIEW_SUN_INTENSITY: usize = 0x73C;
+pub(crate) const OFF_VIEW_SUN_DIM_A: usize = 0x8E4;
+pub(crate) const OFF_VIEW_SUN_DIM_B: usize = 0x8E8;
+pub(crate) const OFF_VIEW_MOON_COLOR: usize = 0x74C;
+pub(crate) const OFF_VIEW_MOON_INTENSITY: usize = 0x758;
+pub(crate) const OFF_VIEW_AMBIENT_LOW: usize = 0x7B4;
+pub(crate) const OFF_VIEW_AMBIENT_HIGH: usize = 0x7B8;
+
 pub(crate) const OFF_SETTINGS_AIR_DENSITY: usize = 0xC4; // f32 sea-level air density (game constant "air_density", 1.225)
 
 /// `opaque_chunk_draw_item(bindset, mesh, first, count, mat_world, prev, next, light, c1, c2, c3,

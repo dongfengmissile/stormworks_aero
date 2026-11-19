@@ -213,6 +213,9 @@ pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
     install_paint_hook();
     install_tint_hooks();
     install_blur_hooks();
+    if let Err(e) = crate::fxdraw::install(MODULE_BASE.load(Ordering::SeqCst)) {
+        log_line(&e);
+    }
     log_line(&format!("camera hook installed ({at:#x})"));
     Ok(())
 }
@@ -607,6 +610,12 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
         let _ = crate::flight::WATER_HEIGHT.set(std::mem::transmute::<usize, crate::flight::WaterHeight>(water));
     } else {
         log_line("raycast / water height prologue mismatch: no ground effect");
+    }
+    let weather = base + RVA_WEATHER_SAMPLE;
+    if bytes_match(weather, &WEATHER_SAMPLE_PROLOGUE) {
+        let _ = crate::flight::WEATHER_SAMPLE.set(std::mem::transmute::<usize, crate::flight::WeatherSample>(weather));
+    } else {
+        log_line("weather sample prologue mismatch: condensation as in clear air");
     }
     log_line(&format!("flight hooks installed (post-step sync {sync:#x}, damping {damping:#x})"));
     Ok(())

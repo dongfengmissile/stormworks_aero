@@ -346,22 +346,27 @@ pub(crate) struct Gl {
     pub(crate) compressed_tex_sub_image_2d: unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, i32, *const c_void),
 }
 
-pub(crate) fn gl() -> Option<&'static Gl> {
-    static GL: OnceLock<Option<Gl>> = OnceLock::new();
-    GL.get_or_init(|| unsafe {
+/// An OpenGL entry point: an opengl32 export, else from `wglGetProcAddress` (needs a current context).
+pub(crate) fn gl_proc(name: &std::ffi::CStr) -> Option<usize> {
+    unsafe {
         let module = LoadLibraryA(c"opengl32.dll".as_ptr().cast());
         if module.is_null() {
             return None;
         }
+        if let Some(f) = GetProcAddress(module, name.as_ptr().cast()) {
+            return Some(f as usize);
+        }
         let wgl = GetProcAddress(module, c"wglGetProcAddress".as_ptr().cast())?;
         let wgl: unsafe extern "system" fn(*const u8) -> usize = std::mem::transmute(wgl);
-        let sym = |name: &std::ffi::CStr| -> Option<usize> {
-            if let Some(f) = GetProcAddress(module, name.as_ptr().cast()) {
-                return Some(f as usize);
-            }
-            let p = wgl(name.as_ptr().cast()); // small sentinels mean "unknown"
-            (p > 0x10000).then_some(p)
-        };
+        let p = wgl(name.as_ptr().cast()); // small sentinels mean "unknown"
+        (p > 0x10000).then_some(p)
+    }
+}
+
+pub(crate) fn gl() -> Option<&'static Gl> {
+    static GL: OnceLock<Option<Gl>> = OnceLock::new();
+    GL.get_or_init(|| unsafe {
+        let sym = gl_proc;
         let gl = Gl {
             bind_buffer: std::mem::transmute::<usize, _>(sym(c"glBindBuffer")?),
             get_buffer_sub_data: std::mem::transmute::<usize, _>(sym(c"glGetBufferSubData")?),

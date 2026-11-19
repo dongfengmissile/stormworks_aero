@@ -3,7 +3,9 @@
 //! cell id for exact picking. (ImGui's 16-bit indices cannot hold a big vehicle.)
 
 use crate::math::{v3, V3};
-use crate::voxel::{Grid, EMPTY, VOXEL_M};
+use crate::model::{Designations, Model};
+use crate::voxel::{Grid, EMPTY, INTERIOR, VOXEL_M};
+use crate::wing::Role;
 
 pub struct Face {
     /// Convex polygon, body frame (metres).
@@ -63,6 +65,43 @@ pub fn faces(g: &Grid) -> Vec<Face> {
         }
     }
     out
+}
+
+/// A wing panel's colour by its control role.
+pub fn role_color(r: Role) -> [u8; 3] {
+    match r {
+        Role::None => [90, 150, 230],
+        Role::Pitch => [240, 140, 40],
+        Role::Roll => [220, 70, 220],
+        Role::Yaw => [70, 210, 90],
+        Role::Flap => [230, 220, 60],
+    }
+}
+
+/// A face's colour in the F7 view (no tool colouring): fins and wing panels by role, designated
+/// wing blocks outside any panel dark blue, the rest grey (sub-grids bluer).
+pub fn face_color(m: &Model, des: &Designations, f: &Face) -> [u8; 3] {
+    let o = f.comp;
+    let part = o != EMPTY && o != INTERIOR;
+    let role = |p: usize| role_color(m.panels[p].role);
+    if let Some(&(p, _)) = m.fin_of.get(&o).filter(|&&(_, moving)| f.moving || !moving) {
+        return role(p);
+    }
+    match m.panel_of[f.cell] {
+        // A missile part: its body is no wing; it stands for its fins only when they are not
+        // separate solids (fins in its static mesh).
+        usize::MAX if part && m.fin_of.contains_key(&o) => m.fin_of.get(&o).filter(|f| !f.1).map(|f| role(f.0)),
+        usize::MAX if part && des.wings.contains(&m.comps[o as usize].pos) => Some([40, 60, 150]),
+        usize::MAX => None,
+        p => Some(role(p)),
+    }
+    .unwrap_or(if part && m.comps[o as usize].body != 0 { [135, 145, 160] } else { [150, 150, 150] })
+}
+
+/// Shading of a face with normal `n` lit from `light` (both sides), and its outline's.
+pub fn shade(n: V3, light: V3) -> (f64, f64) {
+    let s = 0.45 + 0.55 * n.dot(light).abs();
+    (s, s * 0.55)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,13 +196,14 @@ pub fn render_with(faces: &[Face], color: &dyn Fn(usize) -> [u8; 3], pr: &Projec
             continue;
         }
         let base = color(fi);
-        let shade = 0.45 + 0.55 * f.normal.dot(light).abs();
-        let col = base.map(|c| (c as f64 * shade).min(255.0) as u8);
-        let edge = base.map(|c| (c as f64 * shade * 0.55) as u8);
+        let (lit, outline) = shade(f.normal, light);
+        let col = base.map(|c| (c as f64 * lit).min(255.0) as u8);
+        let edge = base.map(|c| (c as f64 * outline) as u8);
         // Fan triangles; mark which triangle edges are polygon edges for the outline.
         let n = p.len();
         for i in 1..n - 1 {
-            let outline = [i == n - 2, true, i == 1]; // edges opposite vertex 0, 1, 2 of (0, i, i+1)
+            // Edges opposite vertex 0, 1, 2 of (0, i, i+1): (i, i+1) always, (0, i+1) last, (0, i) first.
+            let outline = [true, i == n - 2, i == 1];
             raster(&mut img, &mut depth, [p[0], p[i], p[i + 1]], outline, col, edge, fi as u32 + 1);
         }
     }

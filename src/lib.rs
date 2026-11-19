@@ -8,6 +8,8 @@
 
 pub mod body;
 pub mod defs;
+pub mod fx;
+pub mod fxwing;
 pub mod marks;
 pub mod math;
 pub mod model;
@@ -32,6 +34,10 @@ mod fault;
 #[cfg(windows)]
 mod flight;
 #[cfg(windows)]
+mod fxdraw;
+/// The effects' shaders (public for tools/wingsim, which draws them outside the game).
+pub mod fxglsl;
+#[cfg(windows)]
 mod hooks;
 #[cfg(windows)]
 mod logging;
@@ -45,6 +51,7 @@ mod offsets;
 mod overlay;
 #[cfg(windows)]
 mod paint;
+#[cfg(windows)]
 #[cfg(windows)]
 mod plugin;
 #[cfg(windows)]
