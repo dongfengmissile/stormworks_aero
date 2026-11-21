@@ -136,6 +136,8 @@ pub(crate) struct Overlay {
     tool: Tool,
     /// Wing number the block tools paint into (0: the plain wings).
     target: u32,
+    /// A wing is selected (New wing, or Ctrl + click): Mark blocks paints only then.
+    selected: bool,
     /// Drag painting in progress: marking (or unmarking), and the last block it touched.
     stroke: Option<(bool, u32)>,
     /// The designations when the press that started the drag came (its undo step).
@@ -226,6 +228,7 @@ impl Overlay {
             cam: Camera { yaw: 0.6, pitch: 0.45, dist: 25.0, target: V3::ZERO },
             tool: Tool::Inspect,
             target: 0,
+            selected: false,
             stroke: None,
             stroke_start: Designations::default(),
             pick: None,
@@ -441,7 +444,8 @@ impl Overlay {
             if self.target == 0 {
                 self.new_wing();
             } else {
-                self.target = 0;
+                (self.target, self.selected, self.hover_key) = (0, false, None);
+                self.status = "no wing selected".into();
                 self.view_dirty = true;
             }
         }
@@ -466,7 +470,7 @@ impl Overlay {
                 self.tool
             ));
             match pick {
-                Some(face) => self.apply_tool(&m, face, io.key_ctrl),
+                Some(face) => self.apply_tool(&m, face, io.key_ctrl && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0),
                 None => self.status = "no block under the cursor".into(),
             }
         }
@@ -545,7 +549,7 @@ impl Overlay {
         }
         // A wing number from another vehicle; one just started (the next free number) stays.
         if self.target > self.des.splits.values().max().copied().unwrap_or(0) + 1 {
-            self.target = 0;
+            (self.target, self.selected) = (0, false);
         }
     }
 
@@ -1127,7 +1131,7 @@ impl Overlay {
         }
     }
 
-    /// A press on `face`. `pick`: Ctrl is held, so it only chooses the wing to paint into.
+    /// A press on `face`. `pick`: Ctrl is held in Mark blocks, so it only chooses the wing to paint into.
     fn apply_tool(&mut self, m: &Arc<Model>, face: usize, pick: bool) {
         let Some(f) = self.faces.get(face) else {
             return;
@@ -1143,6 +1147,7 @@ impl Overlay {
                     return;
                 }
                 self.target = self.des.splits.get(&comp.pos).copied().unwrap_or(0);
+                (self.selected, self.hover_key) = (true, None);
                 self.status = match self.target {
                     0 => "marking plain wing blocks".into(),
                     n => format!("marking blocks of wing {n}"),
@@ -1195,6 +1200,10 @@ impl Overlay {
                 // Mark blocks: a press on a block of the target wing starts unmarking, any other
                 // starts marking into it; the drag goes on in `stroke_step`.
                 _ => {
+                    if !self.selected {
+                        self.status = "select a wing first: New wing, or Ctrl + click a wing".into();
+                        return;
+                    }
                     let add = !self.in_target(&comp.pos);
                     self.stroke = Some((add, f.comp));
                     self.stroke_block(m, comp.pos, add);
@@ -1293,6 +1302,7 @@ impl Overlay {
     /// New wing: the next free wing number becomes the one being painted into.
     fn new_wing(&mut self) {
         self.target = self.des.splits.values().max().copied().unwrap_or(0) + 1;
+        (self.selected, self.hover_key) = (true, None);
         self.status = format!("wing {}: mark its blocks", self.target);
         self.view_dirty = true;
     }
@@ -1322,6 +1332,7 @@ impl Overlay {
             Tool::Wing => match crate::toolbar::WING_MODE.load(Ordering::Relaxed) {
                 1 => body(),
                 2 => wing(),
+                _ if !self.selected => Vec::new(),
                 _ => vec![comp.pos],
             },
             Tool::Foil => wing(),
@@ -1334,7 +1345,7 @@ impl Overlay {
     /// Hover preview: the faces a press here would change, lit up over the vehicle.
     fn hover_preview(&mut self, ui: &Ui, m: &Arc<Model>) {
         let io = ui.io();
-        let pick = io.key_ctrl && self.tool == Tool::Wing;
+        let pick = io.key_ctrl && self.tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0;
         let face = if io.want_capture_mouse { None } else { crate::toolbar::pointer().and_then(|at| self.pick_world(at, io.display_size, false)) };
         let key = face.map(|f| (f, self.tool, crate::toolbar::WING_MODE.load(Ordering::Relaxed), pick, Arc::as_ptr(m) as usize, self.des.wings.len()));
         if key != self.hover_key {
@@ -1378,7 +1389,7 @@ impl Overlay {
         let before = self.des.clone();
         let d = &mut self.des;
         (d.wings.clear(), d.splits.clear(), d.roles.clear(), d.foils.clear());
-        (d.default_foil, d.default_fin, self.target) = (0, None, 0);
+        (d.default_foil, d.default_fin, self.target, self.selected) = (0, None, 0, false);
         if self.des != before {
             self.redo.clear();
             self.undo.push(before);

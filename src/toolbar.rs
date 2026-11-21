@@ -549,12 +549,12 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
         ),
     ];
     let wing_items = [
-        ("paint_mode", "Mark blocks", "Click or drag over blocks to make them wing blocks. Start on a block of the wing to unmark."),
+        ("paint_mode", "Mark blocks", "Click or drag over blocks to add them to the selected wing. Start on a block of it to unmark. Select a wing first: New wing starts one, Ctrl + click a wing selects it."),
         ("paint_fill", "Fill body", "Click a block to mark every block of its body as wing, however thick. Click a marked block to unmark them."),
         ("component", "Merge wings", "Click a wing, then the wing that should join it."),
     ];
     let wing_actions = [
-        (if own { "aero_split" } else { "new" }, "New wing", "On: the blocks you mark form a separate wing. Off: they join the plain wing. Ctrl + click a wing to continue that one.", ID_NEW_WING),
+        (if own { "aero_split" } else { "new" }, "New wing", "Start a separate wing and select it: Mark blocks adds to it. Off: no wing selected.", ID_NEW_WING),
         (if own { "aero_detect" } else { "mechanics" }, "Detect wings", "Mark the vehicle's thin slabs as wings and give its control surfaces a role.", ID_DETECT),
     ];
     let icons =
