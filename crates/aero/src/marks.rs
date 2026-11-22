@@ -2,9 +2,8 @@
 //! vehicle XML, and in memory a table keyed by component pointer. Marks follow their part through
 //! save/load, copy/paste and undo, wherever it ends up.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+pub use stormworks_core::marks::GEN;
+use stormworks_core::marks as raw;
 
 use crate::model::{Designations, Switches};
 use crate::vehicle::Comp;
@@ -33,6 +32,8 @@ pub struct Mark {
     /// The Mechanisms sequences this joint is in, by name, with its moves in each: start (s),
     /// duration (s), target (degrees, or metres for a sliding joint), from the workbench pose.
     pub seq: Vec<(String, Vec<[f32; 3]>)>,
+    /// Tokens this version does not know (a newer plugin's), written back unchanged.
+    pub other: Vec<String>,
 }
 
 /// Workbench joint angle range, degrees.
@@ -79,10 +80,11 @@ impl Mark {
             let moves: Vec<String> = moves.iter().map(|[s, d, v]| format!("{s:.2}/{d:.2}/{v:.2}")).collect();
             t.push(format!("sq:{}@{}", seq_name(name).replace(' ', "_"), moves.join(";")));
         }
+        t.extend(self.other.iter().cloned());
         t.join(" ")
     }
 
-    /// Unknown tokens (a newer plugin's) are skipped.
+    /// Unknown tokens (a newer plugin's) are kept in `other`.
     pub fn decode(s: &str) -> Mark {
         let mut m = Mark::default();
         for tok in s.split_whitespace() {
@@ -111,12 +113,12 @@ impl Mark {
                     }
                 }
                 Some(("bw", v)) => m.blade_width = v.parse::<f32>().ok().filter(|w| w.is_finite()).map(|w| w.clamp(BLADE_WIDTH_RANGE.0, BLADE_WIDTH_RANGE.1)),
-                Some((k, v)) => {
+                Some((k, v)) if m.sw.tokens().iter().any(|(t, _)| *t == k) => {
                     if let Some((_, slot)) = m.sw.tokens().into_iter().find(|(t, _)| *t == k) {
                         *slot = on_off(v);
                     }
                 }
-                _ => {}
+                _ => m.other.push(tok.to_string()),
             }
         }
         m
@@ -160,6 +162,7 @@ pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
             joint_angle: des.joint_angles.get(&c.pos).map(|&a| a as f32),
             joint_offset: des.joint_offsets.get(&c.pos).map(|&o| o as f32),
             seq: des.joint_seq.get(&c.pos).map(|v| v.iter().map(|(n, mv)| (n.clone(), mv.iter().map(|m| m.map(|x| x as f32)).collect())).collect()).unwrap_or_default(),
+            other: Vec::new(),
         })
         .collect()
 }
@@ -206,48 +209,26 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
     Some(d)
 }
 
-static TABLE: LazyLock<Mutex<HashMap<usize, Mark>>> = LazyLock::new(Default::default);
-/// Bumped when the game moves marks (load, clone, undo): the workbench snapshot re-reads them.
-pub static GEN: AtomicU64 = AtomicU64::new(0);
-
-fn table() -> std::sync::MutexGuard<'static, HashMap<usize, Mark>> {
-    TABLE.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 pub fn get(comp: usize) -> Option<Mark> {
-    table().get(&comp).cloned()
+    raw::get(comp).map(|s| Mark::decode(&s))
 }
 
 /// Set (or with an empty/None mark, clear) a component's marks. `game`: the game moved them.
 pub fn set(comp: usize, mark: Option<Mark>, game: bool) {
-    let mut t = table();
-    let changed = match mark.filter(|m| !m.is_empty()) {
-        Some(m) => t.insert(comp, m.clone()).as_ref() != Some(&m),
-        None => t.remove(&comp).is_some(),
-    };
-    if changed && game {
-        GEN.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Copy `src`'s marks onto `dst` (clone, undo).
-pub fn copy(dst: usize, src: usize) {
-    let m = get(src);
-    set(dst, m, true);
+    raw::set(comp, mark.map(|m| m.encode()), game);
 }
 
 pub fn read(ptrs: &[usize]) -> Vec<Mark> {
-    let t = table();
-    ptrs.iter().map(|p| t.get(p).cloned().unwrap_or_default()).collect()
+    raw::read(ptrs).iter().map(|s| Mark::decode(s)).collect()
 }
 
 /// Copy the vehicle settings (the first of each found, in part order) onto every body's first part.
 /// `parts`: (component, body) in part order. A body held only by a hardpoint (a missile) spawns
 /// as its own vehicle and has to bring them along.
 pub fn spread_settings(parts: &[(usize, u32)]) {
-    let mut t = table();
+    let mut t = raw::table();
     let mut d = Mark::default();
-    for m in parts.iter().filter_map(|(p, _)| t.get(p)) {
+    for m in parts.iter().filter_map(|(p, _)| t.get(p)).map(|s| Mark::decode(s)) {
         d.default_foil = d.default_foil.or(m.default_foil);
         d.default_fin = d.default_fin.or(m.default_fin);
         d.sw = d.sw.or(m.sw);
@@ -257,10 +238,9 @@ pub fn spread_settings(parts: &[(usize, u32)]) {
     }
     let mut seen = std::collections::HashSet::new();
     for (p, _) in parts.iter().filter(|(_, b)| seen.insert(*b)) {
-        let m = t.entry(*p).or_default();
-        m.default_foil = d.default_foil;
-        m.default_fin = d.default_fin;
-        m.sw = d.sw;
+        let mut m = t.get(p).map_or_else(Mark::default, |s| Mark::decode(s));
+        (m.default_foil, m.default_fin, m.sw) = (d.default_foil, d.default_fin, d.sw);
+        t.insert(*p, m.encode());
     }
 }
 
@@ -272,12 +252,14 @@ pub fn designations(comps: &[Comp], ptrs: &[usize]) -> Option<Designations> {
 /// Store designations on a live vehicle's components.
 pub fn store(des: &Designations, comps: &[Comp], ptrs: &[usize]) {
     let marks = from_designations(des, comps);
-    let mut t = table();
-    for (p, m) in ptrs.iter().zip(marks) {
+    let mut t = raw::table();
+    for (p, mut m) in ptrs.iter().zip(marks) {
+        // Tokens of a newer plugin version stay.
+        m.other = t.get(p).map(|s| Mark::decode(s).other).unwrap_or_default();
         if m.is_empty() {
             t.remove(p);
         } else {
-            t.insert(*p, m);
+            t.insert(*p, m.encode());
         }
     }
 }
@@ -371,6 +353,9 @@ mod tests {
         assert_eq!(back, marks);
         assert_eq!(to_designations(&comps, &back), Some(d));
         assert_eq!(to_designations(&comps, &[Mark::default(), Mark::default()]), None);
-        assert_eq!(Mark::decode("w zz:1 r:none q"), Mark { wing: true, ..Default::default() });
+        // A newer plugin's tokens (or the mechanisms plugin's, in older files) survive a re-save.
+        let m = Mark::decode("w zz:1 r:none q");
+        assert_eq!(m, Mark { wing: true, other: vec!["zz:1".into(), "q".into()], ..Default::default() });
+        assert_eq!(m.encode(), "w zz:1 q");
     }
 }

@@ -24,7 +24,7 @@ use crate::logging::log_line;
 use crate::memory::{read_u32_at, read_usize_at, readable, PTR_MIN};
 use crate::voxel::{colour_runs, groups, triangle_voxels, Group};
 
-pub(crate) type ChunkDraw = unsafe extern "system" fn(
+pub type ChunkDraw = unsafe extern "system" fn(
     usize,      // bindset (renderer+0x920)
     usize,      // mesh
     u32,        // first index
@@ -42,15 +42,42 @@ pub(crate) type ChunkDraw = unsafe extern "system" fn(
     usize,      // unused
     u8,         // wireframe pass
 );
-pub(crate) static ORIGINAL: OnceLock<ChunkDraw> = OnceLock::new();
+pub static ORIGINAL: OnceLock<ChunkDraw> = OnceLock::new();
+/// Whether flight paint shows now (the aero plugin: its flight model on and F9 open).
+pub static FLIGHT_SHOWN: OnceLock<fn() -> bool> = OnceLock::new();
+
+fn flight_shown() -> bool {
+    FLIGHT_SHOWN.get().is_some_and(|f| f())
+}
+
+/// The block paint in the game render (workbench and flight). Failure only loses the paint.
+pub unsafe fn install() {
+    let at = crate::state::MODULE_BASE.load(Ordering::SeqCst) + crate::offsets::RVA_CHUNK_DRAW;
+    if !crate::hook::verify(at, &crate::offsets::CHUNK_DRAW_PROLOGUE) {
+        log_line(&format!("opaque_chunk_draw_item prologue mismatch at {at:#x}; blocks not painted"));
+        return;
+    }
+    // Batches the paint's draws (`draw_elements_detour`); without it each run is its own draw.
+    let gl32 = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(c"opengl32.dll".as_ptr().cast());
+    let de = if gl32.is_null() { None } else { windows_sys::Win32::System::LibraryLoader::GetProcAddress(gl32, c"glDrawElements".as_ptr().cast()) };
+    if let Some(de) = de {
+        if let Err(e) = crate::hook::install("glDrawElements", de as usize, &[], draw_elements_detour as *mut std::ffi::c_void, &ORIGINAL_DRAW_ELEMENTS) {
+            log_line(&e);
+        }
+    }
+    match crate::hook::install("block paint", at, &[], chunk_draw_detour as *mut std::ffi::c_void, &ORIGINAL) {
+        Ok(()) => log_line(&format!("block paint hook installed ({at:#x})")),
+        Err(e) => log_line(&e),
+    }
+}
 
 /// Stall red as [r, g, b] (the shader linearises colours like vertex colours).
-pub(crate) const RED: [u8; 3] = [230, 32, 32];
+pub const RED: [u8; 3] = [230, 32, 32];
 
 /// Voxel -> colour (RGBA8, R in the low byte) of one body.
-pub(crate) type VoxelColours = HashMap<[i32; 3], u32>;
+pub type VoxelColours = HashMap<[i32; 3], u32>;
 
-pub(crate) fn rgba(c: [u8; 3]) -> u32 {
+pub fn rgba(c: [u8; 3]) -> u32 {
     c[0] as u32 | (c[1] as u32) << 8 | (c[2] as u32) << 16 | 0xFF00_0000
 }
 const MESH_VBO: usize = 0x60;
@@ -85,23 +112,23 @@ static BENCH_TINT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 static FLIGHT_TINT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 const TINT_MARK: u32 = 0x5A00_0000;
 
-pub(crate) fn publish_bench_tint(t: HashMap<usize, u32>) {
+pub fn publish_bench_tint(t: HashMap<usize, u32>) {
     *BENCH_TINT.lock().unwrap_or_else(|p| p.into_inner()) = (!t.is_empty()).then_some(t);
 }
-pub(crate) fn publish_flight_tint(t: HashMap<usize, u32>) {
+pub fn publish_flight_tint(t: HashMap<usize, u32>) {
     *FLIGHT_TINT.lock().unwrap_or_else(|p| p.into_inner()) = (!t.is_empty()).then_some(t);
 }
 
-pub(crate) use crate::blur::ClassDraw;
-pub(crate) static ORIGINAL_ROCKET_DRAW: OnceLock<ClassDraw> = OnceLock::new();
-pub(crate) static ORIGINAL_RUDDER_DRAW: OnceLock<ClassDraw> = OnceLock::new();
+/// A moving-mesh class draw (`rocket_draw`, `rudder_draw`).
+pub type ClassDraw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub static ORIGINAL_ROCKET_DRAW: OnceLock<ClassDraw> = OnceLock::new();
+pub static ORIGINAL_RUDDER_DRAW: OnceLock<ClassDraw> = OnceLock::new();
 
 /// Tint for this component's draw now (game thread), if any.
 fn tint_of(comp: usize) -> Option<u32> {
     let look = |m: &Mutex<Option<HashMap<usize, u32>>>| m.lock().ok().and_then(|g| g.as_ref()?.get(&comp).copied());
     let bench = || crate::editor::editor_active().then(|| look(&BENCH_TINT)).flatten();
-    let flight =
-        || (crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) && crate::flight::ENABLED.load(Ordering::Relaxed)).then(|| look(&FLIGHT_TINT)).flatten();
+    let flight = || flight_shown().then(|| look(&FLIGHT_TINT)).flatten();
     bench().or_else(flight).map(|c| (c & 0x00FF_FFFF) | TINT_MARK)
 }
 
@@ -127,7 +154,7 @@ unsafe fn class_draw(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "system" fn rocket_draw_detour(
+pub unsafe extern "system" fn rocket_draw_detour(
     c: usize,
     q: usize,
     ma: usize,
@@ -142,7 +169,7 @@ pub(crate) unsafe extern "system" fn rocket_draw_detour(
     class_draw(ORIGINAL_ROCKET_DRAW.get(), c, q, ma, mb, a5, a6, a7, a8, a9, a10)
 }
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "system" fn rudder_draw_detour(
+pub unsafe extern "system" fn rudder_draw_detour(
     c: usize,
     q: usize,
     ma: usize,
@@ -173,14 +200,14 @@ static IBO_BITS: [[AtomicU64; 64]; 2] = [const { [const { AtomicU64::new(0) }; 6
 
 type DrawElements = unsafe extern "system" fn(u32, i32, u32, *const c_void);
 type MultiDrawElements = unsafe extern "system" fn(u32, *const i32, u32, *const *const c_void, i32);
-pub(crate) static ORIGINAL_DRAW_ELEMENTS: OnceLock<DrawElements> = OnceLock::new();
+pub static ORIGINAL_DRAW_ELEMENTS: OnceLock<DrawElements> = OnceLock::new();
 /// Off once a batched draw did not reach `glDrawElements`: each run is then drawn on its own.
 static BATCH_OK: AtomicBool = AtomicBool::new(true);
 
 /// `glDrawElements` (opengl32 export, render thread). With runs queued by `paint`, the game's own
 /// draw call (its state and uniforms set) draws all of them in one `glMultiDrawElements`, from
 /// the same base offset the game used for its own first index.
-pub(crate) unsafe extern "system" fn draw_elements_detour(mode: u32, count: i32, ty: u32, indices: *const c_void) {
+pub unsafe extern "system" fn draw_elements_detour(mode: u32, count: i32, ty: u32, indices: *const c_void) {
     let Some(&orig) = ORIGINAL_DRAW_ELEMENTS.get() else { return };
     let (firsts, counts, n) = MULTI.with(|m| m.get());
     let multi = if n == 0 { None } else { gl().and_then(|g| g.multi_draw_elements) };
@@ -219,12 +246,12 @@ struct Cache {
 /// Extra draws issued since the last frame was presented (reset by the overlay each frame).
 static FRAME_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-pub(crate) fn main_view(on: bool) {
+pub fn main_view(on: bool) {
     MAIN.with(|m| m.set(on));
 }
 
 /// Once per presented frame (overlay render, before SwapBuffers).
-pub(crate) fn new_frame() {
+pub fn new_frame() {
     FRAME_RUNS.store(0, Ordering::Relaxed);
     if WORKBENCH_ACTIVE.load(Ordering::Relaxed) || FLIGHT_ACTIVE.load(Ordering::Relaxed) {
         let _ = std::panic::catch_unwind(diag);
@@ -314,7 +341,7 @@ fn publish_into(src: &Mutex<Source>, active: &AtomicBool, bits: &[AtomicU64; 64]
 }
 
 /// Flight tick (game thread): stalled voxels per body, painted red.
-pub(crate) fn publish(stalled: HashMap<usize, HashSet<[i32; 3]>>) {
+pub fn publish(stalled: HashMap<usize, HashSet<[i32; 3]>>) {
     let mut key: u64 = 0xcbf29ce484222325;
     let mut cells: Vec<(usize, [i32; 3])> = stalled.iter().flat_map(|(&b, v)| v.iter().map(move |&c| (b, c))).collect();
     cells.sort_unstable();
@@ -328,7 +355,7 @@ pub(crate) fn publish(stalled: HashMap<usize, HashSet<[i32; 3]>>) {
 }
 
 /// Editor tick (game thread): the workbench vehicle's voxel colours per body (empty = off).
-pub(crate) fn publish_workbench(key: u64, colours: &HashMap<usize, Arc<VoxelColours>>) {
+pub fn publish_workbench(key: u64, colours: &HashMap<usize, Arc<VoxelColours>>) {
     publish_into(&WORKBENCH, &WORKBENCH_ACTIVE, &IBO_BITS[0], key, colours);
 }
 
@@ -336,20 +363,20 @@ pub(crate) fn publish_workbench(key: u64, colours: &HashMap<usize, Arc<VoxelColo
 // Render thread
 // ---------------------------------------------------------------------------------------------
 
-pub(crate) struct Gl {
-    pub(crate) bind_buffer: unsafe extern "system" fn(u32, u32),
+pub struct Gl {
+    pub bind_buffer: unsafe extern "system" fn(u32, u32),
     get_buffer_sub_data: unsafe extern "system" fn(u32, isize, isize, *mut c_void),
-    pub(crate) get_integerv: unsafe extern "system" fn(u32, *mut i32),
+    pub get_integerv: unsafe extern "system" fn(u32, *mut i32),
     multi_draw_elements: Option<MultiDrawElements>,
     depth_func: unsafe extern "system" fn(u32),
-    pub(crate) bind_texture: unsafe extern "system" fn(u32, u32),
-    pub(crate) compressed_tex_sub_image_2d: unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, i32, *const c_void),
-    pub(crate) get_tex_image: unsafe extern "system" fn(u32, i32, u32, u32, *mut c_void),
-    pub(crate) get_tex_level_parameteriv: unsafe extern "system" fn(u32, i32, u32, *mut i32),
+    pub bind_texture: unsafe extern "system" fn(u32, u32),
+    pub compressed_tex_sub_image_2d: unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, i32, *const c_void),
+    pub get_tex_image: unsafe extern "system" fn(u32, i32, u32, u32, *mut c_void),
+    pub get_tex_level_parameteriv: unsafe extern "system" fn(u32, i32, u32, *mut i32),
 }
 
 /// An OpenGL entry point: an opengl32 export, else from `wglGetProcAddress` (needs a current context).
-pub(crate) fn gl_proc(name: &std::ffi::CStr) -> Option<usize> {
+pub fn gl_proc(name: &std::ffi::CStr) -> Option<usize> {
     unsafe {
         let module = LoadLibraryA(c"opengl32.dll".as_ptr().cast());
         if module.is_null() {
@@ -365,7 +392,7 @@ pub(crate) fn gl_proc(name: &std::ffi::CStr) -> Option<usize> {
     }
 }
 
-pub(crate) fn gl() -> Option<&'static Gl> {
+pub fn gl() -> Option<&'static Gl> {
     static GL: OnceLock<Option<Gl>> = OnceLock::new();
     GL.get_or_init(|| unsafe {
         let sym = gl_proc;
@@ -446,7 +473,7 @@ unsafe fn mesh_tris(gl: Option<&Gl>, mesh: usize, ibo: u32) -> Option<Arc<Vec<cr
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "system" fn chunk_draw_detour(
+pub unsafe extern "system" fn chunk_draw_detour(
     a1: usize,
     mesh: usize,
     first: u32,
@@ -488,8 +515,7 @@ pub(crate) unsafe extern "system" fn chunk_draw_detour(
     let bench = in_bench && WORKBENCH_ACTIVE.load(Ordering::Relaxed) && crate::editor::editor_active();
     let flight = in_flight
         && FLIGHT_ACTIVE.load(Ordering::Relaxed)
-        && crate::flight::DEBUG_WANTED.load(Ordering::Relaxed)
-        && crate::flight::ENABLED.load(Ordering::Relaxed)
+        && flight_shown()
         && MAIN.with(|v| v.get());
     if !bench && !flight {
         return;

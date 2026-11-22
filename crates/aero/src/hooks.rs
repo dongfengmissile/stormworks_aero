@@ -135,15 +135,7 @@ unsafe extern "system" fn air_node_detour(ctx: usize, a2: usize, a3: usize, a4: 
 
 /// Hook `at` when its bytes are the expected `prologue` (none: not checked): keep the original
 /// in `slot`, then enable. `Err`: the log line for the step that failed.
-unsafe fn install<T>(name: &str, at: usize, prologue: &[u8], detour: *mut c_void, slot: &OnceLock<T>) -> Result<(), String> {
-    const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut c_void>()) };
-    if !crate::hook::verify(at, prologue) {
-        return Err(format!("{name} prologue mismatch at {at:#x}"));
-    }
-    let o = MinHook::create_hook(at as *mut c_void, detour).map_err(|e| format!("create {name} hook: {e:?}"))?;
-    let _ = slot.set(std::mem::transmute_copy::<*mut c_void, T>(&o));
-    MinHook::enable_hook(at as *mut c_void).map_err(|e| format!("enable {name} hook: {e:?}"))
-}
+use crate::hook::install;
 
 /// Per-body switch for the game's hull air forces; without it the air constants are zeroed for all.
 unsafe fn install_air_node_hook() {
@@ -321,27 +313,12 @@ unsafe fn install_jet_smoke_hook() {
 
 /// Stalled-voxel paint in the game render; failure only loses the red blocks.
 unsafe fn install_paint_hook() {
-    let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_CHUNK_DRAW;
     if crate::plugin::paint_disabled() {
         log_line("stall paint disabled by request (aero_disable_paint)");
         return;
     }
-    if !crate::hook::verify(at, &CHUNK_DRAW_PROLOGUE) {
-        log_line(&format!("opaque_chunk_draw_item prologue mismatch at {at:#x}; stalled blocks not painted"));
-        return;
-    }
-    // Batches the paint's draws (`paint::draw_elements_detour`); without it each run is its own draw.
-    let gl32 = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(c"opengl32.dll".as_ptr().cast());
-    let de = if gl32.is_null() { None } else { windows_sys::Win32::System::LibraryLoader::GetProcAddress(gl32, c"glDrawElements".as_ptr().cast()) };
-    if let Some(de) = de {
-        if let Err(e) = install("glDrawElements", de as usize, &[], crate::paint::draw_elements_detour as *mut c_void, &crate::paint::ORIGINAL_DRAW_ELEMENTS) {
-            log_line(&e);
-        }
-    }
-    match install("stall paint", at, &[], crate::paint::chunk_draw_detour as *mut c_void, &crate::paint::ORIGINAL) {
-        Ok(()) => log_line(&format!("stall paint hook installed ({at:#x})")),
-        Err(e) => log_line(&e),
-    }
+    let _ = crate::paint::FLIGHT_SHOWN.set(|| crate::flight::DEBUG_WANTED.load(Ordering::Relaxed) && crate::flight::ENABLED.load(Ordering::Relaxed));
+    crate::paint::install();
 }
 
 /// Rotor blur: the three pushes first (they route tagged items), the draw last, all or nothing,

@@ -94,3 +94,14 @@ pub fn verify(addr: usize, prologue: &[u8]) -> bool {
     }
     listed && bytes_match(addr, &[0xE9])
 }
+
+/// Hooks `at` after `verify`, storing the original in `slot` (a fn pointer type).
+pub unsafe fn install<T>(name: &str, at: usize, prologue: &[u8], detour: *mut std::ffi::c_void, slot: &std::sync::OnceLock<T>) -> Result<(), String> {
+    const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut std::ffi::c_void>()) };
+    if !verify(at, prologue) {
+        return Err(format!("{name} prologue mismatch at {at:#x}"));
+    }
+    let o = minhook::MinHook::create_hook(at as *mut std::ffi::c_void, detour).map_err(|e| format!("create {name} hook: {e:?}"))?;
+    let _ = slot.set(std::mem::transmute_copy::<*mut std::ffi::c_void, T>(&o));
+    minhook::MinHook::enable_hook(at as *mut std::ffi::c_void).map_err(|e| format!("enable {name} hook: {e:?}"))
+}

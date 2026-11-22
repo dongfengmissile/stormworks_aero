@@ -21,7 +21,7 @@ use crate::offsets::*;
 /// Settings tab switch.
 pub(crate) static ENABLED: AtomicBool = AtomicBool::new(true);
 
-pub(crate) type ClassDraw = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+pub(crate) use crate::paint::ClassDraw;
 pub(crate) type Push232 =
     unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 pub(crate) type PushShadow = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;

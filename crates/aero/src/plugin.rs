@@ -12,7 +12,10 @@ use windows_sys::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetMo
 
 use crate::logging::{log_line, set_log_path};
 use crate::memory::self_module_path;
-use crate::offsets::{GAME_BUILD_LABEL, PLUGIN_BUILD_LABEL};
+use crate::offsets::GAME_BUILD_LABEL;
+
+/// Compile-time stamp of THIS binary, logged at bootstrap: tells which DLL the game loaded.
+const PLUGIN_BUILD_LABEL: &str = env!("AERO_BUILD_STAMP");
 use crate::state::{MODULE_BASE, SELF_MODULE};
 
 /// Kill switch: `<game>/<marker>` file or `<env>=1`, so a crash can be bisected without a rebuild.
@@ -82,7 +85,7 @@ fn bootstrap() {
             Ok(()) => log_line("hooks installed"),
             Err(e) => log_line(&e),
         }
-        unsafe { crate::markhooks::install() };
+        unsafe { crate::markhooks::install(b"aero\0", None) };
     }
 
     {

@@ -3,6 +3,7 @@
 //! on the host.
 pub mod defs;
 pub mod joints;
+pub mod marks;
 pub mod math;
 pub mod pose;
 pub mod shape;
@@ -21,3 +22,11 @@ pub mod logging;
 pub mod memory;
 #[cfg(windows)]
 pub mod state;
+#[cfg(windows)]
+pub mod editor;
+#[cfg(windows)]
+pub mod markhooks;
+#[cfg(windows)]
+pub mod offsets;
+#[cfg(windows)]
+pub mod paint;

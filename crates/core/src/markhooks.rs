@@ -18,7 +18,7 @@ use minhook::MinHook;
 
 use crate::editor::{ptr_ok, ring};
 use crate::logging::log_line;
-use crate::marks::{self, Mark};
+use crate::marks;
 use crate::memory::{read_u32_at, read_usize_at, readable};
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
@@ -60,7 +60,9 @@ const P_UNDO_APPLY: [u8; 24] =
 const OFF_SER_MODE: usize = 0x20; // 0 XML, 1 binary
 const OFF_SER_WRITE: usize = 0x24; // 1 write, 0 read
 const OFF_DEF_NAME_LEN: usize = 0x290;
-const ATTR: &[u8] = b"aero\0";
+/// This plugin's attribute (NUL-terminated), and an older attribute to read when it is missing,
+/// filtered to this plugin's tokens.
+static ATTR: OnceLock<(&'static [u8], Option<(&'static [u8], fn(&str) -> String)>)> = OnceLock::new();
 
 #[repr(C)]
 struct GStr {
@@ -99,11 +101,11 @@ thread_local! {
 }
 
 /// Marks of bodies written to a binary blob, by part signature (newest last).
-static BINARY: LazyLock<Mutex<VecDeque<(u64, Vec<Mark>)>>> = LazyLock::new(Default::default);
+static BINARY: LazyLock<Mutex<VecDeque<(u64, Vec<String>)>>> = LazyLock::new(Default::default);
 const BINARY_KEEP: usize = 256;
 /// Marks by undo record.
-static RECORDS: LazyLock<Mutex<HashMap<usize, Mark>>> = LazyLock::new(Default::default);
-pub(crate) static HOOKED: AtomicBool = AtomicBool::new(false);
+static RECORDS: LazyLock<Mutex<HashMap<usize, String>>> = LazyLock::new(Default::default);
+pub static HOOKED: AtomicBool = AtomicBool::new(false);
 
 unsafe fn ser_is(ser: usize, mode: u8, write: u8) -> bool {
     ptr_ok(ser, OFF_SER_WRITE + 1) && *((ser + OFF_SER_MODE) as *const u8) == mode && *((ser + OFF_SER_WRITE) as *const u8) == write
@@ -214,11 +216,11 @@ unsafe extern "system" fn def_ref_ser_detour(src: usize, a2: usize, ser: usize, 
     let (Some(comp), Some(f)) = (comp, SER_STRING_FIELD.get()) else {
         return r;
     };
-    if let Some(m) = marks::get(comp) {
-        let text = m.encode() + "\0";
+    if let (Some(m), Some((name, _))) = (marks::get(comp), ATTR.get()) {
+        let text = m + "\0";
         let val = GStr { data: text.as_ptr(), len: text.len() as u32 - 1, cap: text.len() as u32 };
         let none = GStr { data: std::ptr::null(), len: 0, cap: 0 };
-        f(ser, node, ATTR.as_ptr(), &val, &none);
+        f(ser, node, name.as_ptr(), &val, &none);
         note("written to XML");
     }
     r
@@ -234,7 +236,12 @@ unsafe fn ser_write_flag(ser: usize) -> u8 {
 
 /// The `aero` value on an XML node, if any.
 unsafe fn node_attr(node: usize) -> Option<String> {
-    let attr = (ATTR_FIND.get()?)(node, ATTR.as_ptr());
+    let &(name, legacy) = ATTR.get()?;
+    attr_text(node, name).or_else(|| legacy.and_then(|(old, keep)| attr_text(node, old).map(|s| keep(&s))))
+}
+
+unsafe fn attr_text(node: usize, name: &[u8]) -> Option<String> {
+    let attr = (ATTR_FIND.get()?)(node, name.as_ptr());
     if attr == 0 || !ptr_ok(attr, 0x10) {
         return None;
     }
@@ -257,7 +264,7 @@ unsafe extern "system" fn create_by_class_detour(body: usize, class: usize) -> u
     let comp = o(body, class);
     if comp != 0 {
         let node = XML_NODE.with(|n| n.replace(0));
-        let mark = if node != 0 { node_attr(node).map(|s| Mark::decode(&s)) } else { None };
+        let mark = if node != 0 { node_attr(node).filter(|s| !s.is_empty()) } else { None };
         if mark.is_some() {
             note("read from XML");
         }
@@ -321,7 +328,7 @@ unsafe extern "system" fn clone_state_detour(dst: usize, src: usize, ser: usize,
     r
 }
 
-fn records() -> std::sync::MutexGuard<'static, HashMap<usize, Mark>> {
+fn records() -> std::sync::MutexGuard<'static, HashMap<usize, String>> {
     RECORDS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -379,7 +386,9 @@ unsafe fn enable(base: usize, rvas: &[usize]) {
 
 /// All of the save/load/copy hooks or none: writing without reading (or the reverse) would drop
 /// marks from vehicle files. Undo is a separate group (without it, undoing a delete loses marks).
-pub(crate) unsafe fn install() {
+pub unsafe fn install(attr: &'static [u8], legacy: Option<(&'static [u8], fn(&str) -> String)>) {
+    assert!(attr.ends_with(&[0]) && legacy.is_none_or(|(a, _)| a.ends_with(&[0])));
+    let _ = ATTR.set((attr, legacy));
     let base = MODULE_BASE.load(Ordering::SeqCst);
     for (name, rva, p) in [("ser_string_field", RVA_SER_STRING_FIELD, &P_SER_STRING_FIELD), ("xml attr find", RVA_ATTR_FIND, &P_ATTR_FIND)] {
         if !crate::hook::verify(base + rva, p) {

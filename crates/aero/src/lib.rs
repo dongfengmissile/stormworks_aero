@@ -8,7 +8,7 @@
 
 pub use stormworks_core::{defs, joints, math, pose, shape, vehicle, voxel, xml};
 #[cfg(windows)]
-use stormworks_core::{fault, hook, logging, memory, state};
+use stormworks_core::{fault, hook, logging, markhooks, memory, offsets, paint, state};
 #[cfg(all(windows, feature = "logging"))]
 use stormworks_core::hang;
 pub mod body;
@@ -38,13 +38,7 @@ pub mod fxglsl;
 #[cfg(windows)]
 mod hooks;
 #[cfg(windows)]
-mod markhooks;
-#[cfg(windows)]
-mod offsets;
-#[cfg(windows)]
 mod overlay;
-#[cfg(windows)]
-mod paint;
 #[cfg(windows)]
 mod plugin;
 #[cfg(windows)]
