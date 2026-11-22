@@ -11,8 +11,10 @@ pub mod defs;
 pub mod fx;
 pub mod fxwing;
 pub mod marks;
+pub mod mech;
 pub mod math;
 pub mod model;
+pub mod pose;
 pub mod prop;
 pub mod settings;
 pub mod shape;
@@ -37,6 +39,8 @@ mod flight;
 mod fxdraw;
 /// The effects' shaders (public for tools/wingsim, which draws them outside the game).
 pub mod fxglsl;
+#[cfg(all(windows, feature = "logging"))]
+mod hang;
 #[cfg(windows)]
 mod hooks;
 #[cfg(windows)]
@@ -60,5 +64,11 @@ mod watch;
 mod state;
 #[cfg(windows)]
 mod toolbar;
+#[cfg(windows)]
+mod mechmode;
+#[cfg(windows)]
+mod seqwin;
+#[cfg(windows)]
+mod sound;
 #[cfg(windows)]
 mod ui;

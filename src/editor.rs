@@ -97,7 +97,7 @@ unsafe fn comp_of(names: &mut HashMap<usize, String>, (def, pos, rot, body, mirr
         }
     };
     let (size, wheel_size) = part_size(ptr, def);
-    Some(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size })
+    Some(Comp { def: name, pos, rot, body, mirror, prop: prop_set(ptr, def), size, wheel_size, power: joint_power(ptr, def) })
 }
 
 /// Every component of a vehicle with its definition name, and the body pointers.
@@ -123,6 +123,15 @@ pub(crate) unsafe fn part_size(comp: usize, def: usize) -> (Option<[i32; 2]>, Op
         41 => (None, Some(f32::from_bits(read_u32_at(comp + OFF_WHEEL_SIZE)) as f64).filter(|s| s.is_finite()).map(|s| (s, read_u32_at(comp + OFF_WHEEL_DOUBLE) & 0xFF != 0))),
         _ => (None, None),
     }
+}
+
+/// A driven joint's max power setting (`Comp::power`): the parent half of a type-7 part with
+/// flag 0x100, its config panel "%" slider (knowledge/editor-ui.md).
+pub(crate) unsafe fn joint_power(comp: usize, def: usize) -> Option<f64> {
+    if !ptr_ok(def, OFF_DEF_PROP_FLAGS + 4) || !ptr_ok(comp, OFF_JOINT_POWER + 4) || read_u32_at(def + OFF_DEF_CLASS) != 7 || read_u32_at(def + OFF_DEF_PROP_FLAGS) & 0x140 != 0x140 {
+        return None;
+    }
+    Some(f32::from_bits(read_u32_at(comp + OFF_JOINT_POWER)) as f64).filter(|s| s.is_finite())
 }
 
 /// Live propeller / rotor settings of a type-2 part (knowledge/vehicle-model.md "Type 2 force
@@ -164,11 +173,16 @@ unsafe fn read_vehicle_raw(vehicle: usize) -> Option<(Vec<(usize, [i32; 3], [i32
 }
 
 unsafe fn def_name(def: usize) -> Option<String> {
-    if !ptr_ok(def, OFF_DEF_NAME + 0x10) {
+    def_string(def, OFF_DEF_NAME)
+}
+
+/// A string field of a definition (data pointer, then u32 length).
+unsafe fn def_string(def: usize, off: usize) -> Option<String> {
+    if !ptr_ok(def, off + 0x10) {
         return None;
     }
-    let data = read_usize_at(def + OFF_DEF_NAME);
-    let len = read_u32_at(def + OFF_DEF_NAME + 8) as usize;
+    let data = read_usize_at(def + off);
+    let len = read_u32_at(def + off + 8) as usize;
     if len == 0 || len > 256 || !(PTR_MIN..PTR_MAX).contains(&data) || !readable(data, len) {
         return None;
     }
@@ -213,9 +227,39 @@ unsafe fn read_clip(editor: usize) -> Option<[f64; 16]> {
     ((proj[11] + 1.0).abs() < 1e-3 && m.iter().all(|v| v.is_finite())).then_some(m)
 }
 
+/// The editor seen by the last tick (for the part panel, which is not given it).
+static LAST_EDITOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A linear track base's travel in the workbench vehicle, metres (`model::track_travel`, the same
+/// test as `model::joint_links`); None if `comp` is not one. Game thread.
+pub(crate) unsafe fn track_travel_of(comp: usize) -> Option<(f64, f64)> {
+    let editor = LAST_EDITOR.load(Ordering::Relaxed);
+    if !ptr_ok(editor + OFF_EDITOR_VEHICLE, 8) {
+        return None;
+    }
+    let (raw, _, ptrs) = read_vehicle_raw(read_usize_at(editor + OFF_EDITOR_VEHICLE))?;
+    let (def, pos, rot, body, mirror) = raw[ptrs.iter().position(|&p| p == comp)?];
+    let ext = def_string(def, OFF_DEF_EXTENDER)?;
+    let r = crate::vehicle::flipped(rot, mirror);
+    let mut at: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+    for (k, o) in raw.iter().enumerate() {
+        at.entry(o.1).or_default().push(k);
+    }
+    Some(crate::model::track_travel(pos, [r[6], r[7], r[8]], |p| {
+        at.get(&p).is_some_and(|ks| {
+            ks.iter().any(|&k| {
+                let o = &raw[k];
+                o.3 == body && crate::vehicle::flipped(o.2, o.4)[3..6] == r[3..6] && (o.0 == def || def_name(o.0).as_deref() == Some(ext.as_str()))
+            })
+        })
+    }))
+}
+
 /// Called after every editor tick, on the game thread.
 pub(crate) unsafe fn on_tick(editor: usize) {
+    LAST_EDITOR.store(editor, Ordering::Relaxed);
     LAST_TICK_MS.store(now_ms().max(1), Ordering::Relaxed);
+    crate::sound::on_editor_tick(editor);
     let tick = TICKS.fetch_add(1, Ordering::Relaxed);
     if PICK_WANTED.load(Ordering::Relaxed) {
         let _fault = crate::fault::enter(crate::fault::stage::EDITOR_SNAPSHOT);
@@ -280,6 +324,7 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         let (size, wheel) = part_size(ptr, *def);
         size.into_iter().flatten().for_each(|v| mix(v as u64));
         wheel.into_iter().for_each(|(s, d)| mix(s.to_bits() ^ d as u64));
+        joint_power(ptr, *def).into_iter().for_each(|s| mix(s.to_bits()));
         mix(*def as u64);
         pos.iter().chain(rot.iter()).for_each(|v| mix(*v as u32 as u64));
         mix(*body as u64);
@@ -324,4 +369,72 @@ pub(crate) unsafe fn on_tick(editor: usize) {
         ));
     }
     *LATEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(Snapshot { gen, comps, ptrs }));
+}
+
+// --- Workbench pose in the game's view (knowledge/rendering.md "Workbench body draw matrix"):
+// while the Aero wings mode is on, each posed sub-grid's draw matrix (`body+0x2C8`) is swapped in
+// for the editor's scene draw and put back after it, so editing and picking keep the build pose.
+
+/// The posing joints (`model::joint_links`), the vehicle's body count and each joint's target
+/// setting (`pose::joint_settings`): what the workbench shows while a plugin mode is on.
+pub(crate) static POSE_TARGET: Mutex<Option<(Arc<Vec<crate::model::JointLink>>, usize, Vec<f64>)>> = Mutex::new(None);
+static POSE_ANIM: std::sync::LazyLock<Mutex<crate::pose::PoseAnim>> = std::sync::LazyLock::new(Mutex::default);
+static EPOCH: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+
+pub(crate) fn publish_pose_target(joints: &[crate::model::JointLink], bodies: usize, settings: &[f64]) {
+    POSE_SNAP.store(false, Ordering::Relaxed);
+    *POSE_TARGET.lock().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(joints.to_vec()), bodies, settings.to_vec()));
+}
+
+/// The pose shown at once, not eased in: a Mechanisms sequence frame.
+static POSE_SNAP: AtomicBool = AtomicBool::new(false);
+pub(crate) fn publish_pose_now(joints: &[crate::model::JointLink], bodies: usize, settings: &[f64]) {
+    *POSE_TARGET.lock().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(joints.to_vec()), bodies, settings.to_vec()));
+    POSE_SNAP.store(true, Ordering::Relaxed);
+}
+
+pub(crate) type RenderScene = unsafe extern "system" fn(usize, usize, usize, usize, usize);
+pub(crate) static ORIGINAL_RENDER_SCENE: std::sync::OnceLock<RenderScene> = std::sync::OnceLock::new();
+
+pub(crate) unsafe extern "system" fn render_scene_detour(editor: usize, a2: usize, a3: usize, a4: usize, a5: usize) {
+    let Some(original) = ORIGINAL_RENDER_SCENE.get() else { return };
+    let saved = std::panic::catch_unwind(|| pose_bodies(editor)).unwrap_or_default();
+    original(editor, a2, a3, a4, a5);
+    for (at, m) in saved {
+        std::ptr::copy_nonoverlapping(m.as_ptr(), at as *mut u32, 16);
+    }
+}
+
+/// Writes the posed draw matrices; returns each body's matrix address and old contents.
+unsafe fn pose_bodies(editor: usize) -> Vec<(usize, [u32; 16])> {
+    let Some((links, n, settings)) = POSE_TARGET.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return Vec::new() };
+    if !ptr_ok(editor + OFF_EDITOR_VEHICLE, 8) {
+        return Vec::new();
+    }
+    let Some(bodies) = vehicle_bodies(read_usize_at(editor + OFF_EDITOR_VEHICLE)) else { return Vec::new() };
+    if bodies.len() != n {
+        return Vec::new(); // the vehicle changed since the pose was worked out
+    }
+    let on = (crate::toolbar::active() && crate::toolbar::pose_shown()) || crate::toolbar::mech_active();
+    let now = EPOCH.elapsed().as_secs_f64();
+    let Some(poses) = POSE_ANIM.lock().unwrap_or_else(|p| p.into_inner()).poses(&links, n, &settings, on, POSE_SNAP.load(Ordering::Relaxed), now) else { return Vec::new() };
+    let mut saved = Vec::new();
+    for (&body, t) in bodies.iter().zip(&poses) {
+        if *t == crate::pose::Pose::IDENTITY || !ptr_ok(body, OFF_BODY_ORIGIN + 12) || !ptr_ok(body, OFF_BODY_MATRIX + 64) {
+            continue;
+        }
+        let at = body + OFF_BODY_MATRIX;
+        let old: [u32; 16] = std::array::from_fn(|k| read_u32_at(at + 4 * k));
+        let m: [f64; 16] = old.map(|v| f32::from_bits(v) as f64);
+        let o: [f64; 3] = std::array::from_fn(|k| f32::from_bits(read_u32_at(body + OFF_BODY_ORIGIN + 4 * k)) as f64);
+        let posed = crate::pose::draw_matrix(&crate::pose::grid_move(t), o, &m);
+        if !posed.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        for (k, v) in posed.iter().enumerate() {
+            *((at + 4 * k) as *mut f32) = *v as f32;
+        }
+        saved.push((at, old));
+    }
+    saved
 }

@@ -6,7 +6,7 @@
 //! it switches the editor to tool mode 11 (no tool acts on clicks) and the plugin owns left clicks
 //! in the 3D view (picking on the vehicle, applied by the overlay). See re-workbench round 13.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::logging::log_line;
@@ -15,6 +15,14 @@ use crate::state::MODULE_BASE;
 
 /// Our action id (the game's run to ~62; unknown ids only play the click sound).
 const MY_ID: i32 = 200;
+/// Mechanisms mode button and its Check action.
+const MECH_ID: i32 = 260;
+const ID_CHECK: i32 = 261;
+const ID_LABELS: i32 = 263;
+static LABELS_BTN: AtomicUsize = AtomicUsize::new(0);
+const ID_SEQ: i32 = 264;
+static SEQ_BTN: AtomicUsize = AtomicUsize::new(0);
+const MECH_ICON: &str = "mechanics";
 /// Inert tool mode: past the game's tools (0..=10), so every per-mode switch takes its default
 /// and no tool acts on hover, clicks or keys. Not 6 or 7: those poll a save / upload task that only
 /// the save / upload action creates (null otherwise: crash at 0x7DA6C8).
@@ -198,6 +206,21 @@ const ID_RESET: i32 = 243;
 const ID_RESET_YES: i32 = 244;
 const ID_RESET_NO: i32 = 245;
 const ID_NEW_WING: i32 = 246;
+/// Aero wings' "Move sub-grids" toggle.
+const ID_POSE: i32 = 262;
+static POSE_BTN: AtomicUsize = AtomicUsize::new(0);
+/// Aero wings shows (and analyses) sub-grids at their Workbench Angle settings.
+static POSE_SHOWN: AtomicBool = AtomicBool::new(true);
+
+/// The sub-grid posing (mechanisms) is there.
+/// shortcut: built into this DLL, so always true; when it becomes its own mod, check its DLL is loaded.
+pub(crate) fn mechanisms_available() -> bool {
+    true
+}
+
+pub(crate) fn pose_shown() -> bool {
+    POSE_SHOWN.load(Ordering::Relaxed) && mechanisms_available()
+}
 const ID_DETECT: i32 = 247;
 /// Clicks on New wing / Detect wings the overlay has not applied yet.
 pub(crate) static NEW_WING_REQ: AtomicBool = AtomicBool::new(false);
@@ -234,14 +257,22 @@ const ID_FOIL_CAT: i32 = 291;
 const ID_FOIL: i32 = 301;
 
 /// Side shelves (tools, roles, aerofoils) and the toolbar they were built for (game thread only).
-/// tools, wing modes, roles, aerofoil categories, lifting-surface aerofoils, missile-fin aerofoils.
-static SHELVES: Mutex<(usize, [usize; 6])> = Mutex::new((0, [0; 6]));
+/// tools, wing modes, roles, aerofoil categories, lifting-surface aerofoils, missile-fin aerofoils,
+/// then the Mechanisms shelf.
+static SHELVES: Mutex<(usize, [usize; 7])> = Mutex::new((0, [0; 7]));
 
 /// Our button and the toolbar it was appended to.
 static BUTTON: AtomicUsize = AtomicUsize::new(0);
 static APPENDED_TOOLBAR: AtomicUsize = AtomicUsize::new(0);
 /// The plugin's wing mode is on (button selected and the editor idle).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The Mechanisms button and whether its mode is on.
+static MECH_BUTTON: AtomicUsize = AtomicUsize::new(0);
+static MECH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mech_active() -> bool {
+    MECH_ACTIVE.load(Ordering::Relaxed) && crate::editor::editor_active()
+}
 /// A left press in the 3D view while active: normalised view position (x right, y down, -1..1).
 static CLICK: Mutex<Option<[f32; 2]>> = Mutex::new(None);
 
@@ -274,27 +305,33 @@ unsafe fn append(toolbar: usize, ctx: usize) {
         return;
     }
     (f.separator)(shelf, ctx, 0.05);
-    let mut name = gstr(f, ICON);
-    let btn = (f.make_toggle)(0, 0.0, 0.0, 0, &mut name, MY_ID, 0, toolbar + TOOLBAR_GROUP);
-    if btn < PTR_MIN {
-        log_line("toolbar: button constructor returned null");
-        return;
+    let buttons = [
+        (ICON, MY_ID, "Aero wings", "Paint wings by role or aerofoil and designate them by clicking the vehicle.", &BUTTON),
+        (MECH_ICON, MECH_ID, "Mechanisms", "Check the joints: which are locked, and how far each sub-grid moves before it hits something. Hover a part for its joint.", &MECH_BUTTON),
+    ];
+    for (icon, id, title, desc, slot) in buttons {
+        let mut name = gstr(f, icon);
+        let btn = (f.make_toggle)(0, 0.0, 0.0, 0, &mut name, id, 0, toolbar + TOOLBAR_GROUP);
+        if btn < PTR_MIN {
+            log_line("toolbar: button constructor returned null");
+            return;
+        }
+        (f.add_child)(shelf, ctx, btn);
+        // Layout as the game does for its own buttons: next x on the shelf cursor, then grow the shelf.
+        let f32_at = |a: usize| (a as *const f32).read_unaligned();
+        let set = |a: usize, v: f32| (a as *mut f32).write_unaligned(v);
+        let x = f32_at(shelf + 0x58);
+        set(btn + 8, x);
+        set(btn + 0xC, 0.0);
+        let end = x + f32_at(btn + 0x10);
+        set(shelf + 0x58, end);
+        set(shelf + 0x10, end);
+        set(shelf + 0x14, f32_at(shelf + 0x14).max(f32_at(btn + 0x14)));
+        tooltip(f, btn, ctx, title, desc, false);
+        slot.store(btn, Ordering::SeqCst);
+        log_line(&format!("toolbar: {title} button added ({btn:#x}, toolbar {toolbar:#x})"));
     }
-    (f.add_child)(shelf, ctx, btn);
-    // Layout as the game does for its own buttons: next x on the shelf cursor, then grow the shelf.
-    let f32_at = |a: usize| (a as *const f32).read_unaligned();
-    let set = |a: usize, v: f32| (a as *mut f32).write_unaligned(v);
-    let x = f32_at(shelf + 0x58);
-    set(btn + 8, x);
-    set(btn + 0xC, 0.0);
-    let end = x + f32_at(btn + 0x10);
-    set(shelf + 0x58, end);
-    set(shelf + 0x10, end);
-    set(shelf + 0x14, f32_at(shelf + 0x14).max(f32_at(btn + 0x14)));
-    tooltip(f, btn, ctx, "Aero wings", "Paint wings by role or aerofoil and designate them by clicking the vehicle.", false);
-    BUTTON.store(btn, Ordering::SeqCst);
     APPENDED_TOOLBAR.store(toolbar, Ordering::SeqCst);
-    log_line(&format!("toolbar: Aero wings button added ({btn:#x}, toolbar {toolbar:#x})"));
 }
 
 /// Our icons (tools/icons.py): DXT5 mips 64..4 px, written into the free lower half of the game's
@@ -356,18 +393,8 @@ static ICONS_UPLOADED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// Register our icon regions in the UI context (game thread, before buttons use them). False if
 /// the atlas could not be found (buttons then fall back to stock icons).
 unsafe fn register_icons(f: &Fns, ctx: usize) -> bool {
-    let reg = (f.icon_find)(ctx, &mut gstr(f, "propulsion"));
-    if reg < PTR_MIN || !readable(reg, 40) {
-        return false;
-    }
-    let tex = *((reg + 16) as *const i32);
-    let (items, cap, offset) = (read_usize_at(ctx + 0x148), read_u32_at(ctx + 0x150), read_u32_at(ctx + 0x154));
-    if items < PTR_MIN || cap == 0 || tex < 0 {
-        return false;
-    }
-    let entry = items + 32 * ((tex as u32 + offset) % cap) as usize;
-    let texobj = if readable(entry + 24, 8) { read_usize_at(entry + 24) } else { 0 };
-    if texobj < PTR_MIN || !readable(texobj + 0x28, 4) || read_u32_at(entry + 16) != 1024 || read_u32_at(entry + 20) != 1024 {
+    let Some((tex, gl, size)) = atlas_of(f, ctx, "propulsion") else { return false };
+    if size != [1024, 1024] {
         log_line("toolbar: icon atlas is not the expected 1024² texture; stock icons");
         return false;
     }
@@ -377,8 +404,88 @@ unsafe fn register_icons(f: &Fns, ctx: usize) -> bool {
             (f.icon_add_region)(ctx, &mut gstr(f, name), tex, x, x + 64, y, y + 64);
         }
     }
-    ICON_TEX.store(read_u32_at(texobj + 0x28), Ordering::SeqCst);
+    ICON_TEX.store(gl, Ordering::SeqCst);
     true
+}
+
+/// The UI context's texture index, GL texture and size of the atlas holding icon `name`.
+unsafe fn atlas_of(f: &Fns, ctx: usize, name: &str) -> Option<(i32, u32, [u32; 2])> {
+    let reg = (f.icon_find)(ctx, &mut gstr(f, name));
+    if reg < PTR_MIN || !readable(reg, 40) {
+        return None;
+    }
+    let tex = *((reg + 16) as *const i32);
+    let (items, cap, offset) = (read_usize_at(ctx + 0x148), read_u32_at(ctx + 0x150), read_u32_at(ctx + 0x154));
+    if items < PTR_MIN || cap == 0 || tex < 0 {
+        return None;
+    }
+    let entry = items + 32 * ((tex as u32 + offset) % cap) as usize;
+    let texobj = if readable(entry + 24, 8) { read_usize_at(entry + 24) } else { 0 };
+    if texobj < PTR_MIN || !readable(texobj + 0x28, 4) {
+        return None;
+    }
+    Some((tex, read_u32_at(texobj + 0x28), [read_u32_at(entry + 16), read_u32_at(entry + 20)]))
+}
+
+/// Game icons the Mechanisms labels draw: name, its atlas's GL texture and UV rect (l, r, b, t).
+/// Set when the shelves are built.
+pub(crate) static LABEL_ICONS: Mutex<Vec<(&'static str, u32, [f32; 4])>> = Mutex::new(Vec::new());
+
+/// UV rect (l, r, b, t) of a game icon, from the atlas XMLs.
+fn icon_uv(name: &str) -> Option<[f32; 4]> {
+    let (game, _) = crate::flight::PATHS.get()?;
+    let key = format!("name=\"{name}\"");
+    ["gameicons", "gameicons2", "gameicons3"].iter().find_map(|d| {
+        let s = std::fs::read_to_string(game.join(format!("rom/graphics/ui/{d}/atlas_{d}.xml"))).ok()?;
+        let line = s.lines().find(|l| l.contains(&key))?;
+        let num = |k: &str| line.split(&format!(" {k}=\"")).nth(1)?.split('"').next()?.parse::<f32>().ok();
+        Some([num("l")?, num("r")?, num("b")?, num("t")?])
+    })
+}
+
+/// An atlas region's pixels, RGBA rows top first (render thread, GL context current).
+pub(crate) fn read_region(tex: u32, uv: [f32; 4]) -> Option<(Vec<u8>, u32, u32)> {
+    let gl = crate::paint::gl()?;
+    unsafe {
+        let q = |p: u32| {
+            let mut v = 0i32;
+            (gl.get_integerv)(p, &mut v);
+            v
+        };
+        // Pack state the game may have left set would make GL write past our buffer.
+        if q(0x0D02) != 0 || q(0x0D03) != 0 || q(0x0D04) != 0 {
+            return None; // GL_PACK_ROW_LENGTH, _SKIP_ROWS, _SKIP_PIXELS
+        }
+        let (prev, pbo) = (q(0x8069), q(0x88ED)); // texture 2D, pixel pack buffer bindings
+        (gl.bind_buffer)(0x88EB, 0);
+        (gl.bind_texture)(0x0DE1, tex);
+        let (mut w, mut h) = (0i32, 0i32);
+        (gl.get_tex_level_parameteriv)(0x0DE1, 0, 0x1000, &mut w);
+        (gl.get_tex_level_parameteriv)(0x0DE1, 0, 0x1001, &mut h);
+        let ok = (1..=8192).contains(&w) && (1..=8192).contains(&h);
+        let mut all = vec![0u8; if ok { (w * h * 4) as usize } else { 0 }];
+        if ok {
+            (gl.get_tex_image)(0x0DE1, 0, 0x1908, 0x1401, all.as_mut_ptr().cast()); // RGBA, unsigned byte
+        }
+        (gl.bind_texture)(0x0DE1, prev as u32);
+        (gl.bind_buffer)(0x88EB, pbo as u32);
+        if !ok {
+            return None;
+        }
+        let [l, r, b, t] = uv;
+        let (w, h) = (w as u32, h as u32);
+        let (x0, x1) = ((l * w as f32).round() as u32, (r * w as f32).round() as u32);
+        let (y0, y1) = ((b * h as f32).round() as u32, (t * h as f32).round() as u32);
+        if x1 <= x0 || y1 <= y0 || x1 > w || y1 > h {
+            return None;
+        }
+        // The atlas is stored bottom row first (tools/icons.py).
+        let px = (y0..y1).rev().flat_map(|y| {
+            let row = ((y * w + x0) * 4) as usize;
+            all[row..row + ((x1 - x0) * 4) as usize].to_vec()
+        });
+        Some((px.collect(), x1 - x0, y1 - y0))
+    }
 }
 
 /// Render thread, GL context current: write our icon pixels into the atlas texture once per texture.
@@ -509,7 +616,7 @@ unsafe fn build_shelf(
         let mut name = gstr(f, icon);
         let y = -0.14 * (items.len() + j) as f32;
         // Group 0: the game flips the toggle itself on a click, then sends the id.
-        let btn = if *id == ID_NEW_WING { (f.make_toggle)(0, 0.0, y, 0, &mut name, *id, 2, 0) } else { (f.make_action)(0, 0.0, y, 0, &mut name, *id) };
+        let btn = if [ID_NEW_WING, ID_POSE, ID_LABELS, ID_SEQ].contains(id) { (f.make_toggle)(0, 0.0, y, 0, &mut name, *id, 2, 0) } else { (f.make_action)(0, 0.0, y, 0, &mut name, *id) };
         if btn >= PTR_MIN {
             (f.add_child)(s, ctx, btn);
             tooltip(f, btn, ctx, title, desc, true);
@@ -517,6 +624,9 @@ unsafe fn build_shelf(
                 ID_UNDO => UNDO_BTN.store(btn, Ordering::SeqCst),
                 ID_REDO => REDO_BTN.store(btn, Ordering::SeqCst),
                 ID_NEW_WING => NEW_BTN.store(btn, Ordering::SeqCst),
+                ID_POSE => POSE_BTN.store(btn, Ordering::SeqCst),
+                ID_LABELS => LABELS_BTN.store(btn, Ordering::SeqCst),
+                ID_SEQ => SEQ_BTN.store(btn, Ordering::SeqCst),
                 _ => {}
             };
         }
@@ -532,13 +642,18 @@ unsafe fn build_shelf(
 }
 
 /// The three side shelves for the current interface (game thread, after it finished building).
-unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
+unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 7] {
     use crate::wing::{Role, AEROFOILS};
     // Old buttons die with the old interface: never call into them if this build fails.
     UNDO_BTN.store(0, Ordering::SeqCst);
     REDO_BTN.store(0, Ordering::SeqCst);
     NEW_BTN.store(0, Ordering::SeqCst);
+    POSE_BTN.store(0, Ordering::SeqCst);
+    LABELS_BTN.store(0, Ordering::SeqCst);
+    SEQ_BTN.store(0, Ordering::SeqCst);
     let own = register_icons(f, ctx);
+    let icons = ["warning", "action_tick"].into_iter().filter_map(|n| Some((n, atlas_of(f, ctx, n)?.1, icon_uv(n)?))).collect();
+    *LABEL_ICONS.lock().unwrap_or_else(|p| p.into_inner()) = icons;
     let tools = [
         (if own { "aero_wingblocks" } else { "blocks" }, "Wing blocks", "Mark the blocks that form wings."),
         ("vehicle_control", "Control role", "Click a control surface or a hinged sub-grid to give it the role picked on the next shelf."),
@@ -596,13 +711,32 @@ unsafe fn build_shelves(f: &Fns, iface: usize, ctx: usize) -> [usize; 6] {
             &tools,
             ID_TOOL,
             TOOL.load(Ordering::Relaxed),
-            &[("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO), ("redo", "Redo", "Redo the last undone change.", ID_REDO), ("action_cross", "Reset", "Remove every wing block, control role, aerofoil and separate wing from this vehicle.", ID_RESET)],
+            &[
+                ("undo", "Undo", "Undo the last wing / role / aerofoil change.", ID_UNDO),
+                ("redo", "Redo", "Redo the last undone change.", ID_REDO),
+                ("action_cross", "Reset", "Remove every wing block, control role, aerofoil and separate wing from this vehicle.", ID_RESET),
+                ("rotate", "Move sub-grids", "On (needs the mechanisms mod): sub-grids are shown, picked and analysed at their Workbench Angle settings. Off: as built.", ID_POSE),
+            ],
         ),
         build_shelf(f, iface, ctx, 0.17, &wing_items, ID_WING, WING_MODE.load(Ordering::Relaxed).min(2), &wing_actions),
         build_shelf(f, iface, ctx, 0.17, &role_items, ID_ROLE, ROLE.load(Ordering::Relaxed), &[]),
         build_shelf(f, iface, ctx, 0.17, &cats, ID_FOIL_CAT, FOIL_CAT.load(Ordering::Relaxed), &[]),
         build_shelf(f, iface, ctx, 0.34, &foil_items(0), ID_FOIL + foil_range(0).start as i32, pick(0), &[]),
         build_shelf(f, iface, ctx, 0.34, &foil_items(1), ID_FOIL + foil_range(1).start as i32, pick(1), &[]),
+        build_shelf(
+            f,
+            iface,
+            ctx,
+            0.0,
+            &[],
+            0,
+            0,
+            &[
+                ("cube_wrench", "Check", "Sweep every free joint through its travel and find what each sub-grid hits first. Results then follow every change while the mode is on.", ID_CHECK),
+                ("warning", "Labels", "Show each joint's result beside it. Point at a label, or at a part the joint moves, for the details.", ID_LABELS),
+                ("playlist", "Sequence", "Open the sequence timeline: move joints one after another (a door opens, then the gear comes down) and play it.", ID_SEQ),
+            ],
+        ),
     ]
 }
 
@@ -651,6 +785,16 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
     } else if i == ID_RESET_YES || i == ID_RESET_NO {
         set_shown(RESET_DIALOG.load(Ordering::SeqCst), false, false);
         RESET_REQ.store(i == ID_RESET_YES, Ordering::Relaxed);
+    } else if i == ID_POSE {
+        if mechanisms_available() {
+            POSE_SHOWN.fetch_xor(true, Ordering::Relaxed);
+        }
+    } else if i == ID_SEQ {
+        crate::mechmode::SEQ_OPEN.fetch_xor(true, Ordering::Relaxed);
+    } else if i == ID_LABELS {
+        crate::mechmode::LABELS_SHOWN.fetch_xor(true, Ordering::Relaxed);
+    } else if i == ID_CHECK {
+        crate::mechmode::CHECK_REQ.store(true, Ordering::Relaxed);
     } else if i == ID_NEW_WING {
         NEW_WING_REQ.store(true, Ordering::Relaxed);
     } else if i == ID_DETECT {
@@ -665,9 +809,9 @@ pub(crate) unsafe extern "system" fn editor_event_detour(editor: usize, a2: usiz
             FOIL[cat].store(a, Ordering::Relaxed);
         }
     }
-    if i == MY_ID {
+    if i == MY_ID || i == MECH_ID {
         let _ = std::panic::catch_unwind(|| {
-            let btn = BUTTON.load(Ordering::SeqCst);
+            let btn = if i == MY_ID { &BUTTON } else { &MECH_BUTTON }.load(Ordering::SeqCst);
             let Some(f) = fns() else { return };
             if selected(btn) {
                 (f.set_tool_mode)(editor, MODE_IDLE, 0); // leaves the old tool; toggles untouched
@@ -750,12 +894,15 @@ pub(crate) unsafe fn on_tick(editor: usize) {
     let vt = MODULE_BASE.load(Ordering::Relaxed) + RVA_TOOLBAR_VTABLE;
     if toolbar < PTR_MIN || !readable(toolbar, 0x138) || read_usize_at(toolbar) != vt {
         ACTIVE.store(false, Ordering::Relaxed);
+        MECH_ACTIVE.store(false, Ordering::Relaxed);
         return;
     }
     if APPENDED_TOOLBAR.load(Ordering::SeqCst) != toolbar {
         append(toolbar, editor + OFF_UI_CTX);
     }
-    let on = selected(BUTTON.load(Ordering::SeqCst)) && read_u32_at(editor + OFF_TOOL_MODE) == MODE_IDLE as u32;
+    let idle = read_u32_at(editor + OFF_TOOL_MODE) == MODE_IDLE as u32;
+    let on = selected(BUTTON.load(Ordering::SeqCst)) && idle;
+    let mech_on = selected(MECH_BUTTON.load(Ordering::SeqCst)) && idle;
     // Side shelves: built once per interface (children of it, freed with it), shown with the mode.
     let mut sh = SHELVES.lock().unwrap_or_else(|p| p.into_inner());
     if sh.0 != toolbar {
@@ -796,14 +943,14 @@ pub(crate) unsafe fn on_tick(editor: usize) {
     for (k, &shelf) in sh.1.iter().enumerate() {
         // Aerofoil: its category shelf, then the picked category's sections beside it. The
         // shelves draw over the dialog's background, so they go while it asks.
-        let want = on && !asking && (k == 0 || k == tool + 1 || (tool == 2 && k == 4 + cat));
+        let want = if k == 6 { mech_on } else { on && !asking && (k == 0 || k == tool + 1 || (tool == 2 && k == 4 + cat)) };
         if shelf >= PTR_MIN && readable(shelf + 0x81, 1) && (*((shelf + 0x81) as *const u8) != 0) != want {
             set_shown(shelf, want, false);
         }
     }
     drop(sh);
     let hovered = editor + OFF_UI_CTX + 0x188; // the UI element under the mouse
-    let over_view = on && !asking && readable(hovered, 8) && read_usize_at(hovered) == 0 && readable(editor + OFF_MOUSE_X, 8);
+    let over_view = (on && !asking || mech_on) && readable(hovered, 8) && read_usize_at(hovered) == 0 && readable(editor + OFF_MOUSE_X, 8);
     let at = if over_view { ((editor + OFF_MOUSE_X) as *const [f32; 2]).read_unaligned() } else { [f32::NAN; 2] };
     *POINTER.lock().unwrap_or_else(|p| p.into_inner()) = (at[0].is_finite() && at[1].is_finite()).then_some(at);
     set_enabled(UNDO_BTN.load(Ordering::SeqCst), editor + OFF_UI_CTX, CAN_UNDO.load(Ordering::Relaxed));
@@ -813,9 +960,20 @@ pub(crate) unsafe fn on_tick(editor: usize) {
     if new >= PTR_MIN && readable(new + BTN_SELECTED, 1) {
         *((new + BTN_SELECTED) as *mut u8) = NEW_WING_ON.load(Ordering::Relaxed) as u8;
     }
+    for (btn, on) in [(POSE_BTN.load(Ordering::SeqCst), pose_shown()), (LABELS_BTN.load(Ordering::SeqCst), crate::mechmode::LABELS_SHOWN.load(Ordering::Relaxed)), (SEQ_BTN.load(Ordering::SeqCst), crate::mechmode::SEQ_OPEN.load(Ordering::Relaxed))] {
+        if btn >= PTR_MIN && readable(btn + BTN_SELECTED, 1) {
+            *((btn + BTN_SELECTED) as *mut u8) = on as u8;
+        }
+    }
+    let pose = POSE_BTN.load(Ordering::SeqCst);
+    set_enabled(pose, editor + OFF_UI_CTX, mechanisms_available());
     if ACTIVE.swap(on, Ordering::Relaxed) != on {
         log_line(&format!("toolbar: Aero wings mode {}", if on { "on" } else { "off" }));
     }
+    if MECH_ACTIVE.swap(mech_on, Ordering::Relaxed) != mech_on {
+        log_line(&format!("toolbar: Mechanisms mode {}", if mech_on { "on" } else { "off" }));
+    }
+    let _ = std::panic::catch_unwind(|| crate::mechmode::on_tick(mech_on));
 }
 
 // --- Blade width row in the part's configuration panel (c38c03ff756b, knowledge/editor-ui.md
@@ -835,10 +993,64 @@ pub(crate) static ORIGINAL_PROP_PANEL: OnceLock<PropPanel> = OnceLock::new();
 /// `(panel, ctx, label, fmt, min, max, step, float* target, scale)`, floats as raw bits.
 type AddSliderRow = unsafe extern "system" fn(usize, usize, *mut GStr, *mut GStr, u32, u32, u32, *mut f32, u32);
 
-/// The open row's target (blade width, x the part's own), its part, and the value last synced.
-static WIDTH_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
-static WIDTH_COMP: AtomicUsize = AtomicUsize::new(0);
-static WIDTH_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// A plugin-owned slider row: the panel shows one part at a time and its slider writes `cell`
+/// every frame, so one cell per row kind serves it; `comp` is the part it was added for and
+/// `seen` the value last synced into the part's marks.
+struct SliderRow {
+    cell: AtomicU32,
+    comp: AtomicUsize,
+    seen: AtomicU32,
+    label: OnceLock<(usize, u32, u32)>,
+}
+
+impl SliderRow {
+    const fn new() -> SliderRow {
+        SliderRow { cell: AtomicU32::new(0), comp: AtomicUsize::new(0), seen: AtomicU32::new(0), label: OnceLock::new() }
+    }
+
+    /// Adds the row to `panel` for `comp`, showing `value` (`min..max` in `step`s, shown as `fmt`).
+    unsafe fn add(&self, comp: usize, ctx: usize, panel: usize, label: &str, fmt: &str, value: f32, range: (f32, f32, f32)) {
+        let base = MODULE_BASE.load(Ordering::Relaxed);
+        let Some(f) = fns() else { return };
+        if !bytes_match(base + RVA_ADD_SLIDER_ROW, &ADD_SLIDER_ROW_PROLOGUE) {
+            return;
+        }
+        self.cell.store(value.to_bits(), Ordering::SeqCst);
+        self.seen.store(value.to_bits(), Ordering::SeqCst);
+        self.comp.store(comp, Ordering::SeqCst);
+        // The callee copies the label (and leaves it to us) and frees the format.
+        let &(data, len, cap) = self.label.get_or_init(|| {
+            let g = gstr(f, label);
+            (g.data as usize, g.len, g.cap)
+        });
+        if data == 0 {
+            return;
+        }
+        let mut label = GStr { data: data as *mut u8, len, cap };
+        let mut fmt = gstr(f, fmt);
+        let add: AddSliderRow = std::mem::transmute(base + RVA_ADD_SLIDER_ROW);
+        let (lo, hi, step) = range;
+        add(panel, ctx, &mut label, &mut fmt, lo.to_bits(), hi.to_bits(), step.to_bits(), self.cell.as_ptr() as *mut f32, 1.0f32.to_bits());
+    }
+
+    /// The part and its new value when the slider moved while that part is still selected.
+    unsafe fn moved(&self, editor: usize) -> Option<(usize, f32)> {
+        let comp = self.comp.load(Ordering::Relaxed);
+        let bits = self.cell.load(Ordering::Relaxed);
+        if comp == 0 || bits == self.seen.load(Ordering::Relaxed) || !readable(editor + OFF_SELECTED_COMP, 8) {
+            return None;
+        }
+        self.seen.store(bits, Ordering::Relaxed);
+        (read_usize_at(editor + OFF_SELECTED_COMP) == comp).then_some((comp, f32::from_bits(bits)))
+    }
+}
+
+/// Blade width, % of the part's own.
+static WIDTH: SliderRow = SliderRow::new();
+/// A joint's workbench angle, degrees.
+static ANGLE: SliderRow = SliderRow::new();
+/// A sliding joint's workbench offset, metres.
+static OFFSET: SliderRow = SliderRow::new();
 
 pub(crate) unsafe extern "system" fn prop_panel_detour(comp: usize, ctx: usize, panel: usize) {
     let Some(orig) = ORIGINAL_PROP_PANEL.get() else { return };
@@ -847,9 +1059,7 @@ pub(crate) unsafe extern "system" fn prop_panel_detour(comp: usize, ctx: usize, 
 }
 
 unsafe fn add_width_row(comp: usize, ctx: usize, panel: usize) {
-    let base = MODULE_BASE.load(Ordering::Relaxed);
-    let Some(f) = fns() else { return };
-    if !bytes_match(base + RVA_ADD_SLIDER_ROW, &ADD_SLIDER_ROW_PROLOGUE) || !readable(comp + 0x58, 8) {
+    if !readable(comp + 0x58, 8) {
         return;
     }
     // Air propellers and rotors with blades, the parts the plugin flies (`defs`: air_blades).
@@ -862,39 +1072,87 @@ unsafe fn add_width_row(comp: usize, ctx: usize, panel: usize) {
         return;
     }
     let w = crate::marks::get(comp).and_then(|m| m.blade_width).unwrap_or(1.0);
-    WIDTH_CELL.store(w.to_bits(), Ordering::SeqCst);
-    WIDTH_SEEN.store(w.to_bits(), Ordering::SeqCst);
-    WIDTH_COMP.store(comp, Ordering::SeqCst);
-    // The callee copies the label (and leaves it to us) and frees the format.
-    static LABEL: OnceLock<(usize, u32, u32)> = OnceLock::new();
-    let &(data, len, cap) = LABEL.get_or_init(|| {
-        let g = gstr(f, "Blade Width");
-        (g.data as usize, g.len, g.cap)
-    });
-    if data == 0 {
-        return;
-    }
-    let mut label = GStr { data: data as *mut u8, len, cap };
-    let mut fmt = gstr(f, "%.0f%%");
-    let add: AddSliderRow = std::mem::transmute(base + RVA_ADD_SLIDER_ROW);
     let (lo, hi) = crate::marks::BLADE_WIDTH_RANGE;
-    add(panel, ctx, &mut label, &mut fmt, (lo * 100.0).to_bits(), (hi * 100.0).to_bits(), 5.0f32.to_bits(), WIDTH_CELL.as_ptr() as *mut f32, 0.01f32.to_bits());
+    WIDTH.add(comp, ctx, panel, "Blade Width", "%.0f%%", (w * 100.0).round(), (lo * 100.0, hi * 100.0, 5.0));
 }
 
-/// Editor tick: a moved width slider sets the selected part's mark (the workbench re-reads it).
-pub(crate) unsafe fn width_tick(editor: usize) {
-    let comp = WIDTH_COMP.load(Ordering::Relaxed);
-    let bits = WIDTH_CELL.load(Ordering::Relaxed);
-    if comp == 0 || bits == WIDTH_SEEN.load(Ordering::Relaxed) || !readable(editor + OFF_SELECTED_COMP, 8) {
+// --- Workbench angle row on joints (knowledge/editor-ui.md "Joint parts (type 7) config panel",
+// `22e792753489`): the parent half of a turning joint; the workbench shows its sub-grid posed.
+
+pub(crate) const RVA_JOINT_PANEL: usize = 0x0035_B0D0;
+pub(crate) const JOINT_PANEL_PROLOGUE: [u8; 24] =
+    [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x68, 0xA1, 0x48, 0x81, 0xEC, 0xD0, 0x00, 0x00];
+pub(crate) static ORIGINAL_JOINT_PANEL: OnceLock<PropPanel> = OnceLock::new();
+/// Definition: joint flags (0x80 child half), `constraint_type`, `constraint_range_of_motion` (turns).
+const JOINT_CHILD_HALF: u32 = 0x80;
+const OFF_DEF_CONSTRAINT_TYPE: usize = 0x33C;
+const OFF_DEF_RANGE_OF_MOTION: usize = 0x38C;
+const OFF_DEF_CONSTRAINT_AXIS: usize = 0x388;
+
+pub(crate) unsafe extern "system" fn joint_panel_detour(comp: usize, ctx: usize, panel: usize) {
+    let Some(orig) = ORIGINAL_JOINT_PANEL.get() else { return };
+    orig(comp, ctx, panel);
+    let _ = std::panic::catch_unwind(|| add_angle_row(comp, ctx, panel));
+}
+
+unsafe fn add_angle_row(comp: usize, ctx: usize, panel: usize) {
+    if !readable(comp + 0x58, 8) {
         return;
     }
-    WIDTH_SEEN.store(bits, Ordering::Relaxed);
-    if read_usize_at(editor + OFF_SELECTED_COMP) != comp {
+    let def = read_usize_at(comp + 0x58);
+    if def < PTR_MIN || !readable(def + crate::offsets::OFF_DEF_PROP_FLAGS, 4) || !readable(def + OFF_DEF_RANGE_OF_MOTION, 4) {
         return;
     }
-    let (lo, hi) = crate::marks::BLADE_WIDTH_RANGE;
-    let w = ((f32::from_bits(bits) * 100.0).round() / 100.0).clamp(lo, hi);
-    let mut m = crate::marks::get(comp).unwrap_or_default();
-    m.blade_width = (w != 1.0).then_some(w);
-    crate::marks::set(comp, Some(m), true);
+    let flags = read_u32_at(def + crate::offsets::OFF_DEF_PROP_FLAGS);
+    if flags & JOINT_CHILD_HALF != 0 {
+        return;
+    }
+    let range = f32::from_bits(read_u32_at(def + OFF_DEF_RANGE_OF_MOTION));
+    if read_u32_at(def + OFF_DEF_CONSTRAINT_TYPE) == 1 {
+        // A slide: centred on the build pose, or a linear track's run of extensions
+        // (knowledge/vehicle-model.md "Sliders and linear tracks"). The row shows the setting,
+        // which the game negates on a joint mirrored along its axis (`model::joint_links`).
+        let (lo, hi) = if range > 0.0 { (-range as f64 / 2.0, range as f64 / 2.0) } else { crate::editor::track_travel_of(comp).unwrap_or((0.0, 0.0)) };
+        let axis = read_u32_at(def + OFF_DEF_CONSTRAINT_AXIS).min(2);
+        let (lo, hi) = if read_u32_at(def + crate::offsets::OFF_DEF_MIRROR) >> axis & 1 != 0 { (-hi, -lo) } else { (lo, hi) };
+        if hi - lo < 1e-3 {
+            return;
+        }
+        let o = crate::marks::get(comp).and_then(|m| m.joint_offset).unwrap_or(0.0).clamp(lo as f32, hi as f32);
+        let step = if hi - lo > 2.0 { 0.05 } else { 0.01 };
+        OFFSET.add(comp, ctx, panel, "Workbench Offset", "%.2f m", o, (lo as f32, hi as f32, step));
+        return;
+    }
+    // The input of a velocity pivot or turret ring is a speed: no stops (`model::JointLink::travel`).
+    let max = joint_max_deg(if flags & 0x200 != 0 { 0.0 } else { range });
+    let a = crate::marks::get(comp).and_then(|m| m.joint_angle).unwrap_or(0.0).clamp(-max, max);
+    ANGLE.add(comp, ctx, panel, "Workbench Angle", "%.0f deg", a.round(), (-max, max, 1.0));
+}
+
+/// The largest workbench angle of a joint, degrees: its range of motion (total turns), else a half turn.
+fn joint_max_deg(range_turns: f32) -> f32 {
+    let (_, hi) = crate::marks::JOINT_ANGLE_RANGE;
+    if range_turns.is_finite() && range_turns > 0.0 { (range_turns * 180.0).min(hi) } else { hi }
+}
+
+/// Editor tick: a moved slider sets the selected part's mark (the workbench re-reads it).
+pub(crate) unsafe fn panel_rows_tick(editor: usize) {
+    if let Some((comp, v)) = WIDTH.moved(editor) {
+        let (lo, hi) = crate::marks::BLADE_WIDTH_RANGE;
+        let w = ((v).round() / 100.0).clamp(lo, hi);
+        let mut m = crate::marks::get(comp).unwrap_or_default();
+        m.blade_width = (w != 1.0).then_some(w);
+        crate::marks::set(comp, Some(m), true);
+    }
+    if let Some((comp, v)) = OFFSET.moved(editor) {
+        let mut m = crate::marks::get(comp).unwrap_or_default();
+        let v = (v * 100.0).round() / 100.0;
+        m.joint_offset = (v != 0.0).then_some(v);
+        crate::marks::set(comp, Some(m), true);
+    }
+    if let Some((comp, v)) = ANGLE.moved(editor) {
+        let mut m = crate::marks::get(comp).unwrap_or_default();
+        m.joint_angle = (v.round() != 0.0).then_some(v.round());
+        crate::marks::set(comp, Some(m), true);
+    }
 }

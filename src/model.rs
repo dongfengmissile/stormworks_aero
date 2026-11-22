@@ -66,6 +66,12 @@ pub struct Designations {
     pub widths: HashMap<[i32; 3], f64>,
     /// Propeller/rotor blade shape chosen by position: true propeller, false rotor (else auto).
     pub shapes: HashMap<[i32; 3], bool>,
+    /// Workbench joint angle, degrees, by the joint's parent half (`pose`).
+    pub joint_angles: HashMap<[i32; 3], f64>,
+    /// Workbench sliding joint offset, metres, by the joint's parent half (`pose`).
+    pub joint_offsets: HashMap<[i32; 3], f64>,
+    /// Mechanisms sequences and their moves (`marks::Mark::seq`) by the joint's parent half.
+    pub joint_seq: HashMap<[i32; 3], Vec<(String, Vec<[f64; 3]>)>>,
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
@@ -392,6 +398,152 @@ pub struct Model {
     pub silhouette: Vec<bool>,
     /// Free wing tips, where the condensation trails start (`fx`).
     pub tips: Vec<crate::fx::TipSpec>,
+    /// Joints carrying sub-grids, parent before child (`joint_links`).
+    pub joints: Vec<JointLink>,
+    /// Workbench pose per body (`posed`); empty: as built. Flight never sets it.
+    pub poses: Vec<crate::pose::Pose>,
+    /// Each joint's workbench setting (`pose::joint_settings`), set by `posed`.
+    pub settings: Vec<f64>,
+}
+
+/// A joint that carries a sub-grid: its parent half on `parent`, the child half on `child`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JointLink {
+    /// The parent half's component, and the child half's.
+    pub comp: usize,
+    pub half: usize,
+    pub parent: usize,
+    pub child: usize,
+    /// The joint's point and axis as built, aero frame (metres, unit): the game's hinge axis.
+    pub point: V3,
+    pub axis: V3,
+    /// A positive setting turns the sub-grid by `sign`·setting about `axis` (right hand, aero
+    /// frame): the game's own input direction, so mirrored joints given the same angle move mirrored.
+    pub sign: f64,
+    /// Slides along `axis` instead of turning about it.
+    pub slide: bool,
+    /// Where the game stops it, from the build pose along `axis` (rad, or metres for a slide);
+    /// infinite for a joint whose input is a speed.
+    pub travel: (f64, f64),
+    /// Nothing drives it (a plain pivot, a suspension, a max power of 0): in a loop of
+    /// joints it follows the others (`pose::close_loops`).
+    pub free: bool,
+    /// How far the game pulls the sub-grid as it settles, aero frame, metres: the parent half's
+    /// joint point less the child half's (zero on stock joints; half a block on the modded
+    /// half block offset).
+    pub settle: V3,
+}
+
+/// A linear track's travel, metres (knowledge/vehicle-model.md "Sliders and linear tracks"): the
+/// run of extension parts in line with the base along its part z (`z`, unmirrored), `fwd` on +z and
+/// `back` on −z, gives −fwd·0.25 ..= back·0.25 along the slide axis (part −z).
+pub fn track_travel(pos: [i32; 3], z: [i32; 3], is_ext: impl Fn([i32; 3]) -> bool) -> (f64, f64) {
+    let run = |s: i32| (1..4096).take_while(|&k| is_ext(std::array::from_fn(|i| pos[i] + s * k * z[i]))).count() as f64;
+    (-run(1) * 0.25, run(-1) * 0.25)
+}
+
+/// The vehicle's joints: each parent half (`Def::joint`) paired with the child half in the cell
+/// its definition names, on another body. A body reached twice (a sub-grid held by two pivots)
+/// keeps its first joint. Sorted so every parent body is placed before the bodies it carries.
+pub fn joint_links(comps: &[Comp], lib: &mut Library) -> Vec<JointLink> {
+    tree_links(all_joint_links(comps, lib), comps)
+}
+
+/// Every joint of the vehicle in part order, loops and second joints on one sub-grid included
+/// (the game makes a constraint for each).
+pub fn all_joint_links(comps: &[Comp], lib: &mut Library) -> Vec<JointLink> {
+    let mut at: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+    for (i, c) in comps.iter().enumerate() {
+        at.entry(c.pos).or_default().push(i);
+    }
+    let mut links: Vec<JointLink> = Vec::new();
+    for (i, c) in comps.iter().enumerate() {
+        let Some(j) = lib.get(&c.def).and_then(|d| d.joint.clone()) else { continue };
+        let here = at.get(&c.cell(j.child_at)).map(Vec::as_slice).unwrap_or_default();
+        let other = |k: &&usize| comps[**k].body != c.body;
+        let Some(&k) = here.iter().filter(other).find(|&&k| comps[k].def == j.child).or_else(|| here.iter().find(other)) else { continue };
+        let (parent, child) = (c.body as usize, comps[k].body as usize);
+        // The game's hinge axis is the part frame's z after `M(axis)`: x, −y or z; a slider moves
+        // along its x: x, y or −z (knowledge/vehicle-model.md "Type-7 joints").
+        // It turns with the part's rotation before mirroring (`comp+0x30`), like the input sign below.
+        let a = j.axis.min(2);
+        let e = if j.slide { [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, -1.0)] } else { [v3(1.0, 0.0, 0.0), v3(0.0, -1.0, 0.0), v3(0.0, 0.0, 1.0)] }[a];
+        let raw = Comp { rot: crate::vehicle::flipped(c.rot, c.mirror), def: String::new(), ..c.clone() };
+        let axis = raw.part_to_aero(e) - raw.part_to_aero(V3::ZERO);
+        // The game negates the input of a joint whose mirror flips its move (`comp+0x418`).
+        let (mx, my, mz) = (c.mirror & 1 != 0, c.mirror & 2 != 0, c.mirror & 4 != 0);
+        let invert = if j.slide { [mx, my, mz][a] } else { [my ^ mz, !(mx ^ mz), my ^ mx][a] };
+        // A positive input turns the sub-grid right-handed about `axis` (aero frame) and slides it
+        // along +axis, unless inverted. The hinge sign was the other way round until the labels
+        // were compared with pivot inputs in game.
+        let sign = if invert { -1.0 } else { 1.0 };
+        let travel = match (j.slide, &j.extender) {
+            (true, Some(ext)) if j.range <= 0.0 => {
+                let z = [raw.rot[6], raw.rot[7], raw.rot[8]];
+                let is_ext = |p: [i32; 3]| {
+                    at.get(&p).is_some_and(|ks| ks.iter().any(|&k| {
+                        let o = &comps[k];
+                        // The parts' up rows (unmirrored, `comp+0x3C`) must match; extensions may face
+                        // either way or be mirrored (symmetric builds, e.g. the "reach stacker").
+                        o.body == c.body && (o.def == c.def || o.def == *ext) && crate::vehicle::flipped(o.rot, o.mirror)[3..6] == raw.rot[3..6]
+                    }))
+                };
+                track_travel(c.pos, z, is_ext)
+            }
+            (true, _) => (-j.range / 2.0, j.range / 2.0),
+            (false, _) if j.endless() => (f64::NEG_INFINITY, f64::INFINITY),
+            (false, _) if j.range > 0.0 => (-j.range * PI, j.range * PI),
+            (false, _) => (-PI, PI),
+        };
+        let point = c.part_to_aero(j.point);
+        let settle = point - comps[k].part_to_aero(j.child_point);
+        let free = j.passive() || (j.has_power() && c.power.is_some_and(|p| p.abs() < 1e-6));
+        links.push(JointLink { comp: i, half: k, parent, child, point, axis: axis.norm(), sign, slide: j.slide, travel, free, settle });
+    }
+    links
+}
+
+/// The joints that place each sub-grid, parents first, grown out from the fixed body of each
+/// group of jointed bodies (the lowest-numbered one no joint carries). A joint is taken either
+/// way round: a sub-grid that only carries the other half (a piston whose pivot's parent half
+/// sits on it) hangs from the sub-grid it is joined to. Driven joints are taken first, so free
+/// joints are the ones left to close loops.
+fn tree_links(all: Vec<JointLink>, comps: &[Comp]) -> Vec<JointLink> {
+    let n = comps.iter().map(|c| c.body as usize + 1).max().unwrap_or(1).max(all.iter().map(|l| l.parent.max(l.child) + 1).max().unwrap_or(0));
+    let carried: HashSet<usize> = all.iter().map(|l| l.child).collect();
+    let roots: Vec<usize> = (0..n).filter(|b| !carried.contains(b)).chain(0..n).collect();
+    let mut placed = vec![false; n];
+    let mut used = vec![false; all.len()];
+    let mut out = Vec::with_capacity(all.len());
+    for r in roots {
+        if placed[r] {
+            continue;
+        }
+        placed[r] = true;
+        // Driven before free, as built before turned round.
+        while let Some((_, k, back)) = (0..all.len())
+            .filter(|&k| !used[k])
+            .filter_map(|k| match (placed[all[k].parent], placed[all[k].child]) {
+                (true, false) => Some((2 * all[k].free as u8, k, false)),
+                (false, true) => Some((2 * all[k].free as u8 + 1, k, true)),
+                _ => None,
+            })
+            .min()
+        {
+            used[k] = true;
+            let l = if back { turned_round(&all[k]) } else { all[k].clone() };
+            placed[l.child] = true;
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// A joint that carries its parent half's body from its child half's: the same move undone
+/// (`child = parent·turn(point, v)·shift(settle)`, so `parent = child·turn(point − settle, −v)·shift(−settle)`).
+/// Settings, travel and sign are negated together, so the same input gives the same pose.
+fn turned_round(l: &JointLink) -> JointLink {
+    JointLink { parent: l.child, child: l.parent, point: l.point - l.settle, settle: l.settle * -1.0, sign: -l.sign, travel: (-l.travel.1, -l.travel.0), ..l.clone() }
 }
 
 /// A body without lifting panels (a landing gear leg, a door, anything on a pivot) as its own
@@ -909,7 +1061,7 @@ impl Model {
 
     pub fn build(comps: Vec<Comp>, lib: &mut Library, des: &Designations) -> Model {
         let grid = Grid::build(&comps, lib);
-        let (mass, com, inertia) = mass_properties(&comps, &grid, lib);
+        let (mass, com, inertia) = mass_properties(&comps, &grid, lib, &|_, p| p);
 
         let mut body_role: HashMap<u32, Role> = HashMap::new();
         let mut comp_role: HashMap<u32, Role> = HashMap::new();
@@ -1164,7 +1316,32 @@ impl Model {
             .collect();
         let panel_body = |i: usize| panels[i].cells.iter().map(|&c| grid.owner[c]).find(|&o| (o as usize) < comps.len()).map_or(0, |o| comps[o as usize].body as usize);
         let tips = crate::fx::free_tips(&panels, &wing_of, &panel_body);
-        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette, tips }
+        let joints = joint_links(&comps, lib);
+        Model { comps, grid, body, panels, panel_of, wing_of, separate, wing_rank, fin_live, fin_comp, fin_of, mass, com, inertia, s_ref, mac_ref, b_ref, props, bluff, main_body, silhouette, tips, joints, poses: Vec::new(), settings: Vec::new() }
+    }
+
+    /// The workbench's vehicle with its joints at their workbench angles (`pose::vehicle_poses`):
+    /// panels, centre of mass and inertia move with their bodies, and `eval` places the bluff
+    /// bodies the same way. Workbench only: in flight the game poses the bodies.
+    /// shortcut: interactions between panels, wing roots on the fuselage and the fuselage's
+    /// sections stay as built (flight does the same with a swung wing).
+    pub fn posed(mut self, des: &Designations, lib: &mut Library) -> Model {
+        self.settings = crate::pose::joint_settings(&self.joints, &self.comps, des);
+        let n = crate::pose::body_count(&self.comps);
+        self.settings = crate::pose::workbench_settings(&self.joints, &all_joint_links(&self.comps, lib), n, &self.settings).0;
+        let poses = crate::pose::body_poses(&self.joints, n, &|i, _| self.settings[i]);
+        if poses.iter().all(|p| *p == crate::pose::Pose::IDENTITY) {
+            return self;
+        }
+        let bodies: Vec<usize> = self.panels.iter().map(|p| self.panel_body(p)).collect();
+        for (p, b) in self.panels.iter_mut().zip(bodies) {
+            let Some(t) = poses.get(b) else { continue };
+            (p.centroid, p.n, p.u, p.s) = (t.apply(p.centroid), t.dir(p.n), t.dir(p.u), t.dir(p.s));
+        }
+        let place = |i: usize, p: V3| poses.get(self.comps[i].body as usize).map_or(p, |t| t.apply(p));
+        (self.mass, self.com, self.inertia) = mass_properties(&self.comps, &self.grid, lib, &place);
+        self.poses = poses;
+        self
     }
 
     /// One flight condition (FAR `GetClCdCmSteady`), coefficients on S, MAC and span.
@@ -1188,7 +1365,14 @@ impl Model {
         let frame = LiveBody { origin: V3::ZERO, rot: [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)], trans: V3::ZERO, com: V3::ZERO, vel: V3::ZERO, omega: V3::ZERO, wind: V3::ZERO };
         let frame = LiveBody { com: frame.to_world(self.com), vel: frame.dir_to_world(vel), omega: frame.axial_to_world(omega), ..frame };
         let nb = self.comps.iter().map(|k| k.body as usize).max().map_or(1, |b| b + 1);
-        for (_, f, p) in self.bluff_forces(&vec![frame; nb], self.main_body, &at) {
+        // A posed body: grid axes and origin moved by its pose (taken in the aero frame).
+        let frames: Vec<LiveBody> = (0..nb)
+            .map(|b| match self.poses.get(b) {
+                Some(t) => LiveBody { rot: [0, 1, 2].map(|i| frame.dir_to_world(t.dir(grid_to_aero([v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)][i])))), trans: frame.dir_to_world(t.trans), ..frame },
+                None => frame,
+            })
+            .collect();
+        for (_, f, p) in self.bluff_forces(&frames, self.main_body, &at) {
             let f = frame.dir_to_aero(f);
             fb += f;
             mb += (grid_to_aero(frame.world_to_grid(p)) - self.com).cross(f);
@@ -1611,12 +1795,13 @@ impl Stability {
 }
 
 /// Mass, CoM and inertia from definition masses spread over each part's voxels.
-fn mass_properties(comps: &[Comp], grid: &Grid, lib: &mut Library) -> (f64, V3, [f64; 6]) {
+/// `place(component, point)`: where a point of that component is (identity as built).
+fn mass_properties(comps: &[Comp], grid: &Grid, lib: &mut Library, place: &dyn Fn(usize, V3) -> V3) -> (f64, V3, [f64; 6]) {
     let mut cells: Vec<Vec<V3>> = vec![Vec::new(); comps.len()];
     for i in 0..grid.owner.len() {
         let o = grid.owner[i];
         if o != EMPTY && o != INTERIOR {
-            cells[o as usize].push(aero_pos(grid.cell(i)));
+            cells[o as usize].push(place(o as usize, aero_pos(grid.cell(i))));
         }
     }
     let mut pts: Vec<(V3, f64)> = Vec::new();
@@ -1624,7 +1809,7 @@ fn mass_properties(comps: &[Comp], grid: &Grid, lib: &mut Library) -> (f64, V3, 
         // A microcontroller weighs its width x length (the game's one mass override).
         let m = c.size.map(|s| (s[0] * s[1]) as f64).or_else(|| lib.get(&c.def).map(|d| d.mass as f64)).unwrap_or(1.0);
         if cells[i].is_empty() {
-            pts.push((aero_pos(c.pos), m));
+            pts.push((place(i, aero_pos(c.pos)), m));
         } else {
             let k = m / cells[i].len() as f64;
             pts.extend(cells[i].iter().map(|p| (*p, k)));
@@ -1651,6 +1836,21 @@ fn mass_properties(comps: &[Comp], grid: &Grid, lib: &mut Library) -> (f64, V3, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_joint_turned_round_keeps_the_relative_pose() {
+        use crate::pose::body_poses;
+        let l = JointLink { comp: 0, half: 1, parent: 0, child: 1, point: v3(1.0, 2.0, 0.5), axis: v3(0.0, 0.6, 0.8), sign: 1.0, slide: false, travel: (-3.0, 3.0), free: false, settle: v3(0.0, 0.1, 0.0) };
+        for slide in [false, true] {
+            let l = JointLink { slide, ..l.clone() };
+            let r = turned_round(&l);
+            let a = body_poses(&[l.clone()], 2, &|_, _| 0.7);
+            let b = body_poses(&[r], 2, &|_, _| -0.7);
+            // Turned round, body 0 moves by the inverse of body 1's move.
+            let p = v3(0.3, -0.2, 1.1);
+            assert!((a[1].apply(b[0].apply(p)) - p).len() < 1e-9, "{slide}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1663,7 +1863,7 @@ mod tests {
             return;
         }
         // Rocket axis (part y) pointing forward: grid z, aero x.
-        let comp = Comp { def: name.into(), pos: [0, 0, 0], rot: [1, 0, 0, 0, 0, 1, 0, -1, 0], body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+        let comp = Comp { def: name.into(), pos: [0, 0, 0], rot: [1, 0, 0, 0, 0, 1, 0, -1, 0], body: 0, mirror: 0, prop: None, size: None, wheel_size: None, power: None };
         let m = Model::build(vec![comp], &mut lib, &Designations::default());
         let axis = v3(1.0, 0.0, 0.0);
         let fins: Vec<(&Panel, &FinLive)> = m.panels.iter().zip(&m.fin_live).filter_map(|(p, f)| Some((p, f.as_ref()?))).collect();
@@ -1677,6 +1877,100 @@ mod tests {
             assert!((0.02..0.035).contains(&p.area), "face area {}", p.area);
             assert!(f.sign != 0.0);
         }
+    }
+
+    #[test]
+    fn joints_link_parent_and_child_bodies_parents_first() {
+        let (mut lib, appdata) = crate::defs::test_library();
+        for name in ["mig 27", "f4e aero", "c27j", "beaver", "puma"] {
+            let Ok(text) = std::fs::read_to_string(appdata.join(format!("data/vehicles/{name}.xml"))) else {
+                continue;
+            };
+            let comps = crate::vehicle::parse_vehicle_xml(&text);
+            let links = joint_links(&comps, &mut lib);
+            let bodies: HashSet<u32> = comps.iter().map(|c| c.body).collect();
+            let mut placed: HashSet<usize> = (0..bodies.len()).filter(|b| !links.iter().any(|l| l.child == *b)).collect();
+            for l in &links {
+                assert_ne!(l.parent, l.child, "{name}");
+                assert!(placed.contains(&l.parent), "{name}: body {} placed before its parent {}", l.child, l.parent);
+                placed.insert(l.child);
+                let c = &comps[l.comp];
+                assert!((l.point - c.part_to_aero(V3::ZERO)).len() < 1.5, "{name}: joint point far from its part");
+                assert!((l.axis.len() - 1.0).abs() < 1e-9);
+            }
+            if name == "f4e aero" {
+                let half: Vec<f64> = links.iter().filter(|l| comps[l.comp].def == "m_th_half_block_offset_base").map(|l| l.settle.len()).collect();
+                assert!(!half.is_empty() && half.iter().all(|s| (s - 0.125).abs() < 1e-9), "half block offsets pull half a block: {half:?}");
+                assert!(links.iter().filter(|l| comps[l.comp].def != "m_th_half_block_offset_base").all(|l| l.settle.len() < 0.02), "stock joints sit as built");
+            }
+            if name == "mig 27" {
+                // Mirrored pairs set to the same angle move mirrored: the swing wings turn opposite
+                // ways about one vertical axis, the stabilators the same way about one spanwise axis.
+                let turn = |b: usize| links.iter().find(|l| l.child == b).map(|l| l.axis * l.sign).unwrap();
+                assert!((turn(2) + turn(3)).len() < 1e-9 && turn(2).z.abs() > 0.99, "swing wings");
+                assert!((turn(4) - turn(5)).len() < 1e-9 && turn(4).y.abs() > 0.99, "stabilators");
+            }
+            let free = bodies.len() - links.len();
+            eprintln!("{name}: {} joints, {} bodies, {free} not carried by a joint", links.len(), bodies.len());
+            assert!(!links.is_empty(), "{name}: no joints found");
+        }
+    }
+
+    #[test]
+    fn pistons_and_linear_tracks_slide_within_their_travel() {
+        let (mut lib, _) = crate::defs::test_library();
+        if lib.get("linear_base").is_none() {
+            return; // no game install
+        }
+        let part = |def: &str, pos: [i32; 3], body: u32| Comp { def: def.into(), pos, rot: [1, 0, 0, 0, 1, 0, 0, 0, 1], body, mirror: 0, prop: None, size: None, wheel_size: None, power: None };
+        // A track base with two extensions on its +z side and one on −z, and a pneumatic piston.
+        let comps = vec![
+            part("linear_base", [0, 0, 0], 0),
+            part("linear_module", [0, 0, 1], 0),
+            Comp { rot: [-1, 0, 0, 0, 1, 0, 0, 0, -1], ..part("linear_module", [0, 0, 2], 0) },
+            part("linear_module", [0, 0, -1], 0),
+            part("linear_module", [0, 0, 4], 0),
+            part("linear_head", [0, 2, 0], 1),
+            part("linear_matic_a", [10, 0, 0], 0),
+            part("linear_matic_b", [10, 6, 0], 2),
+        ];
+        let links = joint_links(&comps, &mut lib);
+        let track = links.iter().find(|l| l.child == 1).unwrap();
+        assert!(track.slide && track.sign == 1.0 && (track.axis - v3(-1.0, 0.0, 0.0)).len() < 1e-9, "along part −z: {track:?}");
+        assert_eq!(track.travel, (-0.5, 0.25), "the gap at z 3 ends the run");
+        let piston = links.iter().find(|l| l.child == 2).unwrap();
+        assert!(piston.slide && (piston.axis - v3(0.0, 0.0, -1.0)).len() < 1e-9 && piston.travel == (-0.5, 0.5), "{piston:?}");
+        let mut des = Designations::default();
+        des.joint_offsets.insert([0, 0, 0], 3.0);
+        des.joint_offsets.insert([10, 0, 0], -0.2);
+        let m = Model::build(comps, &mut lib, &des).posed(&des, &mut lib);
+        assert!((m.poses[1].trans - v3(-0.25, 0.0, 0.0)).len() < 1e-9, "clamped to the track's end: {:?}", m.poses[1]);
+        assert!((m.poses[2].trans - v3(0.0, 0.0, 0.2)).len() < 1e-9, "piston pulled in 0.2 m: {:?}", m.poses[2]);
+    }
+
+    #[test]
+    fn posed_swing_wings_stay_symmetric_and_move_the_centre_of_mass() {
+        let (mut lib, appdata) = crate::defs::test_library();
+        let Ok(text) = std::fs::read_to_string(appdata.join("data/vehicles/mig 27.xml")) else { return };
+        let comps = crate::vehicle::parse_vehicle_xml(&text);
+        let build = |lib: &mut Library| Model::build(comps.clone(), lib, &Designations::default());
+        let flat = build(&mut lib);
+        let swing: Vec<&JointLink> = flat.joints.iter().filter(|l| l.axis.z.abs() > 0.99 && flat.comps.iter().filter(|c| c.body as usize == l.child).count() > 50).collect();
+        assert_eq!(swing.len(), 2, "two swing-wing pivots");
+        let cond = Cond { alpha: 5f64.to_radians(), beta: 0.0, rates: [0.0; 3], mach: 0.5, alt: 1000.0, pitch: 0.0, roll: 0.0, yaw: 0.0, flap: 0.0 };
+        let c0 = flat.eval(&cond, &mut flat.fresh_stall());
+        for deg in [-30.0, 30.0] {
+            let mut des = Designations::default();
+            for l in &swing {
+                des.joint_angles.insert(flat.comps[l.comp].pos, deg);
+            }
+            let m = build(&mut lib).posed(&des, &mut lib);
+            let c = m.eval(&cond, &mut m.fresh_stall());
+            eprintln!("{deg:+}°: com {:.3?} (was {:.3?}), CL {:.4} (was {:.4}), Cm {:.4} (was {:.4}), Croll {:.5} (was {:.5})", m.com, flat.com, c.cl, c0.cl, c.cm, c0.cm, c.croll, c0.croll);
+            assert!((m.com.y - flat.com.y).abs() < 1e-6 && (m.com.x - flat.com.x).abs() > 1e-3, "CoM moves along, not across");
+            assert!((c.cl - c0.cl).abs() > 1e-4 && (c.croll - c0.croll).abs() < 2e-4, "the lift changes, the roll does not");
+        }
+        assert_eq!(build(&mut lib).posed(&Designations::default(), &mut lib).poses.len(), 0, "unposed stays as built");
     }
 
     #[test]
@@ -1759,7 +2053,7 @@ mod tests {
         if lib.get("01_block").is_none() {
             return;
         }
-        let block = |x: i32, z: i32| Comp { def: "01_block".into(), pos: [x, 0, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+        let block = |x: i32, z: i32| Comp { def: "01_block".into(), pos: [x, 0, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None, power: None };
         let comps: Vec<Comp> = (-12..=12).flat_map(|x| (0..8).map(move |z| block(x, z))).collect();
         let mut des = Designations::default();
         des.wings.extend(comps.iter().map(|c| c.pos));
@@ -1786,7 +2080,7 @@ mod tests {
         if lib.get("01_block").is_none() {
             return;
         }
-        let block = |x: i32, y: i32, z: i32| Comp { def: "01_block".into(), pos: [x, y, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+        let block = |x: i32, y: i32, z: i32| Comp { def: "01_block".into(), pos: [x, y, z], rot: crate::vehicle::IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None, power: None };
         let mut comps = Vec::new();
         // A hollow open-ended hull 5 x 5 x 30 (walls one block thick), a thin 2 x 2 tail boom,
         // a wing through the hull, a tailplane on the boom and a fin on top of it.

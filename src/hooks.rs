@@ -21,7 +21,7 @@ unsafe extern "system" fn editor_update_detour(a1: usize, a2: usize, a3: usize, 
     }
     // A panic cannot unwind out of an extern "system" fn: contain it here.
     let _ = std::panic::catch_unwind(|| crate::editor::on_tick(a1));
-    let _ = std::panic::catch_unwind(|| crate::toolbar::width_tick(a1));
+    let _ = std::panic::catch_unwind(|| crate::toolbar::panel_rows_tick(a1));
     if TOOLBAR_HOOKED.load(Ordering::Relaxed) {
         let _ = std::panic::catch_unwind(|| crate::toolbar::on_tick(a1));
     }
@@ -383,6 +383,13 @@ unsafe fn install_blur_hooks() {
     } else {
         log_line("force emitter config panel prologue mismatch: no Blade Width row");
     }
+    if bytes_match(base + crate::toolbar::RVA_JOINT_PANEL, &crate::toolbar::JOINT_PANEL_PROLOGUE) {
+        if let Some(o) = hook(crate::toolbar::RVA_JOINT_PANEL, crate::toolbar::joint_panel_detour as *mut c_void) {
+            let _ = crate::toolbar::ORIGINAL_JOINT_PANEL.set(std::mem::transmute::<*mut c_void, crate::toolbar::PropPanel>(o));
+        }
+    } else {
+        log_line("joint config panel prologue mismatch: no Workbench Angle row");
+    }
     let Some(o) = hook(RVA_FORCE_EMITTER_DRAW, crate::blur::draw_detour as *mut c_void) else { return };
     let _ = crate::blur::ORIGINAL_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::ClassDraw>(o));
     // Blade width: only the blades, so the hub keeps its size.
@@ -633,6 +640,21 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
     let _ = ORIGINAL_EDITOR_UPDATE.set(std::mem::transmute::<*mut c_void, EditorUpdate>(original));
     MinHook::enable_hook(target as *mut c_void).map_err(|e| format!("enable editor update hook: {e:?}"))?;
     log_line(&format!("editor update hooked at {target:#x}"));
+    // Workbench pose drawn in the game's view (sub-grids at their joints' workbench angles).
+    let scene = base + RVA_EDITOR_RENDER_SCENE;
+    if bytes_match(scene, &EDITOR_RENDER_SCENE_PROLOGUE) {
+        match MinHook::create_hook(scene as *mut c_void, crate::editor::render_scene_detour as *mut c_void) {
+            Ok(o) => {
+                let _ = crate::editor::ORIGINAL_RENDER_SCENE.set(std::mem::transmute::<*mut c_void, crate::editor::RenderScene>(o));
+                if let Err(e) = MinHook::enable_hook(scene as *mut c_void) {
+                    log_line(&format!("enable editor scene draw hook: {e:?}"));
+                }
+            }
+            Err(e) => log_line(&format!("create editor scene draw hook: {e:?}")),
+        }
+    } else {
+        log_line("editor scene draw prologue mismatch: the workbench pose shows only in the F7 view");
+    }
     if crate::plugin::toolbar_disabled() {
         log_line("Aero wings toolbar button disabled by request (aero_disable_toolbar)");
     } else {

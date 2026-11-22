@@ -344,6 +344,8 @@ pub(crate) struct Gl {
     depth_func: unsafe extern "system" fn(u32),
     pub(crate) bind_texture: unsafe extern "system" fn(u32, u32),
     pub(crate) compressed_tex_sub_image_2d: unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, i32, *const c_void),
+    pub(crate) get_tex_image: unsafe extern "system" fn(u32, i32, u32, u32, *mut c_void),
+    pub(crate) get_tex_level_parameteriv: unsafe extern "system" fn(u32, i32, u32, *mut i32),
 }
 
 /// An OpenGL entry point: an opengl32 export, else from `wglGetProcAddress` (needs a current context).
@@ -375,6 +377,8 @@ pub(crate) fn gl() -> Option<&'static Gl> {
             depth_func: std::mem::transmute::<usize, _>(sym(c"glDepthFunc")?),
             bind_texture: std::mem::transmute::<usize, _>(sym(c"glBindTexture")?),
             compressed_tex_sub_image_2d: std::mem::transmute::<usize, _>(sym(c"glCompressedTexSubImage2D")?),
+            get_tex_image: std::mem::transmute::<usize, _>(sym(c"glGetTexImage")?),
+            get_tex_level_parameteriv: std::mem::transmute::<usize, _>(sym(c"glGetTexLevelParameteriv")?),
         };
         Some(gl)
     })

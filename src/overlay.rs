@@ -90,6 +90,8 @@ pub(crate) struct Overlay {
     model: Option<Arc<Model>>,
     faces: Arc<Vec<Face>>,
     model_dirty: bool,
+    /// Whether the last build was posed (Aero wings' Move sub-grids).
+    pose_built: bool,
     building: Arc<AtomicBool>,
     built: Arc<Mutex<Option<Built>>>,
 
@@ -152,6 +154,8 @@ pub(crate) struct Overlay {
     role_pick: usize,
     foil_pick: usize,
     tex: Option<TextureId>,
+    /// The label icons read back so far, and the atlas texture each came from.
+    icons_tried: Vec<(&'static str, u32)>,
     img: Option<Image>,
     upload: bool,
     view_dirty: bool,
@@ -196,6 +200,7 @@ impl Overlay {
             faces_gen: None,
             merge_from: None,
             model_dirty: false,
+            pose_built: true,
             building: Arc::new(AtomicBool::new(false)),
             built: Arc::new(Mutex::new(None)),
             sweep_mach: false,
@@ -238,6 +243,7 @@ impl Overlay {
             role_pick: 1,
             foil_pick: 1,
             tex: None,
+            icons_tried: Vec::new(),
             img: None,
             upload: false,
             view_dirty: true,
@@ -396,7 +402,7 @@ impl Overlay {
     /// applied with the current tool.
     fn bench_mode(&mut self, ui: &Ui) {
         let on = crate::toolbar::active();
-        editor::PICK_WANTED.store(on, Ordering::Relaxed);
+        editor::PICK_WANTED.store(on || crate::toolbar::mech_active(), Ordering::Relaxed);
         if on != self.bench {
             self.bench = on;
             // The workbench paint is on exactly while the Aero wings mode is.
@@ -575,12 +581,14 @@ impl Overlay {
             if first || self.cam.dist <= 0.0 {
                 self.frame_camera(&b.model);
             }
+            let moved = self.model.as_ref().is_none_or(|m| m.poses != b.model.poses);
+            editor::publish_pose_target(&b.model.joints, crate::pose::body_count(&b.model.comps), &b.model.settings);
             self.model = Some(Arc::new(b.model));
             self.prop_peaks.clear();
             self.prop_curves.clear();
-            // Faces follow the parts alone: marking blocks keeps them, and the pick image with them
-            // (rendering it anew per marked block made drag marking stutter).
-            if self.faces_gen != Some(b.gen) || self.faces.len() != b.faces.len() {
+            // Faces follow the parts and the workbench pose alone: marking blocks keeps them, and the
+            // pick image with them (rendering it anew per marked block made drag marking stutter).
+            if self.faces_gen != Some(b.gen) || self.faces.len() != b.faces.len() || moved {
                 self.faces = Arc::new(b.faces);
                 self.faces_gen = Some(b.gen);
             }
@@ -594,6 +602,11 @@ impl Overlay {
             self.snapshot = latest;
             self.model_dirty = true;
             self.sync_marks();
+        }
+        let pose = crate::toolbar::pose_shown();
+        if pose != self.pose_built {
+            self.pose_built = pose;
+            self.model_dirty = true;
         }
         if !self.model_dirty || self.building.load(Ordering::Acquire) {
             return;
@@ -611,7 +624,16 @@ impl Overlay {
                 let mut lib = lib.lock().unwrap_or_else(|p| p.into_inner());
                 let t = std::time::Instant::now();
                 let model = Model::build(comps, &mut lib, &des);
-                let faces = view::faces(&model.grid);
+                // Unposed: still the settings, for the pose the Mechanisms mode shows.
+                let model = if pose { model.posed(&des, &mut lib) } else { Model { settings: crate::pose::joint_settings(&model.joints, &model.comps, &des), ..model } };
+                let mut faces = view::faces(&model.grid);
+                // Workbench pose: each face where its body is turned to (`Model::posed`).
+                for f in &mut faces {
+                    if let Some(t) = model.poses.get(model.comps[f.comp as usize].body as usize) {
+                        f.poly.iter_mut().for_each(|p| *p = t.apply(*p));
+                        f.normal = t.dir(f.normal);
+                    }
+                }
                 log_line(&format!(
                     "model: {} comps, {} voxels, {} panels, {} faces, missing defs {:?}, {} ms",
                     model.comps.len(),
@@ -1855,6 +1877,19 @@ impl ImguiRenderLoop for Overlay {
     }
 
     fn before_render<'a>(&'a mut self, _ctx: &mut Context, render_context: &'a mut dyn RenderContext) {
+        // The game's icons for the Mechanisms labels, read back from their atlases once.
+        let icons = crate::toolbar::LABEL_ICONS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for (name, tex, uv) in icons {
+            if self.icons_tried.contains(&(name, tex)) {
+                continue;
+            }
+            self.icons_tried.push((name, tex));
+            let id = crate::toolbar::read_region(tex, uv).and_then(|(px, w, h)| render_context.load_texture(&px, w, h).ok());
+            log_line(&format!("mechanisms: icon {name} {}", if id.is_some() { "loaded" } else { "not readable; labels use a plain mark" }));
+            let mut have = crate::mechmode::ICONS.lock().unwrap_or_else(|p| p.into_inner());
+            have.retain(|(n, _)| *n != name);
+            have.extend(id.map(|id| (name, id)));
+        }
         if self.upload {
             self.upload = false;
             if let (Some(tex), Some(img)) = (self.tex, self.img.as_ref()) {
@@ -1866,6 +1901,8 @@ impl ImguiRenderLoop for Overlay {
     }
 
     fn render(&mut self, ui: &mut Ui) {
+        #[cfg(feature = "logging")]
+        crate::hang::FRAMES.fetch_add(1, Ordering::Relaxed);
         // A panic here would unwind into the game's wglSwapBuffers and abort it.
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_ok();
         if !ok {
@@ -1910,11 +1947,15 @@ impl Overlay {
             self.draw_flight_data(ui);
             draw_force_arrows(ui);
         }
-        editor::WANTED.store(self.open || self.world, Ordering::Relaxed);
+        editor::WANTED.store(self.open || self.world || crate::toolbar::mech_active(), Ordering::Relaxed);
         if self.open || self.world {
             self.pump_model();
         }
         self.bench_mode(ui);
+        if crate::toolbar::mech_active() {
+            crate::mechmode::draw_labels(ui);
+            crate::mechmode::draw_sequence(ui);
+        }
         if self.world {
             self.publish_paint();
         }
@@ -1974,7 +2015,7 @@ impl Overlay {
         if self.vehicles || self.mouse_hold > 0 {
             f |= MessageFilter::InputMouse | MessageFilter::InputRaw;
         }
-        if !self.open && !self.bench {
+        if !self.open && !self.bench && !crate::toolbar::mech_active() {
             return f;
         }
         if io.want_capture_mouse {
@@ -2233,3 +2274,4 @@ fn publish_track(data: &[crate::flight::VehicleDebug]) {
     }
     *crate::drawcap::TRACK.lock().unwrap_or_else(|p| p.into_inner()) = track;
 }
+

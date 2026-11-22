@@ -26,6 +26,9 @@ pub struct Comp {
     /// An advanced wheel's size setting (`<o wheel_size>`, 1 when unset) and whether it is a
     /// double wheel (`<o double_wheel>`): `defs::Wheel::tyres`.
     pub wheel_size: Option<(f64, bool)>,
+    /// A driven joint's max power setting (`<o max_force_scalar>`, `comp+0x420`, 1 when unset):
+    /// 0 leaves it free.
+    pub power: Option<f64>,
 }
 
 /// The transform of a part saved without an `r` attribute. Not the identity, which the game
@@ -125,7 +128,7 @@ pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
                     rot: DEFAULT_ROT,
                     body: body.max(0) as u32,
                     mirror: 0,
-                    prop: None, size: None, wheel_size: None,
+                    prop: None, size: None, wheel_size: None, power: None,
                 });
                 flip = tag.int0("t");
                 aero.push(tag.get("aero").unwrap_or("").to_string());
@@ -139,6 +142,7 @@ pub fn parse_vehicle_xml_marked(text: &str) -> (Vec<Comp>, Vec<String>) {
                     c.prop = (p != PropSet::default()).then_some(p);
                     let double = tag.get("double_wheel") == Some("true");
                     c.wheel_size = (tag.get("wheel_size").is_some() || double).then(|| (tag.num("wheel_size").unwrap_or(1.0), double));
+                    c.power = tag.num("max_force_scalar");
                 }
                 if let (Some(c), Some(r)) = (cur.as_mut(), tag.get("r")) {
                     let v: Vec<i32> = r.split(',').filter_map(|s| s.trim().parse().ok()).collect();

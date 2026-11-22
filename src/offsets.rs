@@ -13,6 +13,11 @@ pub(crate) const PLUGIN_BUILD_LABEL: &str = env!("AERO_BUILD_STAMP");
 /// per-tick update (vtable slot 6), on the thread that edits the vehicle. All args are
 /// integer-class (call site 0x86ad4d: rcx, rdx, r8, r9 + two stack pointers).
 pub(crate) const RVA_EDITOR_UPDATE: usize = 0x007d_6740;
+/// `editor_render_scene(E, …)` (`22e792753489` [high]): draws the workbench scene; byte 28 starts
+/// a call, so the check stops there (knowledge/rendering.md "Workbench body draw matrix").
+pub(crate) const RVA_EDITOR_RENDER_SCENE: usize = 0x007e_0530;
+pub(crate) const EDITOR_RENDER_SCENE_PROLOGUE: [u8; 28] =
+    [0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0xD0, 0xE6, 0xFF, 0xFF, 0xB8, 0x40, 0x1A, 0x00];
 /// No rip-relative or rel32 bytes in this window, so nothing is wildcarded.
 pub(crate) const EDITOR_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x68, 0xf5, 0xff, 0xff, 0x48, 0x81, 0xec, 0x58,
@@ -30,6 +35,8 @@ pub(crate) const OFF_COMP_DEF: usize = 0x58; // c_scene_tile_definition* (a mirr
 /// u8 mirror mask of the definition variant = the XML `t` (1 x, 2 y, 4 z); comp+0x30 is the
 /// raw `r` without it (definition_init_variant 0x317f30, component_def_ref_serialize 0x4bb180).
 pub(crate) const OFF_DEF_MIRROR: usize = 0x40;
+/// `extender_name` of a linear track base (string, as `OFF_DEF_NAME`) (`22e792753489` [high]).
+pub(crate) const OFF_DEF_EXTENDER: usize = 0x378;
 /// Definition name as written to the vehicle XML `d` attribute: `{char* data; u32 len}`.
 pub(crate) const OFF_DEF_NAME: usize = 0x288;
 pub(crate) const OFF_DEF_CLASS: usize = 0x2AC; // i32 component class (XML `type`)
@@ -83,6 +90,7 @@ pub(crate) const OFF_PROP_COLLECTIVE: usize = 0x260; // f32 live pitch input
 pub(crate) const OFF_MC_WIDTH: usize = 0x188; // i32 microcontroller width, then i32 length
 pub(crate) const OFF_WHEEL_SIZE: usize = 0x6F4; // f32 advanced wheel wheel_size setting
 pub(crate) const OFF_WHEEL_DOUBLE: usize = 0x6FC; // u8 advanced wheel double_wheel setting
+pub(crate) const OFF_JOINT_POWER: usize = 0x420; // f32 type-7 driven joint max power setting (`max_force_scalar`)
 pub(crate) const OFF_PROP_BLADES: usize = 0x264; // u32 blade_count
 pub(crate) const OFF_PROP_PITCH: usize = 0x268; // i32 blade_pitch setting
 pub(crate) const OFF_PROP_FOLDED: usize = 0x270; // u8

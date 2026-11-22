@@ -111,12 +111,21 @@ fn bootstrap() {
         start_overlay(game, appdata);
     }
 
-    // Verbose builds: per-10-second counters, so "never called" and "rejected" are distinguishable.
+    // Verbose builds: per-10-second counters, so "never called" and "rejected" are distinguishable;
+    // the hang watch looks every second.
     #[cfg(feature = "logging")]
-    loop {
-        thread::sleep(Duration::from_secs(10));
+    let mut watch = crate::hang::Watch::new();
+    #[cfg(feature = "logging")]
+    for second in 1u64.. {
+        thread::sleep(Duration::from_secs(1));
+        watch.check();
+        if second % 10 != 0 {
+            continue;
+        }
         log_line(&format!(
-            "heartbeat: editor ticks={} active={} snapshots={} rejects={} | flight on={} ticks={} vehicles={} models={} applied={}",
+            "heartbeat: {} MB, {} frames | editor ticks={} active={} snapshots={} rejects={} | flight on={} ticks={} vehicles={} models={} applied={}",
+            crate::hang::rss_mb(),
+            crate::hang::FRAMES.load(Ordering::Relaxed),
             crate::editor::TICKS.load(Ordering::Relaxed),
             crate::editor::editor_active(),
             crate::editor::SNAPSHOTS.load(Ordering::Relaxed),

@@ -82,6 +82,10 @@ const VX_M: f64 = 0.95;
 /// Momentum theory, v·sqrt(vx² + (vz + v)²) = 1: the largest root (helicopter branch) or the
 /// smallest (windmill brake state).
 fn momentum(vz: f64, vx: f64, helicopter: bool) -> f64 {
+    // An infinite inflow would never step down to the root.
+    if !(vz.is_finite() && vx.is_finite()) {
+        return 0.0;
+    }
     let g = |v: f64| v * (vx * vx + (vz + v) * (vz + v)).sqrt() - 1.0;
     let hi = vz.abs() + 1.5;
     let step = 0.02;

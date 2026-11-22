@@ -26,6 +26,8 @@ pub struct DefVoxel {
 }
 
 pub struct Def {
+    /// Display name (`name`, e.g. "Robotic Pivot").
+    pub name: String,
     pub type_: i32,
     pub mass: f32,
     /// `rudder_type` of type-18 parts: 0 rudder/fin/control surface, 1 wing, 2 keel.
@@ -53,6 +55,56 @@ pub struct Def {
     pub prop: Option<PropDef>,
     /// A wheel's tyre (`Grid::build` adds `tyre_voxels` per part, for its size setting).
     pub wheel: Option<Wheel>,
+    /// The parent half of a joint (type 7 with a `child_name`): how it carries its sub-grid.
+    pub joint: Option<Joint>,
+    /// What the game's physics collides with (knowledge/vehicle-model.md "Body collision
+    /// shapes"): voxels with `flags & 1`, as physics shapes (`bounds` unused), and the extra box
+    /// of `flags & 0x400` parts (`bb_physics_min/max`, part frame metres: a seat's back).
+    pub collision: Vec<DefVoxel>,
+    pub collision_box: Option<(V3, V3)>,
+}
+
+/// A joint's parent half (`multibody_*_a`): the sub-grid on its child half turns about, or slides
+/// along, one of the part's axes (knowledge/vehicle-model.md, type 7).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Joint {
+    /// The child half's definition name (`child_name`).
+    pub child: String,
+    /// Where the child half sits, part voxels (`voxel_location_child`).
+    pub child_at: [i32; 3],
+    /// The joint's point, part frame, metres (`constraint_pos_parent`).
+    pub point: V3,
+    /// The same point on the child half, its own part frame (`constraint_pos_child`). Where the
+    /// two differ as built, the game pulls the child over (the modded half block offset).
+    pub child_point: V3,
+    /// Part axis it turns about or slides along (`constraint_axis`: 0 x, 1 y, 2 z).
+    pub axis: usize,
+    /// Slides (`constraint_type` 1: suspension, pistons) instead of turning.
+    pub slide: bool,
+    /// `constraint_range_of_motion`: total turns, or total metres of a slide (centred on the
+    /// build pose); 0 for unlimited turns, or a linear track's travel from its `extender`.
+    pub range: f64,
+    /// A linear track's extension part (`extender_name`): its travel is the run of them in line.
+    pub extender: Option<String>,
+    /// Definition `flags` (knowledge/vehicle-model.md "Type-7 joints", drive).
+    pub flags: u32,
+}
+
+impl Joint {
+    /// The input is a speed and nothing stops it: velocity pivots, turret rings.
+    pub fn endless(&self) -> bool {
+        self.flags & 0x200 != 0
+    }
+    /// Has a max power setting (`Comp::power`): robotic and velocity pivots, turret rings,
+    /// pistons, linear tracks.
+    pub fn has_power(&self) -> bool {
+        self.flags & 0x100 != 0
+    }
+    /// Nothing drives it: plain and Power pivots swing (Power ones only pass RPS through),
+    /// suspensions spring. Fluid drives the pumpjack (0x4000).
+    pub fn passive(&self) -> bool {
+        self.flags & 0x10000 != 0 || self.flags & 0x4100 == 0
+    }
 }
 
 /// A wheel's tyre as a cylinder in the part's frame. The game marks the cells a tyre sweeps as
@@ -249,6 +301,7 @@ impl Def {
 
 pub fn parse_def(text: &str) -> Def {
     let mut def = Def {
+        name: String::new(),
         type_: 0,
         mass: 0.0,
         rudder_type: 0,
@@ -263,7 +316,11 @@ pub fn parse_def(text: &str) -> Def {
         hinge: V3::ZERO,
         prop: None,
         wheel: None,
+        joint: None,
+        collision: Vec::new(),
+        collision_box: None,
     };
+    let (mut phys_open, mut any_voxel, mut bb) = (false, false, (None::<V3>, None::<V3>));
     // Reserved (not solid) voxels, and the wheel's size attributes.
     let (mut reserved, mut open_reserved, mut wheel_size, mut axle) = (Vec::<[i32; 3]>::new(), false, (0.0f64, None::<f64>), 0);
     let mut prop = PropDef::default();
@@ -284,6 +341,7 @@ pub fn parse_def(text: &str) -> Def {
     for tag in xml::tags(text) {
         match (tag.name, tag.close) {
             ("definition", false) => {
+                def.name = tag.get("name").unwrap_or_default().to_string();
                 def.type_ = tag.int0("type");
                 def.mass = tag.num("mass").unwrap_or(0.0);
                 def.rudder_type = tag.int0("rudder_type");
@@ -301,6 +359,32 @@ pub fn parse_def(text: &str) -> Def {
                 prop.max_force = tag.num("force_emitter_max_force").unwrap_or(1000.0);
                 wheel_size = (tag.num("wheel_radius").unwrap_or(0.0), tag.num("wheel_width"));
                 axle = tag.int0("constraint_axis").clamp(0, 2) as usize;
+                def.joint = tag.get("child_name").filter(|n| !n.is_empty() && def.type_ == TYPE_MULTIBODY).map(|n| Joint {
+                    child: n.to_string(),
+                    child_at: [0; 3],
+                    point: V3::ZERO,
+                    child_point: V3::ZERO,
+                    axis: axle,
+                    slide: tag.int0("constraint_type") == 1,
+                    range: tag.num("constraint_range_of_motion").unwrap_or(0.0),
+                    extender: tag.get("extender_name").filter(|n| !n.is_empty()).map(str::to_string),
+                    flags: tag.int0("flags") as u32,
+                });
+            }
+            ("constraint_pos_parent", false) => {
+                if let Some(j) = def.joint.as_mut() {
+                    j.point = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0));
+                }
+            }
+            ("constraint_pos_child", false) => {
+                if let Some(j) = def.joint.as_mut() {
+                    j.child_point = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0));
+                }
+            }
+            ("voxel_location_child", false) => {
+                if let Some(j) = def.joint.as_mut() {
+                    j.child_at = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
+                }
             }
             ("force_dir", false) => prop.axis = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0)),
             ("dynamic_rotation_axes", false) => def.hinge = v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0)),
@@ -320,6 +404,11 @@ pub fn parse_def(text: &str) -> Def {
             ("logic_node", false) => def.logic = true,
             ("voxel", false) if in_voxels => {
                 let flags = tag.int0("flags");
+                any_voxel = true;
+                phys_open = flags & 1 != 0 && !tag.empty;
+                if flags & 1 != 0 {
+                    def.collision.push(DefVoxel { pos: [0; 3], shape: tag.int0("physics_shape"), rot: crate::vehicle::IDENTITY, bounds: None, moving: false });
+                }
                 // bit 0 = solid, 4 = moving panel (control surface, door). 0/2 = reserved space
                 // (prop discs, tyre sweep, seat occupant); an omitted attribute means 0.
                 let solid = flags & 1 != 0 || flags & 4 != 0;
@@ -332,7 +421,9 @@ pub fn parse_def(text: &str) -> Def {
                 }
                 open_reserved = !solid && !tag.empty;
             }
-            ("voxel", true) => (open, open_reserved) = (false, false),
+            ("voxel", true) => (open, open_reserved, phys_open) = (false, false, false),
+            ("bb_physics_min", false) => bb.0 = Some(v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0))),
+            ("bb_physics_max", false) => bb.1 = Some(v3(tag.num("x").unwrap_or(0.0), tag.num("y").unwrap_or(0.0), tag.num("z").unwrap_or(0.0))),
             ("position", false) if open_reserved => {
                 if let Some(v) = reserved.last_mut() {
                     *v = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
@@ -342,12 +433,18 @@ pub fn parse_def(text: &str) -> Def {
                 if let Some(v) = def.voxels.last_mut() {
                     v.pos = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
                 }
+                if let Some(v) = def.collision.last_mut().filter(|_| phys_open) {
+                    v.pos = [tag.int0("x"), tag.int0("y"), tag.int0("z")];
+                }
             }
             ("physics_shape_rotation", false) if open => {
                 // Entries equal to identity are omitted (`00="0" 02="-1" 20="1" 22="0"` keeps 11 = 1).
                 let r: [i32; 9] = std::array::from_fn(|k| tag.num(&format!("{}{}", k / 3, k % 3)).unwrap_or((k % 4 == 0) as i32));
-                if let Some(v) = def.voxels.last_mut() {
-                    if crate::vehicle::valid_rotation(&r) {
+                if crate::vehicle::valid_rotation(&r) {
+                    if let Some(v) = def.voxels.last_mut() {
+                        v.rot = r;
+                    }
+                    if let Some(v) = def.collision.last_mut().filter(|_| phys_open) {
                         v.rot = r;
                     }
                 }
@@ -357,6 +454,16 @@ pub fn parse_def(text: &str) -> Def {
     }
     if def.voxels.is_empty() {
         def.voxels.push(DefVoxel { pos: [0; 3], shape: 0, rot: crate::vehicle::IDENTITY, bounds: None, moving: false });
+    }
+    // shortcut: a definition without any <voxel> collides as one cube (as the aero grid takes it); not checked in game.
+    if !any_voxel {
+        def.collision = def.voxels.iter().map(|v| DefVoxel { pos: v.pos, shape: v.shape, rot: v.rot, bounds: None, moving: false }).collect();
+    }
+    if prop.flags & 0x400 != 0 {
+        def.collision_box = match bb {
+            (Some(lo), Some(hi)) if (0..3).all(|a| hi.get(a) > lo.get(a)) => Some((lo, hi)),
+            _ => None,
+        };
     }
     // Invisible parts (sensors, hidden weights): nothing drawn in game, only an editor-only mesh.
     // They take no space in the air (their mass stays, at the part's position).
@@ -939,6 +1046,14 @@ mod tests {
         bin.extend((b.len() as u32).to_le_bytes());
         bin.extend(&b);
         assert_eq!(bin_mesh(&bin, "m.mesh"), Some(&b[..]));
+    }
+
+    #[test]
+    fn joint_fields_from_the_parent_half() {
+        let d = parse_def(r#"<definition type="7" child_name="multibody_pivot_b" constraint_type="0" constraint_axis="2" constraint_range_of_motion="0.5"><constraint_pos_parent x="0" y="0.25" z="0"/><constraint_pos_child x="0" y="-0.25" z="0"/><voxel_location_child x="0" y="2" z="0"/></definition>"#);
+        assert_eq!(d.joint, Some(Joint { child: "multibody_pivot_b".into(), child_at: [0, 2, 0], point: v3(0.0, 0.25, 0.0), child_point: v3(0.0, -0.25, 0.0), axis: 2, slide: false, range: 0.5, extender: None, flags: 0 }));
+        let b = parse_def(r#"<definition type="7" child_name="" constraint_axis="0"><constraint_pos_parent/></definition>"#);
+        assert_eq!(b.joint, None, "the child half carries nothing");
     }
 
     #[test]

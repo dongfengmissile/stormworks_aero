@@ -61,7 +61,7 @@ pub fn blade_solids(c: &Comp, p: &crate::defs::PropDef) -> Vec<Solid> {
 }
 
 /// `p·R + pos`: the component transform, stretched or not.
-fn place(s: &Solid, c: &Comp) -> Solid {
+pub(crate) fn place(s: &Solid, c: &Comp) -> Solid {
     let r = c.rot.map(|v| v as f64);
     let t = |p: V3| {
         v3(
@@ -206,7 +206,7 @@ impl Grid {
                 g.fill[i] = f;
                 g.owner[i] = o;
             }
-            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None };
+            let c = Comp { def: String::new(), pos: p, rot: IDENTITY, body: 0, mirror: 0, prop: None, size: None, wheel_size: None, power: None };
             g.solids.push((o, place(&voxel_solid(None), &c)));
         }
         g
