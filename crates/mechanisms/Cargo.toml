@@ -1,0 +1,22 @@
+[package]
+name = "stormworks_mechanisms"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lib]
+name = "StormworksMechanisms"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+logging = ["stormworks_core/logging"]
+
+[dependencies]
+stormworks_core = { path = "../core" }
+
+[target.'cfg(windows)'.dependencies]
+minhook = "0.9"
+# The same overlay stack as the aero plugin (hooks wglSwapBuffers + the window proc).
+imgui = { version = "0.12", features = ["tables-api"] }
+hudhook = { version = "0.7.1", default-features = false, features = ["opengl3"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }

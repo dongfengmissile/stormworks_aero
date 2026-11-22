@@ -24,22 +24,10 @@ pub struct Mark {
     pub blade_width: Option<f32>,
     /// Blade shape chosen for a propeller/rotor: true propeller, false rotor (None: auto).
     pub airscrew: Option<bool>,
-    /// A joint's workbench pose, degrees (`JOINT_ANGLE_RANGE`): the analysis and the editor show
-    /// its sub-grid turned this far. Flight ignores it.
-    pub joint_angle: Option<f32>,
-    /// A sliding joint's workbench pose, metres along its axis (`JOINT_OFFSET_RANGE`).
-    pub joint_offset: Option<f32>,
-    /// The Mechanisms sequences this joint is in, by name, with its moves in each: start (s),
-    /// duration (s), target (degrees, or metres for a sliding joint), from the workbench pose.
-    pub seq: Vec<(String, Vec<[f32; 3]>)>,
-    /// Tokens this version does not know (a newer plugin's), written back unchanged.
+    /// Tokens this version does not know (a newer plugin's, or the mechanisms plugin's joint
+    /// settings in older files), written back unchanged.
     pub other: Vec<String>,
 }
-
-/// Workbench joint angle range, degrees.
-pub const JOINT_ANGLE_RANGE: (f32, f32) = (-180.0, 180.0);
-/// Workbench sliding joint offset range, metres (long linear tracks).
-pub const JOINT_OFFSET_RANGE: (f32, f32) = (-100.0, 100.0);
 
 /// Blade width multiplier range.
 pub const BLADE_WIDTH_RANGE: (f32, f32) = (0.25, 2.0);
@@ -54,8 +42,7 @@ impl Mark {
     }
 
     /// Attribute value: space-separated `w`, `s` / `s:<n>`, `r:<role>`, `f:<foil>`, `fd:<foil>`, `ff:<foil>`,
-    /// `fm:on|off`, `vrs:on|off`, `pm:on|off`, `ge:on|off`, `js:on|off`, `bw:<width>`, `sh:prop|rotor`, `pa:<degrees>`,
-    /// `po:<metres>`, `sq:<name>@<start>/<duration>/<target>;...` (one per sequence, `_` for spaces).
+    /// `fm:on|off`, `vrs:on|off`, `pm:on|off`, `ge:on|off`, `js:on|off`, `bw:<width>`, `sh:prop|rotor`.
     pub fn encode(&self) -> String {
         let mut t: Vec<String> = Vec::new();
         if self.wing {
@@ -74,12 +61,6 @@ impl Mark {
         t.extend(sw.tokens().into_iter().filter_map(|(k, v)| v.map(|b| format!("{k}:{}", if b { "on" } else { "off" }))));
         t.extend(self.blade_width.map(|w| format!("bw:{w:.2}")));
         t.extend(self.airscrew.map(|a| format!("sh:{}", if a { "prop" } else { "rotor" })));
-        t.extend(self.joint_angle.map(|a| format!("pa:{a:.1}")));
-        t.extend(self.joint_offset.map(|o| format!("po:{o:.3}")));
-        for (name, moves) in &self.seq {
-            let moves: Vec<String> = moves.iter().map(|[s, d, v]| format!("{s:.2}/{d:.2}/{v:.2}")).collect();
-            t.push(format!("sq:{}@{}", seq_name(name).replace(' ', "_"), moves.join(";")));
-        }
         t.extend(self.other.iter().cloned());
         t.join(" ")
     }
@@ -98,20 +79,6 @@ impl Mark {
                 Some(("ff", v)) => m.default_fin = aerofoil_index(v),
                 Some(("sh", "prop")) => m.airscrew = Some(true),
                 Some(("sh", "rotor")) => m.airscrew = Some(false),
-                Some(("pa", v)) => m.joint_angle = v.parse::<f32>().ok().filter(|a| a.is_finite()).map(|a| a.clamp(JOINT_ANGLE_RANGE.0, JOINT_ANGLE_RANGE.1)),
-                Some(("po", v)) => m.joint_offset = v.parse::<f32>().ok().filter(|o| o.is_finite()).map(|o| o.clamp(JOINT_OFFSET_RANGE.0, JOINT_OFFSET_RANGE.1)),
-                Some(("sq", v)) => {
-                    let (name, moves) = v.split_once('@').map_or(("Sequence 1".to_string(), v), |(n, mv)| (seq_name(&n.replace('_', " ")), mv));
-                    let moves = (moves.split(';'))
-                        .filter_map(|mv| {
-                            let n: Vec<f32> = mv.split('/').filter_map(|x| x.parse().ok()).filter(|x: &f32| x.is_finite()).collect();
-                            (n.len() == 3).then(|| [n[0].clamp(0.0, 600.0), n[1].clamp(0.0, 600.0), n[2].clamp(-SEQ_TARGET_MAX, SEQ_TARGET_MAX)])
-                        })
-                        .collect();
-                    if !name.is_empty() && !m.seq.iter().any(|(n, _)| *n == name) {
-                        m.seq.push((name, moves));
-                    }
-                }
                 Some(("bw", v)) => m.blade_width = v.parse::<f32>().ok().filter(|w| w.is_finite()).map(|w| w.clamp(BLADE_WIDTH_RANGE.0, BLADE_WIDTH_RANGE.1)),
                 Some((k, v)) if m.sw.tokens().iter().any(|(t, _)| *t == k) => {
                     if let Some((_, slot)) = m.sw.tokens().into_iter().find(|(t, _)| *t == k) {
@@ -123,14 +90,6 @@ impl Mark {
         }
         m
     }
-}
-
-/// The largest sequence move target: velocity pivots and turret rings turn on (100 turns).
-const SEQ_TARGET_MAX: f32 = 36000.0;
-
-/// A sequence name as stored: letters, digits, spaces and dashes.
-pub fn seq_name(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric() || " -".contains(*c)).collect::<String>().trim().to_string()
 }
 
 fn on_off(v: &str) -> Option<bool> {
@@ -159,9 +118,6 @@ pub fn from_designations(des: &Designations, comps: &[Comp]) -> Vec<Mark> {
             sw: if first { des.sw } else { Switches::default() },
             blade_width: des.widths.get(&c.pos).map(|&w| w as f32),
             airscrew: des.shapes.get(&c.pos).copied(),
-            joint_angle: des.joint_angles.get(&c.pos).map(|&a| a as f32),
-            joint_offset: des.joint_offsets.get(&c.pos).map(|&o| o as f32),
-            seq: des.joint_seq.get(&c.pos).map(|v| v.iter().map(|(n, mv)| (n.clone(), mv.iter().map(|m| m.map(|x| x as f32)).collect())).collect()).unwrap_or_default(),
             other: Vec::new(),
         })
         .collect()
@@ -192,15 +148,6 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Option<Designations> {
         }
         if let Some(a) = m.airscrew {
             d.shapes.insert(c.pos, a);
-        }
-        if let Some(a) = m.joint_angle {
-            d.joint_angles.insert(c.pos, a as f64);
-        }
-        if let Some(o) = m.joint_offset {
-            d.joint_offsets.insert(c.pos, o as f64);
-        }
-        if !m.seq.is_empty() {
-            d.joint_seq.insert(c.pos, m.seq.iter().map(|(n, mv)| (n.clone(), mv.iter().map(|s| s.map(|x| x as f64)).collect())).collect());
         }
     }
     d.default_foil = marks.iter().find_map(|m| m.default_foil).unwrap_or(0);
@@ -281,31 +228,6 @@ mod tests {
         let comps = [comp([1, 2, 3])];
         let des = to_designations(&comps, &[m.clone()]).unwrap();
         assert_eq!(des.widths.get(&[1, 2, 3]), Some(&1.5));
-        assert_eq!(from_designations(&des, &comps)[0], m);
-    }
-
-    #[test]
-    fn joint_angle_round_trips_and_clamps() {
-        let m = Mark { joint_angle: Some(-32.5), ..Default::default() };
-        assert_eq!(m.encode(), "pa:-32.5");
-        assert_eq!(Mark::decode(&m.encode()), m);
-        assert_eq!(Mark::decode("pa:400").joint_angle, Some(JOINT_ANGLE_RANGE.1));
-        let comps = [comp([1, 2, 3])];
-        let des = to_designations(&comps, &[m.clone()]).unwrap();
-        assert_eq!(des.joint_angles.get(&[1, 2, 3]), Some(&-32.5));
-        assert_eq!(from_designations(&des, &comps)[0], m);
-        let m = Mark { seq: vec![("Landing gear".into(), vec![[0.0, 1.5, 45.0], [3.0, 1.0, -10.0]]), ("Canopy".into(), vec![])], ..Default::default() };
-        assert_eq!(m.encode(), "sq:Landing_gear@0.00/1.50/45.00;3.00/1.00/-10.00 sq:Canopy@");
-        assert_eq!(Mark::decode(&m.encode()), m);
-        assert_eq!(Mark::decode("sq:a@1/2;x/1/2;0/1/9").seq, vec![("a".into(), vec![[0.0, 1.0, 9.0]])], "bad moves are skipped");
-        assert_eq!(Mark::decode(&Mark { seq: vec![("Spin".into(), vec![[0.0, 2.0, 720.0]])], ..Default::default() }.encode()).seq[0].1, vec![[0.0, 2.0, 720.0]], "turns past 180 keep");
-        assert_eq!(Mark::decode("sq:0/1/9").seq, vec![("Sequence 1".into(), vec![[0.0, 1.0, 9.0]])], "unnamed: the first sequence");
-        let des = to_designations(&comps, &[m.clone()]).unwrap();
-        assert_eq!(from_designations(&des, &comps)[0], m);
-        let m = Mark { joint_offset: Some(0.375), ..Default::default() };
-        assert_eq!(m.encode(), "po:0.375");
-        assert_eq!(Mark::decode(&m.encode()), m);
-        let des = to_designations(&comps, &[m.clone()]).unwrap();
         assert_eq!(from_designations(&des, &comps)[0], m);
     }
 

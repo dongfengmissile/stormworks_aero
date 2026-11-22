@@ -67,12 +67,6 @@ pub struct Designations {
     pub widths: HashMap<[i32; 3], f64>,
     /// Propeller/rotor blade shape chosen by position: true propeller, false rotor (else auto).
     pub shapes: HashMap<[i32; 3], bool>,
-    /// Workbench joint angle, degrees, by the joint's parent half (`pose`).
-    pub joint_angles: HashMap<[i32; 3], f64>,
-    /// Workbench sliding joint offset, metres, by the joint's parent half (`pose`).
-    pub joint_offsets: HashMap<[i32; 3], f64>,
-    /// Mechanisms sequences and their moves (`marks::Mark::seq`) by the joint's parent half.
-    pub joint_seq: HashMap<[i32; 3], Vec<(String, Vec<[f64; 3]>)>>,
 }
 
 /// Whole wings: union of panels with face-adjacent cells (a wing and the surfaces hinged on it).
@@ -1186,8 +1180,9 @@ impl Model {
     /// bodies the same way. Workbench only: in flight the game poses the bodies.
     /// shortcut: interactions between panels, wing roots on the fuselage and the fuselage's
     /// sections stay as built (flight does the same with a swung wing).
-    pub fn posed(mut self, des: &Designations, lib: &mut Library) -> Model {
-        self.settings = crate::pose::joint_settings(&self.joints, &self.comps, &des.joint_angles, &des.joint_offsets);
+    /// `angles` (degrees) and `offsets` (metres) by the joint's parent half position.
+    pub fn posed(mut self, angles: &HashMap<[i32; 3], f64>, offsets: &HashMap<[i32; 3], f64>, lib: &mut Library) -> Model {
+        self.settings = crate::pose::joint_settings(&self.joints, &self.comps, angles, offsets);
         let n = crate::pose::body_count(&self.comps);
         self.settings = crate::pose::workbench_settings(&self.joints, &all_joint_links(&self.comps, lib), n, &self.settings).0;
         let poses = crate::pose::body_poses(&self.joints, n, &|i, _| self.settings[i]);
@@ -1801,10 +1796,8 @@ mod tests {
         assert_eq!(track.travel, (-0.5, 0.25), "the gap at z 3 ends the run");
         let piston = links.iter().find(|l| l.child == 2).unwrap();
         assert!(piston.slide && (piston.axis - v3(0.0, 0.0, -1.0)).len() < 1e-9 && piston.travel == (-0.5, 0.5), "{piston:?}");
-        let mut des = Designations::default();
-        des.joint_offsets.insert([0, 0, 0], 3.0);
-        des.joint_offsets.insert([10, 0, 0], -0.2);
-        let m = Model::build(comps, &mut lib, &des).posed(&des, &mut lib);
+        let offsets = HashMap::from([([0, 0, 0], 3.0), ([10, 0, 0], -0.2)]);
+        let m = Model::build(comps, &mut lib, &Designations::default()).posed(&HashMap::new(), &offsets, &mut lib);
         assert!((m.poses[1].trans - v3(-0.25, 0.0, 0.0)).len() < 1e-9, "clamped to the track's end: {:?}", m.poses[1]);
         assert!((m.poses[2].trans - v3(0.0, 0.0, 0.2)).len() < 1e-9, "piston pulled in 0.2 m: {:?}", m.poses[2]);
     }
@@ -1821,17 +1814,14 @@ mod tests {
         let cond = Cond { alpha: 5f64.to_radians(), beta: 0.0, rates: [0.0; 3], mach: 0.5, alt: 1000.0, pitch: 0.0, roll: 0.0, yaw: 0.0, flap: 0.0 };
         let c0 = flat.eval(&cond, &mut flat.fresh_stall());
         for deg in [-30.0, 30.0] {
-            let mut des = Designations::default();
-            for l in &swing {
-                des.joint_angles.insert(flat.comps[l.comp].pos, deg);
-            }
-            let m = build(&mut lib).posed(&des, &mut lib);
+            let angles: HashMap<[i32; 3], f64> = swing.iter().map(|l| (flat.comps[l.comp].pos, deg)).collect();
+            let m = build(&mut lib).posed(&angles, &HashMap::new(), &mut lib);
             let c = m.eval(&cond, &mut m.fresh_stall());
             eprintln!("{deg:+}°: com {:.3?} (was {:.3?}), CL {:.4} (was {:.4}), Cm {:.4} (was {:.4}), Croll {:.5} (was {:.5})", m.com, flat.com, c.cl, c0.cl, c.cm, c0.cm, c.croll, c0.croll);
             assert!((m.com.y - flat.com.y).abs() < 1e-6 && (m.com.x - flat.com.x).abs() > 1e-3, "CoM moves along, not across");
             assert!((c.cl - c0.cl).abs() > 1e-4 && (c.croll - c0.croll).abs() < 2e-4, "the lift changes, the roll does not");
         }
-        assert_eq!(build(&mut lib).posed(&Designations::default(), &mut lib).poses.len(), 0, "unposed stays as built");
+        assert_eq!(build(&mut lib).posed(&HashMap::new(), &HashMap::new(), &mut lib).poses.len(), 0, "unposed stays as built");
     }
 
     #[test]

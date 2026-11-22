@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/aero"]
+members = ["crates/core", "crates/aero", "crates/mechanisms"]
 # Standalone tools with their own lock files and targets.
 exclude = ["tools/uimock", "tools/wingsim"]
 

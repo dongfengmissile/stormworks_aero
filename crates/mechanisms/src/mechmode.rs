@@ -131,14 +131,14 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
     let lib = m
         .lib
         .get_or_insert_with(|| {
-            let (game, appdata) = crate::flight::PATHS.get().cloned().unwrap_or_default();
+            let (game, appdata) = crate::plugin::PATHS.get().cloned().unwrap_or_default();
             Arc::new(Mutex::new(Library::new(&game, &appdata)))
         })
         .clone();
     let ptrs = snap.ptrs.clone();
     let (building, done) = (m.building.clone(), m.done.clone());
     building.store(true, Ordering::Release);
-    let _ = std::thread::Builder::new().name("aero-mech".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("mechanisms".into()).spawn(move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _fault = crate::fault::enter(crate::fault::stage::ANALYSIS);
             let mut lib = lib.lock().unwrap_or_else(|p| p.into_inner());
@@ -199,7 +199,7 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
 }
 
 fn publish_pose(b: &Built) {
-    crate::editor::publish_pose_target(&b.report.tree, b.report.n_bodies, &b.report.settings);
+    crate::posing::publish_pose_target(&b.report.tree, b.report.n_bodies, &b.report.settings);
 }
 
 /// Red: parts in contact or stopping a joint; orange: the halves of a locked joint. Whether
@@ -246,18 +246,16 @@ pub(crate) fn draw_labels(ui: &imgui::Ui) {
     let Some(clip) = *crate::editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()) else { return };
     let size = ui.io().display_size;
     let mouse = ui.io().mouse_pos;
-    let proj = crate::view::Projection::from_clip(clip, size[0] as usize, size[1] as usize);
     let ndc = [(mouse[0] / size[0] * 2.0 - 1.0) as f64, (mouse[1] / size[1] * 2.0 - 1.0) as f64];
     let under = crate::mech::pick(&b.report.hulls, &b.report.poses, &clip, ndc).and_then(|c| b.report.joint_at(&b.comps, c as usize));
     let dl = ui.get_background_draw_list();
     let (pad, line) = (5.0, ui.text_line_height());
     let mut open = None;
     for l in &b.labels {
-        let (x, y, depth) = proj.project(l.at);
+        let (x, y, depth) = crate::ui::project(&clip, size[0], size[1], l.at);
         if depth <= 0.0 {
             continue;
         }
-        let (x, y) = (x as f32, y as f32);
         let col = colour(l.status);
         let short = l.text.lines().next().unwrap_or("");
         let at = [x + 14.0, y - line * 0.5 - pad];
@@ -368,7 +366,7 @@ pub(crate) fn draw_sequence(ui: &imgui::Ui) {
     }
     if posed {
         let settings = follow(&b, &mut s);
-        crate::editor::publish_pose_now(&b.report.tree, b.report.n_bodies, &settings);
+        crate::posing::publish_pose_now(&b.report.tree, b.report.n_bodies, &settings);
     } else {
         s.restart();
         if SEQ_POSED.load(Ordering::Relaxed) {
@@ -435,7 +433,7 @@ fn follow(b: &Built, s: &mut Seq) -> Vec<f64> {
 }
 
 /// The joint setting (`pose::body_poses`) for a value in the Workbench Angle's units.
-fn setting(j: &crate::model::JointLink, slide: bool, v: f64) -> f64 {
+fn setting(j: &crate::joints::JointLink, slide: bool, v: f64) -> f64 {
     (j.sign * if slide { v } else { v.to_radians() }).clamp(j.travel.0, j.travel.1)
 }
 
@@ -443,11 +441,11 @@ fn setting(j: &crate::model::JointLink, slide: bool, v: f64) -> f64 {
 fn highlight(ui: &imgui::Ui, name: &str, at: Option<crate::math::V3>) {
     let (Some(at), Some(clip)) = (at, *crate::editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner())) else { return };
     let size = ui.io().display_size;
-    let (x, y, depth) = crate::view::Projection::from_clip(clip, size[0] as usize, size[1] as usize).project(at);
+    let (x, y, depth) = crate::ui::project(&clip, size[0], size[1], at);
     if depth > 0.0 {
         let dl = ui.get_foreground_draw_list();
-        dl.add_circle([x as f32, y as f32], 16.0, [1.0, 0.85, 0.2, 1.0]).thickness(3.0).build();
-        dl.add_text([x as f32 + 20.0, y as f32 - 8.0], [1.0, 0.85, 0.2, 1.0], name);
+        dl.add_circle([x, y], 16.0, [1.0, 0.85, 0.2, 1.0]).thickness(3.0).build();
+        dl.add_text([x + 20.0, y - 8.0], [1.0, 0.85, 0.2, 1.0], name);
     }
 }
 

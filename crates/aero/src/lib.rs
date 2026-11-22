@@ -15,7 +15,6 @@ pub mod body;
 pub mod fx;
 pub mod fxwing;
 pub mod marks;
-pub mod mech;
 pub mod model;
 pub mod prop;
 pub mod settings;
@@ -45,11 +44,5 @@ mod plugin;
 mod watch;
 #[cfg(windows)]
 mod toolbar;
-#[cfg(windows)]
-mod mechmode;
-#[cfg(windows)]
-mod seqwin;
-#[cfg(windows)]
-mod sound;
 #[cfg(windows)]
 mod ui;

@@ -30,3 +30,7 @@ pub mod markhooks;
 pub mod offsets;
 #[cfg(windows)]
 pub mod paint;
+#[cfg(windows)]
+pub mod toolbar;
+#[cfg(windows)]
+pub mod plugin;

@@ -1,7 +1,7 @@
-Third-party software in StormworksAero.dll
-=========================================
+Third-party software in StormworksAero.dll and StormworksMechanisms.dll
+=======================================================================
 
-StormworksAero is GPLv3 (see LICENSE). It contains the following third-party code, under
+Both DLLs are GPLv3 (see LICENSE). They contain the following third-party code, under
 the licenses reproduced below. Crates offered under "MIT OR Apache-2.0" are used under MIT.
 
 ------------------------------------------------------------------------------

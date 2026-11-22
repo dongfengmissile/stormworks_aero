@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::defs::Library;
 use crate::math::{v3, V3};
-use crate::model::JointLink;
+use crate::joints::JointLink;
 use crate::pose::{body_poses, Pose};
 use crate::shape::{voxel_solid, Solid};
 use crate::vehicle::Comp;
@@ -798,9 +798,9 @@ pub enum Status {
 }
 
 impl Report {
-    pub fn new(comps: &[Comp], lib: &mut Library, des: &crate::model::Designations, check: bool) -> Report {
-        let tree = crate::model::joint_links(comps, lib);
-        let all = crate::model::all_joint_links(comps, lib);
+    pub fn new(comps: &[Comp], lib: &mut Library, des: &crate::marks::Designations, check: bool) -> Report {
+        let tree = crate::joints::joint_links(comps, lib);
+        let all = crate::joints::all_joint_links(comps, lib);
         let n_bodies = crate::pose::body_count(comps);
         let wanted = crate::pose::joint_settings(&tree, comps, &des.joint_angles, &des.joint_offsets);
         let (settings, _) = crate::pose::workbench_settings(&tree, &all, n_bodies, &wanted);
@@ -1033,7 +1033,7 @@ mod tests {
         let name = std::env::var("MECH_VEHICLE").unwrap_or_default();
         let Ok(text) = std::fs::read_to_string(appdata.join(format!("data/vehicles/{name}.xml"))) else { return };
         let comps = crate::vehicle::parse_vehicle_xml(&text);
-        let r = Report::new(&comps, &mut lib, &crate::model::Designations::default(), false);
+        let r = Report::new(&comps, &mut lib, &crate::marks::Designations::default(), false);
         for j in &r.tree {
             println!("tree {} {} -> {} free {} slide {} travel {:?}", comps[j.comp].def, j.parent, j.child, j.free, j.slide, j.travel);
         }
@@ -1053,7 +1053,7 @@ mod tests {
         let (mut lib, appdata) = crate::defs::test_library();
         let Ok(text) = std::fs::read_to_string(appdata.join("data/vehicles/piston crankshaft.xml")) else { return };
         let comps = crate::vehicle::parse_vehicle_xml(&text);
-        let r = Report::new(&comps, &mut lib, &crate::model::Designations::default(), false);
+        let r = Report::new(&comps, &mut lib, &crate::marks::Designations::default(), false);
         for j in &r.tree {
             println!("{} -> {} free {} sign {}", j.parent, j.child, j.free, j.sign);
         }
@@ -1078,7 +1078,7 @@ mod tests {
         let (mut lib, appdata) = crate::defs::test_library();
         let Ok(text) = std::fs::read_to_string(appdata.join("data/vehicles/m8a1.xml")) else { return };
         let comps = crate::vehicle::parse_vehicle_xml(&text);
-        let r = Report::new(&comps, &mut lib, &crate::model::Designations::default(), false);
+        let r = Report::new(&comps, &mut lib, &crate::marks::Designations::default(), false);
         // The game's slope table and the one the aero model infers from the stock blocks agree.
         for id in 1..=41 {
             let (g, a) = (cut_plane(id, &crate::vehicle::IDENTITY, &crate::vehicle::IDENTITY).unwrap(), lib.shapes.plane(id).unwrap());
@@ -1295,14 +1295,14 @@ mod tests {
                 continue;
             }
             let comps = crate::vehicle::parse_vehicle_xml(&std::fs::read_to_string(&f).unwrap_or_default());
-            let joints = crate::model::all_joint_links(&comps, &mut lib);
+            let joints = crate::joints::all_joint_links(&comps, &mut lib);
             if joints.is_empty() {
                 continue;
             }
             let n = crate::pose::body_count(&comps);
             {
                 // Loops close at the build pose already: closing them must not move anything.
-                let tree = crate::model::joint_links(&comps, &mut lib);
+                let tree = crate::joints::joint_links(&comps, &mut lib);
                 let mut s = vec![0.0; tree.len()];
                 let t = std::time::Instant::now();
                 crate::pose::close_loops(&tree, &joints, n, &mut s);
@@ -1311,7 +1311,7 @@ mod tests {
                 println!("loops {name}: {} loop joints, {free} free, moved {moved:.2e} in {} us", joints.len() - tree.len(), t.elapsed().as_micros());
                 assert!(moved < 1e-6, "{name}: closing its loops moved the build pose");
                 // Every joint gets its label.
-                let r = Report::new(&comps, &mut lib, &crate::model::Designations::default(), false);
+                let r = Report::new(&comps, &mut lib, &crate::marks::Designations::default(), false);
                 let lost: Vec<&str> = r.all.iter().filter(|j| r.joint_anchor(j).is_none()).map(|j| comps[j.comp].def.as_str()).collect();
                 assert!(lost.is_empty(), "{name}: no label place for {lost:?}");
                 let t = std::time::Instant::now();
@@ -1331,7 +1331,7 @@ mod tests {
             let locked = m.iter().filter(|m| matches!(m, Mobility::Locked { .. })).count();
             let t = std::time::Instant::now();
             let hulls = hulls(&comps, &mut lib);
-            let tree = crate::model::joint_links(&comps, &mut lib);
+            let tree = crate::joints::joint_links(&comps, &mut lib);
             let zero = vec![0.0; tree.len()];
             let th = t.elapsed().as_millis();
             let name_of = |c: u32| format!("{}@{:?}", comps[c as usize].def, comps[c as usize].pos);
@@ -1343,7 +1343,7 @@ mod tests {
                 lines.push(format!("    {} now {:?} | down {} ({}) | up {} ({}){}", name_of(tree[j].comp as u32), s.now.iter().map(|c| format!("{} vs {}", name_of(c.moving), name_of(c.other))).collect::<Vec<_>>(), unit(s.down.to), hit(&s.down), unit(s.up.to), hit(&s.up), if s.all_round { " all round" } else { "" }));
             }
             if only.is_some() {
-                let r = Report::new(&comps, &mut lib, &crate::model::Designations::default(), true);
+                let r = Report::new(&comps, &mut lib, &crate::marks::Designations::default(), true);
                 let named: Vec<String> = comps.iter().map(|c| lib.get(&c.def).map(|d| d.name.clone()).unwrap_or_default()).collect();
                 let names = |c: usize| named[c].clone();
                 for j in r.tree.iter().take(3) {

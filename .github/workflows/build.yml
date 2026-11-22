@@ -68,8 +68,9 @@ jobs:
         run: |
           mkdir -p package dist
           cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/StormworksAero.dll" package/
+          cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/StormworksMechanisms.dll" package/
           cd package
-          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll
+          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll StormworksMechanisms.dll
 
       - name: Upload build ZIP
         uses: actions/upload-artifact@v7
