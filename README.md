@@ -4,9 +4,9 @@ A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/5
 
 ## READ THIS FIRST
 
-stormworks-aero uses low-level techniques (DLL injection + function hooking) to extend the game, because there is no supported way to do it.
+stormworks-aero uses low-level techniques (a DLL loaded into the game + function hooking) to extend the game, because there is no supported way to do it.
 
-- No guarantees about stability. Every function the plugin hooks is verified against a known byte pattern first, and if it doesn't match (usually after a game update) that hook is skipped and the plugin says so in its log instead of patching blindly — but injection itself can still be a bad time.
+- No guarantees about stability. Every function the plugin hooks is verified against a known byte pattern first, and if it doesn't match (usually after a game update) that hook is skipped and the plugin says so in its log instead of patching blindly.
 - **Antivirus software might flag it.** Injecting into another process is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
 - It does not modify any game files on disk. Your designations are saved inside your vehicle files, as an extra `aero` attribute on each marked part, which the game without the plugin ignores. If you save a vehicle while the plugin is not loaded, its designations are lost.
 
@@ -28,15 +28,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Usage
 
-1. Start Stormworks.
-2. Inject `StormworksAero.dll` into `stormworks64.exe` — either with the bundled `aero_inject.exe` or any other DLL injector.
-
-On Linux, the game runs under Proton, so the injector has to run inside the same Proton prefix Steam created for Stormworks (573090) rather than a bare WINE prefix.
+1. Install the [proxy mod loader](https://github.com/dongfengmissile/stormworks_proxy_mod_loader): copy its `dbghelp.dll` next to `stormworks64.exe`. On Linux, set the game's launch options to `WINEDLLOVERRIDES="dbghelp=n,b" %command%`.
+2. Copy `StormworksAero.dll` into `<Stormworks>/Mods/`. It loads when the game starts.
 
 Logs go to:
 
 ```
-<Stormworks install>/logs/aero.log
+<Stormworks install>/Mods/logs/aero.log
 ```
 
 ## Keybindings

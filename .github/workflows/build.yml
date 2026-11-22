@@ -53,24 +53,23 @@ jobs:
         with:
           key: ${{ matrix.profile }}
 
-      - name: Build DLL and injector
+      - name: Build the DLLs
         env:
           PROFILE: ${{ matrix.profile }}
           FEATURES: ${{ matrix.features }}
         run: |
           cargo +stable build --locked --target x86_64-pc-windows-gnu \
-            --profile "$PROFILE" --features "$FEATURES" --lib --bin aero_inject
+            --profile "$PROFILE" --features "$FEATURES" --workspace --lib
 
-      - name: Package DLL and EXE only
+      - name: Package the DLLs only
         env:
           BUILD_DIRECTORY: ${{ matrix.directory }}
           ARCHIVE_NAME: ${{ matrix.archive }}
         run: |
           mkdir -p package dist
           cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/StormworksAero.dll" package/
-          cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/aero_inject.exe" package/
           cd package
-          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll aero_inject.exe
+          zip "../dist/$ARCHIVE_NAME" StormworksAero.dll
 
       - name: Upload build ZIP
         uses: actions/upload-artifact@v7
