@@ -19,6 +19,10 @@ pub(crate) static LABELS_SHOWN: AtomicBool = AtomicBool::new(true);
 static SHOWN: Mutex<Option<Arc<Built>>> = Mutex::new(None);
 /// The sequence window is open (Sequence toggle beside Check).
 pub(crate) static SEQ_OPEN: AtomicBool = AtomicBool::new(false);
+/// The Fixed tool is on: a click fixes the sub-grid under the mouse (`fix_click`).
+pub(crate) static FIXING: AtomicBool = AtomicBool::new(false);
+/// Shift is held (overlay frame), for the click on the game thread.
+pub(crate) static SHIFT: AtomicBool = AtomicBool::new(false);
 /// A sequence frame is shown instead of the workbench pose.
 static SEQ_POSED: AtomicBool = AtomicBool::new(false);
 /// The game's label icons (`toolbar::LABEL_ICONS`) as overlay textures, by name.
@@ -26,6 +30,7 @@ pub(crate) static ICONS: Mutex<Vec<(&'static str, imgui::TextureId)>> = Mutex::n
 
 const RED: [u8; 3] = [230, 32, 32];
 const ORANGE: [u8; 3] = [245, 150, 20];
+const BLUE: [u8; 3] = [50, 110, 230];
 
 struct Built {
     key: (u64, bool),
@@ -41,8 +46,9 @@ struct Built {
     lane_at: Vec<Option<crate::math::V3>>,
     /// `marks::GEN` when the marks were read.
     marks_gen: u64,
-    /// Each part's name.
+    /// Each part's name, and its component pointer (marks).
     names: Vec<String>,
+    ptrs: Vec<usize>,
 }
 
 
@@ -66,8 +72,8 @@ struct Mode {
     building: Arc<AtomicBool>,
     done: Arc<Mutex<Option<Arc<Built>>>>,
     built: Option<Arc<Built>>,
-    /// The build last painted, and whether it painted anything.
-    painted: Option<((u64, bool), bool)>,
+    /// The build last painted with the Fixed tool on or off, and whether it painted anything.
+    painted: Option<(((u64, bool), bool), bool)>,
 }
 
 static MODE: LazyLock<Mutex<Mode>> = LazyLock::new(Mutex::default);
@@ -115,8 +121,9 @@ pub(crate) fn on_tick(on: bool) {
     let Some(b) = m.built.clone() else { return };
     // Leaving Aero wings clears the paint after us (overlay frame): paint again then.
     let cleared = m.painted.is_some_and(|p| p.1) && crate::editor::PAINT.lock().unwrap_or_else(|p| p.into_inner()).is_none();
-    if m.painted.map(|p| p.0) != Some(b.key) || cleared {
-        m.painted = Some((b.key, paint(&b)));
+    let fixing = FIXING.load(Ordering::Relaxed);
+    if m.painted.map(|p| p.0) != Some((b.key, fixing)) || cleared {
+        m.painted = Some(((b.key, fixing), paint(&b, fixing)));
     }
     let mut shown = SHOWN.lock().unwrap_or_else(|p| p.into_inner());
     if shown.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &b)) {
@@ -136,6 +143,7 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
         })
         .clone();
     let ptrs = snap.ptrs.clone();
+    let all_ptrs = snap.ptrs.clone();
     let (building, done) = (m.building.clone(), m.done.clone());
     building.store(true, Ordering::Release);
     let _ = std::thread::Builder::new().name("mechanisms".into()).spawn(move || {
@@ -170,7 +178,7 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
                 .map(|(i, j)| {
                     let user = |g: f64| if j.slide { j.sign * g } else { (j.sign * g).to_degrees() };
                     // Where its loops let it go, so a move cannot ask for more.
-                    let reach = crate::pose::reach(&report.tree, &report.all, report.n_bodies, &report.settings, i);
+                    let reach = crate::pose::reach(&report.tree, &report.links, report.n_bodies, &report.settings, i);
                     let (a, z) = (user(reach.0), user(reach.1));
                     let n = &base_names[i];
                     let k = base_names[..i].iter().filter(|o| *o == n).count() + 1;
@@ -188,7 +196,7 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
                 .collect();
             let lane_ptr = report.tree.iter().map(|j| ptrs.get(j.comp).copied().unwrap_or(0)).collect();
             log_line(&format!("mechanisms: {} joints, {} hulls, checked {}, {} ms", report.all.len(), report.hulls.len(), key.1, t.elapsed().as_millis()));
-            Built { key, comps, cells, report, labels, lanes, lane_ptr, lane_at, marks_gen, names }
+            Built { key, comps, cells, report, labels, lanes, lane_ptr, lane_at, marks_gen, names, ptrs: all_ptrs }
         }));
         match r {
             Ok(b) => *done.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(b)),
@@ -202,12 +210,18 @@ fn publish_pose(b: &Built) {
     crate::posing::publish_pose_target(&b.report.tree, b.report.n_bodies, &b.report.settings);
 }
 
-/// Red: parts in contact or stopping a joint; orange: the halves of a locked joint. Whether
-/// anything is painted.
-fn paint(b: &Built) -> bool {
+/// Red: parts in contact or stopping a joint; orange: the halves of a locked joint; with the
+/// Fixed tool on, blue: the fixed sub-grids. Whether anything is painted.
+fn paint(b: &Built, fixing: bool) -> bool {
     let mut per_body: Vec<crate::paint::VoxelColours> = Vec::new();
-    for (c, status) in b.report.paint() {
-        let col = crate::paint::rgba(if status == Status::Locked { ORANGE } else { RED });
+    let fixed = (0..b.comps.len()).filter(|&c| fixing && b.report.fixed.get(b.comps[c].body as usize) == Some(&true)).map(|c| (c as u32, None));
+    let status = b.report.paint().into_iter().map(|(c, s)| (c, Some(s)));
+    for (c, status) in fixed.chain(status).collect::<Vec<_>>() {
+        let col = crate::paint::rgba(match status {
+            None => BLUE,
+            Some(Status::Locked) => ORANGE,
+            Some(_) => RED,
+        });
         let body = b.comps[c as usize].body as usize;
         if per_body.len() <= body {
             per_body.resize_with(body + 1, Default::default);
@@ -228,9 +242,99 @@ fn paint(b: &Built) -> bool {
             }
         }
     }
-    let key = b.key.0 ^ (b.key.1 as u64) << 63 ^ 0x6d65_6368;
+    let key = b.key.0 ^ (b.key.1 as u64) << 63 ^ (fixing as u64) << 62 ^ 0x6d65_6368;
     *crate::editor::PAINT.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, per_body.into_iter().map(Arc::new).collect(), Arc::default()));
     true
+}
+
+/// The sub-grid under the mouse with the Fixed tool on, if any: its body and the part.
+fn fix_target(b: &Built, at: [f64; 2]) -> Option<(usize, usize)> {
+    let clip = (*crate::editor::WORLD_CLIP.lock().unwrap_or_else(|p| p.into_inner()))?;
+    let c = crate::mech::pick(&b.report.hulls, &b.report.poses, &clip, at)? as usize;
+    Some((b.comps.get(c)?.body as usize, c))
+}
+
+/// The bodies joined to `body` through joints (its group), itself included.
+fn group(r: &Report, body: usize) -> Vec<usize> {
+    let mut g = vec![body];
+    let mut k = 0;
+    while let Some(&b) = g.get(k) {
+        for l in &r.all {
+            for (x, y) in [(l.parent, l.child), (l.child, l.parent)] {
+                if x == b && !g.contains(&y) {
+                    g.push(y);
+                }
+            }
+        }
+        k += 1;
+    }
+    g
+}
+
+/// A click with the Fixed tool (game thread, view position −1..1): the sub-grid under it becomes
+/// its group's only fixed one; with Shift, it is fixed as well, or freed if another stays fixed.
+pub(crate) fn fix_click(at: [f32; 2]) {
+    let Some(b) = SHOWN.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+    let Some((body, part)) = fix_target(&b, [at[0] as f64, at[1] as f64]) else { return };
+    let r = &b.report;
+    let g = group(r, body);
+    if g.len() < 2 {
+        return crate::sound::error(); // nothing jointed to it: it stays put anyway
+    }
+    let ptr = |c: usize| b.ptrs.get(c).copied().unwrap_or(0);
+    let set = |c: usize, on: bool| {
+        let mut m = crate::marks::get(ptr(c)).unwrap_or_default();
+        if m.fixed != on && ptr(c) != 0 {
+            m.fixed = on;
+            crate::marks::set(ptr(c), Some(m), true);
+        }
+    };
+    let on_body = |o: usize| (0..b.comps.len()).filter(|&c| b.comps[c].body as usize == o).collect::<Vec<_>>();
+    let fixed = |o: usize| r.fixed.get(o) == Some(&true);
+    if SHIFT.load(Ordering::Relaxed) {
+        if fixed(body) && !g.iter().any(|&o| o != body && fixed(o)) {
+            return crate::sound::error(); // one sub-grid of each group stays fixed
+        }
+        // The group's fixed sub-grids marked, so a default one stays fixed beside the new one.
+        for &o in g.iter().filter(|&&o| o != body && fixed(o)) {
+            let cs = on_body(o);
+            if !cs.iter().any(|&c| crate::marks::get(ptr(c)).is_some_and(|m| m.fixed)) {
+                cs.first().map(|&c| set(c, true));
+            }
+        }
+        if fixed(body) {
+            on_body(body).into_iter().for_each(|c| set(c, false));
+        } else {
+            set(part, true);
+        }
+    } else {
+        for &o in &g {
+            on_body(o).into_iter().for_each(|c| set(c, c == part));
+        }
+    }
+}
+
+/// With the Fixed tool on: what a click on the sub-grid under the mouse would do (overlay frame).
+pub(crate) fn draw_fix_hint(ui: &imgui::Ui) {
+    if !FIXING.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(b) = SHOWN.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+    let (size, mouse) = (ui.io().display_size, ui.io().mouse_pos);
+    let ndc = [(mouse[0] / size[0] * 2.0 - 1.0) as f64, (mouse[1] / size[1] * 2.0 - 1.0) as f64];
+    let Some((body, _)) = fix_target(&b, ndc) else { return };
+    let text = if group(&b.report, body).len() < 2 {
+        "No joints: stays put"
+    } else if b.report.fixed.get(body) == Some(&true) {
+        "Fixed: stays put\nShift-click to free it"
+    } else {
+        "Click: hold this still instead\nShift-click: hold it still as well"
+    };
+    let (pad, at) = (5.0, [mouse[0] + 18.0, mouse[1] + 18.0]);
+    let t = ui.calc_text_size(text);
+    let dl = ui.get_foreground_draw_list();
+    dl.add_rect(at, [at[0] + t[0] + 2.0 * pad, at[1] + t[1] + 2.0 * pad], [0.08, 0.08, 0.09, 0.9]).filled(true).rounding(4.0).build();
+    dl.add_text([at[0] + pad, at[1] + pad], [0.95, 0.95, 0.95, 1.0], text);
 }
 
 /// Each joint's label: at the joint, one line; over it (or over a part it moves), everything.

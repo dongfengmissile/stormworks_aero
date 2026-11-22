@@ -15,10 +15,12 @@ const MECH_ID: i32 = 260;
 const ID_CHECK: i32 = 261;
 const ID_LABELS: i32 = 263;
 const ID_SEQ: i32 = 264;
+const ID_FIXED: i32 = 265;
 
 static MECH_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static LABELS_BTN: AtomicUsize = AtomicUsize::new(0);
 static SEQ_BTN: AtomicUsize = AtomicUsize::new(0);
+static FIXED_BTN: AtomicUsize = AtomicUsize::new(0);
 /// The side shelf and the toolbar it was built for (game thread).
 static SHELF: Mutex<(usize, usize)> = Mutex::new((0, 0));
 static MECH_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -39,6 +41,7 @@ unsafe fn append(f: &Fns, toolbar: usize, shelf: usize, ctx: usize) {
 unsafe fn event(editor: usize, i: i32) {
     match i {
         ID_SEQ => _ = crate::mechmode::SEQ_OPEN.fetch_xor(true, Ordering::Relaxed),
+        ID_FIXED => _ = crate::mechmode::FIXING.fetch_xor(true, Ordering::Relaxed),
         ID_LABELS => _ = crate::mechmode::LABELS_SHOWN.fetch_xor(true, Ordering::Relaxed),
         ID_CHECK => crate::mechmode::CHECK_REQ.store(true, Ordering::Relaxed),
         MECH_ID => mode_clicked(editor, MECH_BUTTON.load(Ordering::SeqCst)),
@@ -46,7 +49,11 @@ unsafe fn event(editor: usize, i: i32) {
     }
 }
 
-unsafe fn click(_editor: usize, _at: [f32; 2]) {}
+unsafe fn click(_editor: usize, at: [f32; 2]) {
+    if mech_active() && crate::mechmode::FIXING.load(Ordering::Relaxed) {
+        crate::mechmode::fix_click(at);
+    }
+}
 
 /// Editor tick (game thread): the shelf and the mode.
 unsafe fn tick(f: &Fns, editor: usize, bar: Option<(usize, usize)>) {
@@ -60,16 +67,18 @@ unsafe fn tick(f: &Fns, editor: usize, bar: Option<(usize, usize)>) {
     // Built once per interface (a child of it, freed with it), shown with the mode.
     if sh.0 != toolbar {
         let game = crate::plugin::PATHS.get().map(|p| p.0.clone()).unwrap_or_default();
-        let icons = ["warning", "action_tick"].into_iter().filter_map(|n| Some((n, atlas_of(f, ctx, n)?.1, icon_uv(&game, n)?))).collect();
+        let icons = ["warning", "action_tick", "padlock"].into_iter().filter_map(|n| Some((n, atlas_of(f, ctx, n)?.1, icon_uv(&game, n)?))).collect();
         *LABEL_ICONS.lock().unwrap_or_else(|p| p.into_inner()) = icons;
         let actions = [
             ("cube_wrench", "Check", "Sweep every free joint through its travel and find what each sub-grid hits first. Results then follow every change while the mode is on.", ID_CHECK, false),
             ("warning", "Labels", "Show each joint's result beside it. Point at a label, or at a part the joint moves, for the details.", ID_LABELS, true),
+            ("padlock", "Fixed", "Choose what stays put: click a part, and its sub-grid holds still while the joints move the rest about it. Shift-click to fix more than one, or to free one again. Fixed sub-grids show blue.", ID_FIXED, true),
             ("playlist", "Sequence", "Open the sequence timeline: move joints one after another (a door opens, then the gear comes down) and play it.", ID_SEQ, true),
         ];
         let (shelf, btns) = build_shelf(f, iface, ctx, 0.0, &[], 0, 0, &actions);
         LABELS_BTN.store(btns.get(1).copied().unwrap_or(0), Ordering::SeqCst);
-        SEQ_BTN.store(btns.get(2).copied().unwrap_or(0), Ordering::SeqCst);
+        FIXED_BTN.store(btns.get(2).copied().unwrap_or(0), Ordering::SeqCst);
+        SEQ_BTN.store(btns.get(3).copied().unwrap_or(0), Ordering::SeqCst);
         *sh = (toolbar, shelf);
         log_line(&format!("toolbar: Mechanisms shelf built {shelf:#x}"));
     }
@@ -80,6 +89,7 @@ unsafe fn tick(f: &Fns, editor: usize, bar: Option<(usize, usize)>) {
     }
     set_lit(LABELS_BTN.load(Ordering::SeqCst), crate::mechmode::LABELS_SHOWN.load(Ordering::Relaxed));
     set_lit(SEQ_BTN.load(Ordering::SeqCst), crate::mechmode::SEQ_OPEN.load(Ordering::Relaxed));
+    set_lit(FIXED_BTN.load(Ordering::SeqCst), crate::mechmode::FIXING.load(Ordering::Relaxed));
     if MECH_ACTIVE.swap(on, Ordering::Relaxed) != on {
         log_line(&format!("toolbar: Mechanisms mode {}", if on { "on" } else { "off" }));
     }

@@ -48,7 +48,7 @@ pub fn track_travel(pos: [i32; 3], z: [i32; 3], is_ext: impl Fn([i32; 3]) -> boo
 /// its definition names, on another body. A body reached twice (a sub-grid held by two pivots)
 /// keeps its first joint. Sorted so every parent body is placed before the bodies it carries.
 pub fn joint_links(comps: &[Comp], lib: &mut Library) -> Vec<JointLink> {
-    tree_links(all_joint_links(comps, lib), comps)
+    tree_links(all_joint_links(comps, lib), comps, &[])
 }
 
 /// Every joint of the vehicle in part order, loops and second joints on one sub-grid included
@@ -106,14 +106,15 @@ pub fn all_joint_links(comps: &[Comp], lib: &mut Library) -> Vec<JointLink> {
 }
 
 /// The joints that place each sub-grid, parents first, grown out from the fixed body of each
-/// group of jointed bodies (the lowest-numbered one no joint carries). A joint is taken either
+/// group of jointed bodies: the first of `fixed` in it (the user's choice), else the
+/// lowest-numbered one no joint carries. Other `fixed` bodies of a group are held by `welds`. A joint is taken either
 /// way round: a sub-grid that only carries the other half (a piston whose pivot's parent half
 /// sits on it) hangs from the sub-grid it is joined to. Driven joints are taken first, so free
 /// joints are the ones left to close loops.
-pub fn tree_links(all: Vec<JointLink>, comps: &[Comp]) -> Vec<JointLink> {
+pub fn tree_links(all: Vec<JointLink>, comps: &[Comp], fixed: &[usize]) -> Vec<JointLink> {
     let n = comps.iter().map(|c| c.body as usize + 1).max().unwrap_or(1).max(all.iter().map(|l| l.parent.max(l.child) + 1).max().unwrap_or(0));
     let carried: HashSet<usize> = all.iter().map(|l| l.child).collect();
-    let roots: Vec<usize> = (0..n).filter(|b| !carried.contains(b)).chain(0..n).collect();
+    let roots: Vec<usize> = fixed.iter().copied().filter(|&b| b < n).chain((0..n).filter(|b| !carried.contains(b))).chain(0..n).collect();
     let mut placed = vec![false; n];
     let mut used = vec![false; all.len()];
     let mut out = Vec::with_capacity(all.len());
@@ -137,6 +138,29 @@ pub fn tree_links(all: Vec<JointLink>, comps: &[Comp]) -> Vec<JointLink> {
             placed[l.child] = true;
             out.push(l);
         }
+    }
+    out
+}
+
+/// `JointLink::comp` of a weld (`welds`): no part.
+pub const WELD: usize = usize::MAX;
+
+/// For each body of `fixed` that `tree` places (a second fixed body in one group): a slide with
+/// no travel from its group's fixed body, which keeps it where it was built. Loops for
+/// `pose::settle` and the mobility check, beside `all_joint_links`; `comp` is `WELD`.
+pub fn welds(tree: &[JointLink], fixed: &[usize]) -> Vec<JointLink> {
+    let up = |b: usize| tree.iter().find(|l| l.child == b);
+    let mut out: Vec<JointLink> = Vec::new();
+    for &b in fixed {
+        let Some(l) = up(b) else { continue };
+        if out.iter().any(|w| w.child == b) {
+            continue;
+        }
+        let mut root = l.parent;
+        while let Some(p) = up(root) {
+            root = p.parent;
+        }
+        out.push(JointLink { comp: WELD, half: WELD, parent: root, child: b, sign: 1.0, slide: true, travel: (0.0, 0.0), free: true, settle: V3::ZERO, ..l.clone() });
     }
     out
 }

@@ -19,6 +19,8 @@ pub struct Mark {
     /// The sequences this joint is in, by name, with its moves in each: start (s), duration (s),
     /// target (degrees, or metres for a sliding joint), from the workbench pose.
     pub seq: Vec<(String, Vec<[f32; 3]>)>,
+    /// The part's sub-grid stays put in the Mechanisms mode; the joints move the rest about it.
+    pub fixed: bool,
     /// Tokens this version does not know (a newer plugin's), written back unchanged.
     pub other: Vec<String>,
 }
@@ -36,7 +38,7 @@ impl Mark {
     }
 
     /// Attribute value: space-separated `pa:<degrees>`, `po:<metres>`,
-    /// `sq:<name>@<start>/<duration>/<target>;...` (one per sequence, `_` for spaces).
+    /// `sq:<name>@<start>/<duration>/<target>;...` (one per sequence, `_` for spaces), `fx` (fixed).
     pub fn encode(&self) -> String {
         let mut t: Vec<String> = Vec::new();
         t.extend(self.joint_angle.map(|a| format!("pa:{a:.1}")));
@@ -44,6 +46,9 @@ impl Mark {
         for (name, moves) in &self.seq {
             let moves: Vec<String> = moves.iter().map(|[s, d, v]| format!("{s:.2}/{d:.2}/{v:.2}")).collect();
             t.push(format!("sq:{}@{}", seq_name(name).replace(' ', "_"), moves.join(";")));
+        }
+        if self.fixed {
+            t.push("fx".into());
         }
         t.extend(self.other.iter().cloned());
         t.join(" ")
@@ -53,6 +58,10 @@ impl Mark {
     pub fn decode(s: &str) -> Mark {
         let mut m = Mark::default();
         for tok in s.split_whitespace() {
+            if tok == "fx" {
+                m.fixed = true;
+                continue;
+            }
             match tok.split_once(':') {
                 Some(("pa", v)) => m.joint_angle = v.parse::<f32>().ok().filter(|a| a.is_finite()).map(|a| a.clamp(JOINT_ANGLE_RANGE.0, JOINT_ANGLE_RANGE.1)),
                 Some(("po", v)) => m.joint_offset = v.parse::<f32>().ok().filter(|o| o.is_finite()).map(|o| o.clamp(JOINT_OFFSET_RANGE.0, JOINT_OFFSET_RANGE.1)),
@@ -94,6 +103,8 @@ pub struct Designations {
     pub joint_offsets: HashMap<[i32; 3], f64>,
     /// Sequences and their moves (`Mark::seq`).
     pub joint_seq: HashMap<[i32; 3], Vec<(String, Vec<[f64; 3]>)>>,
+    /// Parts whose sub-grid stays put (`Mark::fixed`).
+    pub fixed: std::collections::HashSet<[i32; 3]>,
 }
 
 pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Designations {
@@ -104,6 +115,9 @@ pub fn to_designations(comps: &[Comp], marks: &[Mark]) -> Designations {
         }
         if let Some(o) = m.joint_offset {
             d.joint_offsets.insert(c.pos, o as f64);
+        }
+        if m.fixed {
+            d.fixed.insert(c.pos);
         }
         if !m.seq.is_empty() {
             d.joint_seq.insert(c.pos, m.seq.iter().map(|(n, mv)| (n.clone(), mv.iter().map(|s| s.map(|x| x as f64)).collect())).collect());
@@ -143,6 +157,9 @@ mod tests {
         assert_eq!(Mark::decode("sq:a@1/2;x/1/2;0/1/9").seq, vec![("a".into(), vec![[0.0, 1.0, 9.0]])], "bad moves are skipped");
         assert_eq!(Mark::decode(&Mark { seq: vec![("Spin".into(), vec![[0.0, 2.0, 720.0]])], ..Default::default() }.encode()).seq[0].1, vec![[0.0, 2.0, 720.0]], "turns past 180 keep");
         assert_eq!(Mark::decode("sq:0/1/9").seq, vec![("Sequence 1".into(), vec![[0.0, 1.0, 9.0]])], "unnamed: the first sequence");
+        let m = Mark { fixed: true, joint_angle: Some(5.0), ..Default::default() };
+        assert_eq!(m.encode(), "pa:5.0 fx");
+        assert_eq!(Mark::decode(&m.encode()), m);
         let m = Mark { joint_offset: Some(0.375), ..Default::default() };
         assert_eq!(m.encode(), "po:0.375");
         assert_eq!(Mark::decode(&m.encode()), m);

@@ -25,12 +25,13 @@ pub enum Mobility {
 /// the bodies at `poses` (empty: as built). The first body of each group of jointed bodies stays
 /// put; the check is on velocities (instantaneous), so it holds at this pose only.
 pub fn mobility(joints: &[JointLink], n_bodies: usize, poses: &[Pose]) -> Vec<Mobility> {
-    mobility_basis(joints, n_bodies, poses).0
+    mobility_basis(joints, n_bodies, poses, None).0
 }
 
 /// `mobility`, with the motions the joints allow (a basis, 6 twist values per moving body) and
-/// each body's first column in them (None: a fixed body).
-fn mobility_basis(joints: &[JointLink], n_bodies: usize, poses: &[Pose]) -> (Vec<Mobility>, Vec<Vec<f64>>, Vec<Option<usize>>) {
+/// each body's first column in them (None: a fixed body). `fixed`: the bodies that stay put, else
+/// the first of each group.
+fn mobility_basis(joints: &[JointLink], n_bodies: usize, poses: &[Pose], held: Option<&[bool]>) -> (Vec<Mobility>, Vec<Vec<f64>>, Vec<Option<usize>>) {
     let pose = |b: usize| poses.get(b).copied().unwrap_or(Pose::IDENTITY);
     let fixed = |j: &JointLink| j.slide && j.travel.1 - j.travel.0 < 1e-9;
     // One fixed body per group of jointed bodies: the lowest-numbered one no joint carries.
@@ -57,7 +58,8 @@ fn mobility_basis(joints: &[JointLink], n_bodies: usize, poses: &[Pose]) -> (Vec
     let mut col = vec![None; n_bodies];
     let mut n = 0;
     for (b, c) in col.iter_mut().enumerate() {
-        if anchor[root(&mut group, b)] != b {
+        let held = held.map_or(anchor[root(&mut group, b)] == b, |f| f.get(b).copied().unwrap_or(false));
+        if !held {
             *c = Some(n);
             n += 6;
         }
@@ -103,6 +105,10 @@ fn mobility_basis(joints: &[JointLink], n_bodies: usize, poses: &[Pose]) -> (Vec
             if fixed(j) {
                 return Mobility::Fixed;
             }
+            // Between two fixed bodies (both chosen fixed).
+            if j.parent != j.child && [j.parent, j.child].iter().all(|&b| col.get(b).is_some_and(|c| c.is_none())) {
+                return Mobility::Locked { by: loop_mates(joints, i) };
+            }
             let (q, a, _, _) = frame(j);
             let rate = if j.slide { shift(j, q, a) } else { turn(j, a) };
             let size = rate.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -122,9 +128,9 @@ fn mobility_basis(joints: &[JointLink], n_bodies: usize, poses: &[Pose]) -> (Vec
 
 /// Each body's mechanism (`usize::MAX` for a fixed body): the bodies joined to each other, not
 /// through a fixed one (each door, each landing gear, a crank with its rod and piston). Fixed
-/// bodies are the ones `tree` places nothing on.
+/// bodies are the ones `tree` places nothing on, and the ones welded (`joints::welds`).
 pub fn mechanisms(tree: &[JointLink], all: &[JointLink], n_bodies: usize) -> Vec<usize> {
-    let moving: Vec<bool> = (0..n_bodies).map(|b| tree.iter().any(|j| j.child == b)).collect();
+    let moving: Vec<bool> = fixed_bodies(tree, all, n_bodies).into_iter().map(|f| !f).collect();
     let mut up: Vec<usize> = (0..n_bodies).collect();
     fn root(g: &mut [usize], b: usize) -> usize {
         if g[b] != b {
@@ -140,6 +146,11 @@ pub fn mechanisms(tree: &[JointLink], all: &[JointLink], n_bodies: usize) -> Vec
     (0..n_bodies)
         .map(|b| if moving[b] { let r = root(&mut up, b); let n = ids.len(); *ids.entry(r).or_insert(n) } else { usize::MAX })
         .collect()
+}
+
+/// The bodies that stay put: those `tree` places nothing on and those `all` welds.
+pub fn fixed_bodies(tree: &[JointLink], all: &[JointLink], n_bodies: usize) -> Vec<bool> {
+    (0..n_bodies).map(|b| !tree.iter().any(|j| j.child == b) || all.iter().any(|j| j.comp == crate::joints::WELD && j.child == b)).collect()
 }
 
 /// Degrees of freedom of each mechanism (`mech_of`, `mechanisms`) in a basis of allowed motions.
@@ -162,7 +173,8 @@ fn dofs(basis: &[Vec<f64>], col: &[Option<usize>], mech_of: &[usize], n_mech: us
 pub fn mobility_near(tree: &[JointLink], all: &[JointLink], n_bodies: usize, settings: &[f64]) -> (Vec<Mobility>, Vec<usize>) {
     let mech_of = mechanisms(tree, all, n_bodies);
     let n_mech = mech_of.iter().filter(|&&m| m != usize::MAX).max().map_or(0, |m| m + 1);
-    let (mut m, basis, col) = mobility_basis(all, n_bodies, &body_poses(tree, n_bodies, &|i, _| settings[i]));
+    let fixed = fixed_bodies(tree, all, n_bodies);
+    let (mut m, basis, col) = mobility_basis(all, n_bodies, &body_poses(tree, n_bodies, &|i, _| settings[i]), Some(&fixed));
     let mut dof = dofs(&basis, &col, &mech_of, n_mech);
     let loops: Vec<usize> = all.iter().filter(|l| !tree.iter().any(|t| t.comp == l.comp)).flat_map(|l| [l.parent, l.child]).collect();
     let on_loop = crate::pose::above(tree, loops.iter().copied());
@@ -184,7 +196,7 @@ pub fn mobility_near(tree: &[JointLink], all: &[JointLink], n_bodies: usize, set
                 continue; // cannot move that way: the loop does not close
             }
             moves[t] = true;
-            let (there, basis, col) = mobility_basis(all, n_bodies, &body_poses(tree, n_bodies, &|i, _| s[i]));
+            let (there, basis, col) = mobility_basis(all, n_bodies, &body_poses(tree, n_bodies, &|i, _| s[i]), Some(&fixed));
             for (a, b) in m.iter_mut().zip(there) {
                 if b == Mobility::Free {
                     *a = Mobility::Free;
@@ -672,7 +684,7 @@ impl Settler {
         };
         let free_moved = carried(&|i| tree[i].free);
         // Pairs of bodies joined to each other: a free joint lets those sink into each other.
-        let joined: std::collections::HashSet<(usize, usize)> = r.all.iter().flat_map(|j| [(j.parent, j.child), (j.child, j.parent)]).collect();
+        let joined: std::collections::HashSet<(usize, usize)> = r.links.iter().flat_map(|j| [(j.parent, j.child), (j.child, j.parent)]).collect();
         // Hull pairs near each other, one of them on a `moved` body.
         let pairs = |s: &[f64], moved: &[bool]| -> Vec<(usize, usize)> {
             let poses = body_poses(tree, r.n_bodies, &|i, _| s[i]);
@@ -741,9 +753,9 @@ impl Settler {
                     (free_moved[a] || free_moved[b]) && !joined.contains(&(a, b))
                 })
                 .collect();
-            let loops = r.all.iter().filter(|l| !tree.iter().any(|t| t.comp == l.comp)).flat_map(|l| [l.parent, l.child]);
+            let loops = r.links.iter().filter(|l| !tree.iter().any(|t| t.comp == l.comp)).flat_map(|l| [l.parent, l.child]);
             let free = crate::pose::free_above(tree, loops.chain(push.iter().flat_map(|&(i, k)| [r.hulls[i].body, r.hulls[k].body])));
-            let e = crate::pose::settle(tree, &r.all, r.n_bodies, s, &free, &|p, out| out.extend(push.iter().map(|&pk| depth(p, pk).max(0.0))));
+            let e = crate::pose::settle(tree, &r.links, r.n_bodies, s, &free, &|p, out| out.extend(push.iter().map(|&pk| depth(p, pk).max(0.0))));
             if e > crate::pose::JAM {
                 hit = None;
                 return e;
@@ -772,6 +784,10 @@ pub struct Report {
     /// Posing joints (`model::joint_links`) and every joint (`model::all_joint_links`).
     pub tree: Vec<JointLink>,
     pub all: Vec<JointLink>,
+    /// `all` and the welds holding a group's other fixed bodies (`joints::welds`): what the
+    /// solver closes. Per body: it stays put (`fixed_bodies`).
+    pub links: Vec<JointLink>,
+    pub fixed: Vec<bool>,
     pub n_bodies: usize,
     /// Each posing joint's workbench setting, where its loops let it get to it (`settings`), and
     /// the bodies posed by them.
@@ -799,16 +815,23 @@ pub enum Status {
 
 impl Report {
     pub fn new(comps: &[Comp], lib: &mut Library, des: &crate::marks::Designations, check: bool) -> Report {
-        let tree = crate::joints::joint_links(comps, lib);
         let all = crate::joints::all_joint_links(comps, lib);
+        // The sub-grids the user fixed (a part of each marked), lowest first.
+        let mut chosen: Vec<usize> = comps.iter().filter(|c| des.fixed.contains(&c.pos)).map(|c| c.body as usize).collect();
+        chosen.sort_unstable();
+        chosen.dedup();
+        let tree = crate::joints::tree_links(all.clone(), comps, &chosen);
+        let links: Vec<JointLink> = all.iter().cloned().chain(crate::joints::welds(&tree, &chosen)).collect();
         let n_bodies = crate::pose::body_count(comps);
+        let fixed = fixed_bodies(&tree, &links, n_bodies);
         let wanted = crate::pose::joint_settings(&tree, comps, &des.joint_angles, &des.joint_offsets);
-        let (settings, _) = crate::pose::workbench_settings(&tree, &all, n_bodies, &wanted);
+        let (settings, _) = crate::pose::workbench_settings(&tree, &links, n_bodies, &wanted);
         let poses = body_poses(&tree, n_bodies, &|i, _| settings[i]);
-        let (mobility, dof) = mobility_near(&tree, &all, n_bodies, &settings);
-        let mech_of = mechanisms(&tree, &all, n_bodies);
+        let (mut mobility, dof) = mobility_near(&tree, &links, n_bodies, &settings);
+        mobility.truncate(all.len());
+        let mech_of = mechanisms(&tree, &links, n_bodies);
         let hulls = hulls(comps, lib);
-        let mut r = Report { tree, all, n_bodies, wanted, settings, poses, mobility, mech_of, dof, hulls, sweeps: None };
+        let mut r = Report { tree, all, links, fixed, n_bodies, wanted, settings, poses, mobility, mech_of, dof, hulls, sweeps: None };
         if check {
             r.sweeps = Some((0..r.tree.len()).map(|t| r.sweepable(t).then(|| sweep(&r.tree, t, &r.settings, r.n_bodies, &r.hulls))).collect());
         }
@@ -1114,6 +1137,32 @@ mod tests {
     }
 
     #[test]
+    fn chosen_fixed_body_holds_still() {
+        // A swing wing: the wing is body 0, the fuselage body 1 on a driven pivot.
+        let z = v3(0.0, 0.0, 1.0);
+        let all = vec![hinge(0, 1, v3(1.0, 0.0, 0.0), z)];
+        let tree = crate::joints::tree_links(all.clone(), &[], &[1]);
+        assert_eq!((tree[0].parent, tree[0].child), (1, 0), "grown from the fuselage");
+        // An input of 0.5 (`joint_settings`: its sign times the input) turns the wing −0.5 about the fuselage.
+        let p = body_poses(&tree, 2, &|_, l| l.sign * all[0].sign * 0.5);
+        assert_eq!(p[1], Pose::IDENTITY);
+        let wing = Pose::turn(z, v3(1.0, 0.0, 0.0), -0.5);
+        assert!((p[0].apply(v3(3.0, 2.0, 0.0)) - wing.apply(v3(3.0, 2.0, 0.0))).len() < 1e-9, "the same input turns the wing the other way");
+        assert!(crate::joints::welds(&tree, &[1]).is_empty());
+        let (m, dof) = mobility_near(&tree, &all, 2, &[0.0]);
+        assert_eq!((m, dof), (vec![Mobility::Free], vec![1]));
+        // Both fixed: the pivot cannot move.
+        let tree = crate::joints::tree_links(all.clone(), &[], &[0, 1]);
+        let links = [all.clone(), crate::joints::welds(&tree, &[0, 1])].concat();
+        assert_eq!(links.len(), 2);
+        assert!(fixed_bodies(&tree, &links, 2).iter().all(|&f| f));
+        let (m, _) = mobility_near(&tree, &links, 2, &[0.0]);
+        assert!(matches!(m[0], Mobility::Locked { .. }), "{m:?}");
+        let (s, stuck) = crate::pose::workbench_settings(&tree, &links, 2, &[0.5]);
+        assert!(stuck && s[0].abs() < 0.01, "{s:?}");
+    }
+
+    #[test]
     fn stretched_linkage_is_rigid() {
         // "2 link mechanism": links of 1 m and 0.75 m between pivots 1.75 m apart, in line.
         let x = v3(1.0, 0.0, 0.0);
@@ -1199,7 +1248,7 @@ mod tests {
                 hulls.push(Hull::from_solid(2, 0, &cube(v3(1.0 + 0.25 * k as f64, y, 0.0))));
             }
         }
-        let r = Report { all: tree.clone(), tree, n_bodies: 4, wanted: vec![0.0; 3], settings: vec![0.0; 3], poses: Vec::new(), mobility: Vec::new(), mech_of: Vec::new(), dof: Vec::new(), hulls, sweeps: None };
+        let r = Report { all: tree.clone(), links: tree.clone(), fixed: vec![true, false, false, false], tree, n_bodies: 4, wanted: vec![0.0; 3], settings: vec![0.0; 3], poses: Vec::new(), mobility: Vec::new(), mech_of: Vec::new(), dof: Vec::new(), hulls, sweeps: None };
         let mut st = Settler::default();
         let s = st.frame(&r, &[FRAC_PI_2, 0.0, 0.0]);
         let p = body_poses(&r.tree, 4, &|i, _| s[i]);
