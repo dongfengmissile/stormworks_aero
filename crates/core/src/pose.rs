@@ -2,7 +2,9 @@
 //! about (or slides along) the joint's axis, after the body carrying it has been placed.
 
 use crate::math::{v3, V3};
-use crate::model::{Designations, JointLink};
+use std::collections::HashMap;
+
+use crate::joints::JointLink;
 
 /// A rigid move in the aero frame: `p' = rot·p + trans` (`rot` as matrix rows).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,12 +325,13 @@ pub fn body_count(comps: &[crate::vehicle::Comp]) -> usize {
 }
 
 /// Each joint's workbench setting as `body_poses` takes it (the game's sign, within its travel).
-pub fn joint_settings(joints: &[JointLink], comps: &[crate::vehicle::Comp], des: &Designations) -> Vec<f64> {
+/// `angles` (degrees) and `offsets` (metres) by the joint's parent half position.
+pub fn joint_settings(joints: &[JointLink], comps: &[crate::vehicle::Comp], angles: &HashMap<[i32; 3], f64>, offsets: &HashMap<[i32; 3], f64>) -> Vec<f64> {
     joints
         .iter()
         .map(|j| {
             let pos = &comps[j.comp].pos;
-            let v = if j.slide { des.joint_offsets.get(pos).copied().unwrap_or(0.0) } else { des.joint_angles.get(pos).copied().unwrap_or(0.0).to_radians() };
+            let v = if j.slide { offsets.get(pos).copied().unwrap_or(0.0) } else { angles.get(pos).copied().unwrap_or(0.0).to_radians() };
             (j.sign * v).clamp(j.travel.0, j.travel.1)
         })
         .collect()

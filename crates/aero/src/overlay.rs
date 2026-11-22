@@ -625,7 +625,7 @@ impl Overlay {
                 let t = std::time::Instant::now();
                 let model = Model::build(comps, &mut lib, &des);
                 // Unposed: still the settings, for the pose the Mechanisms mode shows.
-                let model = if pose { model.posed(&des, &mut lib) } else { Model { settings: crate::pose::joint_settings(&model.joints, &model.comps, &des), ..model } };
+                let model = if pose { model.posed(&des, &mut lib) } else { Model { settings: crate::pose::joint_settings(&model.joints, &model.comps, &des.joint_angles, &des.joint_offsets), ..model } };
                 let mut faces = view::faces(&model.grid);
                 // Workbench pose: each face where its body is turned to (`Model::posed`).
                 for f in &mut faces {

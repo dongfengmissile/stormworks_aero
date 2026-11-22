@@ -721,7 +721,7 @@ pub fn hull_solid(pts: &[V3], dirs: &[V3]) -> crate::shape::Solid {
 /// A flat piece big enough to lift: thinner than a quarter of its width, over ~20 cm² of outline.
 fn is_plate(piece: &[Tri]) -> bool {
     let pts: Vec<V3> = piece.iter().flat_map(|t| t.0).collect();
-    let Some(e) = crate::wing::extents(&pts) else {
+    let Some(e) = crate::math::extents(&pts) else {
         return false;
     };
     e[0] < 0.25 * e[1] && e[1] * e[2] > 0.004
@@ -939,8 +939,8 @@ impl Library {
 }
 
 /// The installed game's part library and its save folder (a Linux Steam install), for unit tests.
-#[cfg(test)]
-pub(crate) fn test_library() -> (Library, PathBuf) {
+#[doc(hidden)]
+pub fn test_library() -> (Library, PathBuf) {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let appdata = home.join(".local/share/Steam/steamapps/compatdata/573090/pfx/drive_c/users/steamuser/AppData/Roaming/Stormworks");
     (Library::new(&home.join(".local/share/Steam/steamapps/common/Stormworks"), &appdata), appdata)

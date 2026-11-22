@@ -61,7 +61,7 @@ pub fn blade_solids(c: &Comp, p: &crate::defs::PropDef) -> Vec<Solid> {
 }
 
 /// `p·R + pos`: the component transform, stretched or not.
-pub(crate) fn place(s: &Solid, c: &Comp) -> Solid {
+pub fn place(s: &Solid, c: &Comp) -> Solid {
     let r = c.rot.map(|v| v as f64);
     let t = |p: V3| {
         v3(

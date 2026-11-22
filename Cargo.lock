@@ -282,8 +282,13 @@ dependencies = [
  "hudhook",
  "imgui",
  "minhook",
+ "stormworks_core",
  "windows-sys",
 ]
+
+[[package]]
+name = "stormworks_core"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

@@ -11,6 +11,9 @@ crate-type = ["cdylib", "rlib"]
 [features]
 logging = []
 
+[dependencies]
+stormworks_core = { path = "../core" }
+
 [target.'cfg(windows)'.dependencies]
 minhook = "0.9"
 # Same overlay stack as video_get_2 and swQolSuite (hooks wglSwapBuffers + the window proc).

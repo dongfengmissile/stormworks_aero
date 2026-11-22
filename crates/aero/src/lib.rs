@@ -6,24 +6,18 @@
 
 #![allow(non_snake_case)] // crate name matches the DLL name
 
+pub use stormworks_core::{defs, joints, math, pose, shape, vehicle, voxel, xml};
 pub mod body;
-pub mod defs;
 pub mod fx;
 pub mod fxwing;
 pub mod marks;
 pub mod mech;
-pub mod math;
 pub mod model;
-pub mod pose;
 pub mod prop;
 pub mod settings;
-pub mod shape;
 pub mod spool;
-pub mod vehicle;
 pub mod view;
-pub mod voxel;
 pub mod wing;
-pub mod xml;
 
 #[cfg(windows)]
 mod blur;

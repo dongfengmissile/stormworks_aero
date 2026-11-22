@@ -802,7 +802,7 @@ impl Report {
         let tree = crate::model::joint_links(comps, lib);
         let all = crate::model::all_joint_links(comps, lib);
         let n_bodies = crate::pose::body_count(comps);
-        let wanted = crate::pose::joint_settings(&tree, comps, des);
+        let wanted = crate::pose::joint_settings(&tree, comps, &des.joint_angles, &des.joint_offsets);
         let (settings, _) = crate::pose::workbench_settings(&tree, &all, n_bodies, &wanted);
         let poses = body_poses(&tree, n_bodies, &|i, _| settings[i]);
         let (mobility, dof) = mobility_near(&tree, &all, n_bodies, &settings);
