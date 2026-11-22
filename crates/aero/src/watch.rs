@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::math::V3;
-use crate::memory::{bytes_match, readable};
+use crate::memory::readable;
 
 pub(crate) const RVA_CAMERA_STEP: usize = 0x0071_b630;
 pub(crate) const CAMERA_STEP_PROLOGUE: [u8; 24] =
@@ -291,8 +291,8 @@ pub(crate) unsafe extern "system" fn status_detour(c: usize, a2: usize, a3: usiz
 }
 
 pub(crate) fn prologues_match(base: usize) -> bool {
-    bytes_match(base + RVA_CAMERA_STEP, &CAMERA_STEP_PROLOGUE)
-        && bytes_match(base + RVA_CAMERA_STATUS, &CAMERA_STATUS_PROLOGUE)
-        && bytes_match(base + RVA_CAMERA_SYNC, &CAMERA_SYNC_PROLOGUE)
-        && bytes_match(base + RVA_MOUSE_LOOK_ALLOWED, &MOUSE_LOOK_ALLOWED_PROLOGUE)
+    crate::hook::verify(base + RVA_CAMERA_STEP, &CAMERA_STEP_PROLOGUE)
+        && crate::hook::verify(base + RVA_CAMERA_STATUS, &CAMERA_STATUS_PROLOGUE)
+        && crate::hook::verify(base + RVA_CAMERA_SYNC, &CAMERA_SYNC_PROLOGUE)
+        && crate::hook::verify(base + RVA_MOUSE_LOOK_ALLOWED, &MOUSE_LOOK_ALLOWED_PROLOGUE)
 }

@@ -12,19 +12,19 @@ use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION,
 
 /// Plausible userland pointer range for a game object: below `PTR_MIN` is the
 /// null page / small integers, above `PTR_MAX` is non-canonical.
-pub(crate) const PTR_MIN: usize = 0x10000;
-pub(crate) const PTR_MAX: usize = 0x7fff_ffff_ffff;
+pub const PTR_MIN: usize = 0x10000;
+pub const PTR_MAX: usize = 0x7fff_ffff_ffff;
 
 use crate::state::SELF_MODULE;
 
-pub(crate) fn bytes_match(address: usize, expected: &[u8]) -> bool {
+pub fn bytes_match(address: usize, expected: &[u8]) -> bool {
     unsafe {
         let actual = std::slice::from_raw_parts(address as *const u8, expected.len());
         actual == expected
     }
 }
 
-pub(crate) fn self_module_path() -> Option<PathBuf> {
+pub fn self_module_path() -> Option<PathBuf> {
     let module = SELF_MODULE.load(Ordering::SeqCst);
     if module == 0 {
         return None;
@@ -68,7 +68,7 @@ fn bad_read(addr: usize) {
     }
 }
 #[track_caller]
-pub(crate) unsafe fn read_usize_at(addr: usize) -> usize {
+pub unsafe fn read_usize_at(addr: usize) -> usize {
     if !plausible_address(addr) {
         bad_read(addr);
         return 0;
@@ -76,7 +76,7 @@ pub(crate) unsafe fn read_usize_at(addr: usize) -> usize {
     (addr as *const usize).read_unaligned()
 }
 #[track_caller]
-pub(crate) unsafe fn read_u32_at(addr: usize) -> u32 {
+pub unsafe fn read_u32_at(addr: usize) -> u32 {
     if !plausible_address(addr) {
         bad_read(addr);
         return 0;
@@ -93,7 +93,7 @@ pub(crate) unsafe fn read_u32_at(addr: usize) -> u32 {
 /// The region is cached per CALL only: a region validated on an earlier tick can
 /// already be decommitted (the game frees containers it rebuilt), and a stale
 /// cache would let every later probe pass while the pages are unmapped.
-pub(crate) fn readable(address: usize, len: usize) -> bool {
+pub fn readable(address: usize, len: usize) -> bool {
     if let Some(hit) = REGION_CACHE.with(|cache| {
         let cache = cache.borrow();
         if !cache.active {
@@ -129,12 +129,12 @@ thread_local! {
 
 /// Enables the per-thread region cache until dropped (not reentrant-safe by
 /// design: a nested scope just keeps the outer one's cache).
-pub(crate) struct RegionCacheScope {
+pub struct RegionCacheScope {
     outer: bool,
 }
 
 impl RegionCacheScope {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let outer = REGION_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             let was = cache.active;

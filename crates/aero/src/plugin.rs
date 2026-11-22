@@ -72,6 +72,8 @@ fn bootstrap() {
     }
     MODULE_BASE.store(base, Ordering::SeqCst);
 
+    // The other plugins wait until our hooks are in (crate::hook).
+    let installing = crate::hook::Exclusive::take();
     if disabled(&plugin_dir, "aero_disable_hook", "AERO_NO_HOOK") {
         log_line("editor hook disabled by request (aero_disable_hook / AERO_NO_HOOK)");
     } else {
@@ -110,6 +112,7 @@ fn bootstrap() {
         log_line(&format!("game dir {} appdata {}", game.display(), appdata.display()));
         start_overlay(game, appdata);
     }
+    drop(installing);
 
     // Verbose builds: per-10-second counters, so "never called" and "rejected" are distinguishable;
     // the hang watch looks every second.

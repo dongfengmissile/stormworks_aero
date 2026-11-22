@@ -36,7 +36,7 @@ const LOG_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 static LOG_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LOG_CAPPED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn set_log_path(path: PathBuf) {
+pub fn set_log_path(path: PathBuf) {
     // The verbose log's millisecond clock starts when the bootstrap log is set
     // up, so its first line is 0 ms.
     #[cfg(feature = "logging")]
@@ -50,7 +50,7 @@ pub(crate) fn set_log_path(path: PathBuf) {
     }
 }
 
-pub(crate) fn log_line(message: &str) {
+pub fn log_line(message: &str) {
     // Recover from a poisoned mutex: silently dropping every later line is far
     // worse than continuing to log.
     let slot = LOG_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

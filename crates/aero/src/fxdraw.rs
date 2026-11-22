@@ -55,7 +55,7 @@ extern "system" {
 pub(crate) unsafe fn install(base: usize) -> Result<(), String> {
     use crate::offsets::*;
     let (at, site) = (base + RVA_GL_SET_DEPTH_TEST_MASK, base + RVA_FX_CALL_SITE);
-    if !crate::memory::bytes_match(at, &GL_SET_DEPTH_TEST_MASK_PROLOGUE) || !crate::memory::bytes_match(site, &FX_CALL_SITE_BYTES) {
+    if !crate::hook::verify(at, &GL_SET_DEPTH_TEST_MASK_PROLOGUE) || !crate::hook::verify(site, &FX_CALL_SITE_BYTES) {
         return Err(format!("effects: gl_set_depth_test_mask {at:#x} or its call site {site:#x} not as expected; no effects drawn"));
     }
     let o = minhook::MinHook::create_hook(at as *mut c_void, aero_fx_depth_mask_detour as *mut c_void).map_err(|e| format!("effects: create hook: {e:?}"))?;

@@ -19,7 +19,7 @@ use minhook::MinHook;
 use crate::editor::{ptr_ok, ring};
 use crate::logging::log_line;
 use crate::marks::{self, Mark};
-use crate::memory::{bytes_match, read_u32_at, read_usize_at, readable};
+use crate::memory::{read_u32_at, read_usize_at, readable};
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
 
@@ -363,7 +363,7 @@ unsafe extern "system" fn undo_apply_detour(a1: usize, a2: usize, a3: usize, a4:
 }
 
 unsafe fn hook(base: usize, name: &str, rva: usize, prologue: &[u8], detour: *mut c_void) -> Result<*mut c_void, String> {
-    if !bytes_match(base + rva, prologue) {
+    if !crate::hook::verify(base + rva, prologue) {
         return Err(format!("{name} prologue mismatch at {:#x}", base + rva));
     }
     MinHook::create_hook((base + rva) as *mut c_void, detour).map_err(|e| format!("create {name} hook: {e:?}"))
@@ -382,7 +382,7 @@ unsafe fn enable(base: usize, rvas: &[usize]) {
 pub(crate) unsafe fn install() {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     for (name, rva, p) in [("ser_string_field", RVA_SER_STRING_FIELD, &P_SER_STRING_FIELD), ("xml attr find", RVA_ATTR_FIND, &P_ATTR_FIND)] {
-        if !bytes_match(base + rva, p) {
+        if !crate::hook::verify(base + rva, p) {
             log_line(&format!("{name} prologue mismatch at {:#x}; designations are not stored in vehicle files", base + rva));
             return;
         }

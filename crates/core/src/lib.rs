@@ -9,3 +9,15 @@ pub mod shape;
 pub mod vehicle;
 pub mod voxel;
 pub mod xml;
+#[cfg(windows)]
+pub mod fault;
+#[cfg(all(windows, feature = "logging"))]
+pub mod hang;
+#[cfg(windows)]
+pub mod hook;
+#[cfg(windows)]
+pub mod logging;
+#[cfg(windows)]
+pub mod memory;
+#[cfg(windows)]
+pub mod state;

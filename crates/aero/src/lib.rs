@@ -7,6 +7,10 @@
 #![allow(non_snake_case)] // crate name matches the DLL name
 
 pub use stormworks_core::{defs, joints, math, pose, shape, vehicle, voxel, xml};
+#[cfg(windows)]
+use stormworks_core::{fault, hook, logging, memory, state};
+#[cfg(all(windows, feature = "logging"))]
+use stormworks_core::hang;
 pub mod body;
 pub mod fx;
 pub mod fxwing;
@@ -26,23 +30,15 @@ mod drawcap;
 #[cfg(windows)]
 mod editor;
 #[cfg(windows)]
-mod fault;
-#[cfg(windows)]
 mod flight;
 #[cfg(windows)]
 mod fxdraw;
 /// The effects' shaders (public for tools/wingsim, which draws them outside the game).
 pub mod fxglsl;
-#[cfg(all(windows, feature = "logging"))]
-mod hang;
 #[cfg(windows)]
 mod hooks;
 #[cfg(windows)]
-mod logging;
-#[cfg(windows)]
 mod markhooks;
-#[cfg(windows)]
-mod memory;
 #[cfg(windows)]
 mod offsets;
 #[cfg(windows)]
@@ -50,12 +46,9 @@ mod overlay;
 #[cfg(windows)]
 mod paint;
 #[cfg(windows)]
-#[cfg(windows)]
 mod plugin;
 #[cfg(windows)]
 mod watch;
-#[cfg(windows)]
-mod state;
 #[cfg(windows)]
 mod toolbar;
 #[cfg(windows)]

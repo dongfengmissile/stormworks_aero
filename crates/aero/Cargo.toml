@@ -9,7 +9,7 @@ name = "StormworksAero"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-logging = []
+logging = ["stormworks_core/logging"]
 
 [dependencies]
 stormworks_core = { path = "../core" }

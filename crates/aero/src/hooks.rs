@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use minhook::MinHook;
 
 use crate::logging::log_line;
-use crate::memory::{bytes_match, read_usize_at};
+use crate::memory::read_usize_at;
 use crate::offsets::*;
 use crate::state::MODULE_BASE;
 use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
@@ -64,7 +64,7 @@ unsafe fn install_toolbar_hooks() {
         ),
     ];
     for (name, rva, pro, _) in &targets {
-        if !bytes_match(base + rva, pro) {
+        if !crate::hook::verify(base + rva, pro) {
             log_line(&format!("{name} prologue mismatch at {:#x}; no Aero wings toolbar button", base + rva));
             return;
         }
@@ -137,7 +137,7 @@ unsafe extern "system" fn air_node_detour(ctx: usize, a2: usize, a3: usize, a4: 
 /// in `slot`, then enable. `Err`: the log line for the step that failed.
 unsafe fn install<T>(name: &str, at: usize, prologue: &[u8], detour: *mut c_void, slot: &OnceLock<T>) -> Result<(), String> {
     const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut c_void>()) };
-    if !bytes_match(at, prologue) {
+    if !crate::hook::verify(at, prologue) {
         return Err(format!("{name} prologue mismatch at {at:#x}"));
     }
     let o = MinHook::create_hook(at as *mut c_void, detour).map_err(|e| format!("create {name} hook: {e:?}"))?;
@@ -180,14 +180,14 @@ unsafe extern "system" fn sim_render_detour(g: usize, a2: usize, a3: usize, a4: 
 /// so none of those either.
 pub(crate) unsafe fn install_camera_hook() -> Result<(), String> {
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_SIM_RENDER_SLOT7;
-    if !bytes_match(at, &SIM_RENDER_SLOT7_PROLOGUE) {
+    if !crate::hook::verify(at, &SIM_RENDER_SLOT7_PROLOGUE) {
         return Err(format!("sim render slot 7 prologue mismatch at {at:#x}; in-flight force arrows disabled"));
     }
     let o = MinHook::create_hook(at as *mut c_void, sim_render_detour as *mut c_void).map_err(|e| format!("create camera hook: {e:?}"))?;
     let _ = ORIGINAL_SIM_RENDER.set(std::mem::transmute::<*mut c_void, SimRender>(o));
     MinHook::enable_hook(at as *mut c_void).map_err(|e| format!("enable camera hook: {e:?}"))?;
     let interp = MODULE_BASE.load(Ordering::SeqCst) + RVA_MATRIX_INTERP;
-    if bytes_match(interp, &MATRIX_INTERP_PROLOGUE) {
+    if crate::hook::verify(interp, &MATRIX_INTERP_PROLOGUE) {
         // Detour it to capture the exact per-body draw matrices; our own calls go to the trampoline.
         match MinHook::create_hook(interp as *mut c_void, crate::drawcap::interp_detour as *mut c_void) {
             Ok(o) => {
@@ -326,7 +326,7 @@ unsafe fn install_paint_hook() {
         log_line("stall paint disabled by request (aero_disable_paint)");
         return;
     }
-    if !bytes_match(at, &CHUNK_DRAW_PROLOGUE) {
+    if !crate::hook::verify(at, &CHUNK_DRAW_PROLOGUE) {
         log_line(&format!("opaque_chunk_draw_item prologue mismatch at {at:#x}; stalled blocks not painted"));
         return;
     }
@@ -352,9 +352,9 @@ unsafe fn install_blur_hooks() {
     let mut ok = true;
     for (rva, frame) in [(RVA_PUSH_232, 0xF9), (RVA_PUSH_SHADOW_A, 0xF1), (RVA_PUSH_SHADOW_B, 0xE9)] {
         push[28] = frame;
-        ok &= bytes_match(base + rva, &push);
+        ok &= crate::hook::verify(base + rva, &push);
     }
-    ok &= bytes_match(base + RVA_PUSH_DITHER, &PUSH_DITHER_PROLOGUE) && bytes_match(base + RVA_FORCE_EMITTER_DRAW, &FORCE_EMITTER_DRAW_PROLOGUE);
+    ok &= crate::hook::verify(base + RVA_PUSH_DITHER, &PUSH_DITHER_PROLOGUE) && crate::hook::verify(base + RVA_FORCE_EMITTER_DRAW, &FORCE_EMITTER_DRAW_PROLOGUE);
     if !ok {
         log_line("rotor blur: prologue mismatch, blades drawn sharp");
         return;
@@ -376,14 +376,14 @@ unsafe fn install_blur_hooks() {
         let _ = slot.set(std::mem::transmute::<*mut c_void, crate::blur::PushShadow>(o));
     }
     // Blade width row in the propeller's configuration panel (the width is drawn by the hooks below).
-    if bytes_match(base + crate::toolbar::RVA_PROP_PANEL, &crate::toolbar::PROP_PANEL_PROLOGUE) {
+    if crate::hook::verify(base + crate::toolbar::RVA_PROP_PANEL, &crate::toolbar::PROP_PANEL_PROLOGUE) {
         if let Some(o) = hook(crate::toolbar::RVA_PROP_PANEL, crate::toolbar::prop_panel_detour as *mut c_void) {
             let _ = crate::toolbar::ORIGINAL_PROP_PANEL.set(std::mem::transmute::<*mut c_void, crate::toolbar::PropPanel>(o));
         }
     } else {
         log_line("force emitter config panel prologue mismatch: no Blade Width row");
     }
-    if bytes_match(base + crate::toolbar::RVA_JOINT_PANEL, &crate::toolbar::JOINT_PANEL_PROLOGUE) {
+    if crate::hook::verify(base + crate::toolbar::RVA_JOINT_PANEL, &crate::toolbar::JOINT_PANEL_PROLOGUE) {
         if let Some(o) = hook(crate::toolbar::RVA_JOINT_PANEL, crate::toolbar::joint_panel_detour as *mut c_void) {
             let _ = crate::toolbar::ORIGINAL_JOINT_PANEL.set(std::mem::transmute::<*mut c_void, crate::toolbar::PropPanel>(o));
         }
@@ -393,10 +393,10 @@ unsafe fn install_blur_hooks() {
     let Some(o) = hook(RVA_FORCE_EMITTER_DRAW, crate::blur::draw_detour as *mut c_void) else { return };
     let _ = crate::blur::ORIGINAL_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::ClassDraw>(o));
     // Blade width: only the blades, so the hub keeps its size.
-    if bytes_match(base + RVA_DRAW_DEF_MESH1, &DRAW_DEF_MESH1_PROLOGUE) {
+    if crate::hook::verify(base + RVA_DRAW_DEF_MESH1, &DRAW_DEF_MESH1_PROLOGUE) {
         if let Some(o) = hook(RVA_DRAW_DEF_MESH1, crate::blur::mesh1_detour as *mut c_void) {
             let _ = crate::blur::ORIGINAL_MESH1.set(std::mem::transmute::<*mut c_void, crate::blur::Mesh1Draw>(o));
-            if bytes_match(base + RVA_FORCE_EMITTER_EDITOR_DRAW, &FORCE_EMITTER_EDITOR_DRAW_PROLOGUE) {
+            if crate::hook::verify(base + RVA_FORCE_EMITTER_EDITOR_DRAW, &FORCE_EMITTER_EDITOR_DRAW_PROLOGUE) {
                 if let Some(o) = hook(RVA_FORCE_EMITTER_EDITOR_DRAW, crate::blur::editor_draw_detour as *mut c_void) {
                     let _ = crate::blur::ORIGINAL_EDITOR_DRAW.set(std::mem::transmute::<*mut c_void, crate::blur::EditorDraw>(o));
                 }
@@ -588,9 +588,9 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     let (sync, damping, apply) = (base + RVA_POST_STEP_SYNC, base + RVA_SET_DAMPING, base + RVA_APPLY_FORCE);
     for (name, at, ok) in [
-        ("physics_scene_post_step_sync", sync, bytes_match(sync, &POST_STEP_SYNC_PROLOGUE)),
-        ("physics_scene_set_damping", damping, bytes_match(damping, &SET_DAMPING_PROLOGUE)),
-        ("btRigidBody::applyForce", apply, bytes_match(apply, &APPLY_FORCE_PROLOGUE)),
+        ("physics_scene_post_step_sync", sync, crate::hook::verify(sync, &POST_STEP_SYNC_PROLOGUE)),
+        ("physics_scene_set_damping", damping, crate::hook::verify(damping, &SET_DAMPING_PROLOGUE)),
+        ("btRigidBody::applyForce", apply, crate::hook::verify(apply, &APPLY_FORCE_PROLOGUE)),
     ] {
         if !ok {
             return Err(format!(
@@ -612,14 +612,14 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
     install_prop_hook();
     // Ground effect: the game's raycast and water height (called, not hooked).
     let (ray, water) = (base + RVA_RAYCAST_CLOSEST, base + RVA_WATER_HEIGHT);
-    if bytes_match(ray, &RAYCAST_CLOSEST_PROLOGUE) && bytes_match(water, &WATER_HEIGHT_PROLOGUE) {
+    if crate::hook::verify(ray, &RAYCAST_CLOSEST_PROLOGUE) && crate::hook::verify(water, &WATER_HEIGHT_PROLOGUE) {
         let _ = crate::flight::RAYCAST.set(std::mem::transmute::<usize, crate::flight::Raycast>(ray));
         let _ = crate::flight::WATER_HEIGHT.set(std::mem::transmute::<usize, crate::flight::WaterHeight>(water));
     } else {
         log_line("raycast / water height prologue mismatch: no ground effect");
     }
     let weather = base + RVA_WEATHER_SAMPLE;
-    if bytes_match(weather, &WEATHER_SAMPLE_PROLOGUE) {
+    if crate::hook::verify(weather, &WEATHER_SAMPLE_PROLOGUE) {
         let _ = crate::flight::WEATHER_SAMPLE.set(std::mem::transmute::<usize, crate::flight::WeatherSample>(weather));
     } else {
         log_line("weather sample prologue mismatch: condensation as in clear air");
@@ -631,7 +631,7 @@ pub(crate) unsafe fn install_flight_hooks() -> Result<(), String> {
 pub(crate) unsafe fn install_hooks() -> Result<(), String> {
     let base = MODULE_BASE.load(Ordering::SeqCst);
     let target = base + RVA_EDITOR_UPDATE;
-    if !bytes_match(target, &EDITOR_UPDATE_PROLOGUE) {
+    if !crate::hook::verify(target, &EDITOR_UPDATE_PROLOGUE) {
         return Err(format!(
             "editor update prologue mismatch at {target:#x} (another plugin hooked it, or this game build is not {GAME_BUILD_LABEL}); workbench analysis disabled"
         ));
@@ -642,7 +642,7 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
     log_line(&format!("editor update hooked at {target:#x}"));
     // Workbench pose drawn in the game's view (sub-grids at their joints' workbench angles).
     let scene = base + RVA_EDITOR_RENDER_SCENE;
-    if bytes_match(scene, &EDITOR_RENDER_SCENE_PROLOGUE) {
+    if crate::hook::verify(scene, &EDITOR_RENDER_SCENE_PROLOGUE) {
         match MinHook::create_hook(scene as *mut c_void, crate::editor::render_scene_detour as *mut c_void) {
             Ok(o) => {
                 let _ = crate::editor::ORIGINAL_RENDER_SCENE.set(std::mem::transmute::<*mut c_void, crate::editor::RenderScene>(o));

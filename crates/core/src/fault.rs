@@ -25,20 +25,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// process-wide word, so with the render thread and the game thread both busy
 /// it reports whichever phase stored last).
 #[cfg_attr(not(feature = "logging"), allow(dead_code))]
-pub(crate) static STAGE: AtomicU32 = AtomicU32::new(stage::IDLE);
+pub static STAGE: AtomicU32 = AtomicU32::new(stage::IDLE);
 
-pub(crate) mod stage {
-    pub(crate) const IDLE: u32 = 0;
-    pub(crate) const EDITOR_SNAPSHOT: u32 = 1;
-    pub(crate) const OVERLAY_RENDER: u32 = 2;
-    pub(crate) const ANALYSIS: u32 = 3;
-    pub(crate) const FLIGHT: u32 = 4;
+pub mod stage {
+    pub const IDLE: u32 = 0;
+    pub const EDITOR_SNAPSHOT: u32 = 1;
+    pub const OVERLAY_RENDER: u32 = 2;
+    pub const ANALYSIS: u32 = 3;
+    pub const FLIGHT: u32 = 4;
 }
 
 /// Name of a stage code, for the fault line. `&'static str`, so the handler
 /// needs no allocation.
 #[cfg_attr(not(feature = "logging"), allow(dead_code))]
-pub(crate) fn stage_name(code: u32) -> &'static str {
+pub fn stage_name(code: u32) -> &'static str {
     match code {
         stage::EDITOR_SNAPSHOT => "editor snapshot",
         stage::OVERLAY_RENDER => "overlay render",
@@ -50,7 +50,7 @@ pub(crate) fn stage_name(code: u32) -> &'static str {
 
 /// Record the phase that is about to run (compiled out of the player build).
 #[inline]
-pub(crate) fn set(code: u32) {
+pub fn set(code: u32) {
     #[cfg(feature = "logging")]
     STAGE.store(code, Ordering::Relaxed);
     #[cfg(not(feature = "logging"))]
@@ -59,7 +59,7 @@ pub(crate) fn set(code: u32) {
 
 /// Verbose builds: one lock-free line when the process exits through
 /// ExitProcess (safe under the loader lock; other threads are already dead).
-pub(crate) fn note_detach(reserved_non_null: bool) {
+pub fn note_detach(reserved_non_null: bool) {
     #[cfg(feature = "logging")]
     veil::note_detach(reserved_non_null);
     #[cfg(not(feature = "logging"))]
@@ -69,9 +69,9 @@ pub(crate) fn note_detach(reserved_non_null: bool) {
 /// Set the breadcrumb for the lifetime of the guard, then fall back to idle.
 /// Use it where a phase has several returns and a panic must not leave the
 /// breadcrumb claiming a phase that is over.
-pub(crate) struct StageGuard(());
+pub struct StageGuard(());
 
-pub(crate) fn enter(code: u32) -> StageGuard {
+pub fn enter(code: u32) -> StageGuard {
     set(code);
     StageGuard(())
 }
@@ -129,7 +129,7 @@ mod veil {
     static CPP_SEEN: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
     static CPP_NEXT: AtomicUsize = AtomicUsize::new(0);
 
-    pub(super) fn install(log_path: &std::path::Path) {
+    pub fn install(log_path: &std::path::Path) {
         use std::os::windows::ffi::OsStrExt;
         let mut wide: Vec<u16> = log_path.as_os_str().encode_wide().collect();
         wide.push(0);
@@ -279,7 +279,7 @@ mod veil {
 
     /// DLL_PROCESS_DETACH: ExitProcess ran (a clean or game-initiated exit).
     /// TerminateProcess / a kill never gets here, so a missing line means that.
-    pub(super) fn note_detach(reserved_non_null: bool) {
+    pub fn note_detach(reserved_non_null: bool) {
         let mut line = Line::new();
         line.str(if reserved_non_null {
             "PROCESS EXIT: DLL_PROCESS_DETACH via ExitProcess, last stage="
@@ -333,7 +333,7 @@ mod veil {
         }
     }
 
-    pub(super) unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    pub unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         if IN_HANDLER.swap(true, Ordering::Relaxed) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -432,7 +432,7 @@ mod veil {
 
 /// Install the fault handler on the bootstrap log. Verbose builds only: the
 /// player build writes no diagnostics, so a fault line would be noise.
-pub(crate) fn install(log_path: &std::path::Path) {
+pub fn install(log_path: &std::path::Path) {
     #[cfg(feature = "logging")]
     veil::install(log_path);
     #[cfg(not(feature = "logging"))]
