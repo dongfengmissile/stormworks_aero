@@ -763,6 +763,14 @@ unsafe fn air_constants(st: &mut State, enabled: bool) {
     }
 }
 
+/// Unload, no hook running any more: the game's own air constants back if they were replaced.
+/// shortcut: a vehicle kept active for the watch camera stays so until the world reloads; clear
+/// its keep-active byte here if that matters.
+pub(crate) fn restore_air_constants() {
+    let mut st = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe { air_constants(&mut st, false) };
+}
+
 /// Mass the game's gravity adds for the fluid in a body's tanks (`body_fluid_force_compute`
 /// 0x48D5B0: a downward force, not body mass), kg. Every liquid weighs as water; gas only past
 /// the tank's capacity. shortcut: the game settings' defaults (water density 1000, factors 1,

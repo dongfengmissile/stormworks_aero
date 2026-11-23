@@ -1855,6 +1855,7 @@ fn sweep_readout(ui: &Ui, x: &[f64], up: &[Coeffs]) {
 
 impl ImguiRenderLoop for Overlay {
     fn initialize<'a>(&'a mut self, ctx: &mut Context, render_context: &'a mut dyn RenderContext) {
+        stormworks_core::unload::note_window();
         ctx.set_ini_filename(None);
         let blank = vec![0u8; VIEW_W * VIEW_H * 4];
         match render_context.load_texture(&blank, VIEW_W as u32, VIEW_H as u32) {

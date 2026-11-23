@@ -2,22 +2,18 @@
 //! thread's stack as module+offset (ours: addr2line on the debug DLL; the game's: IDA), and ends a
 //! hung game before it takes all the system's memory.
 
-use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, RtlLookupFunctionEntry, RtlVirtualUnwind, CONTEXT, CONTEXT_FULL_AMD64, UNW_FLAG_NHANDLER};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
-use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, PAGE_GUARD, PAGE_NOACCESS};
+use windows_sys::Win32::System::Memory::MEM_IMAGE;
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, TerminateProcess, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 
 use crate::logging::log_line;
+use crate::unload::{other_threads, region, stack_of};
 
 /// Overlay frames drawn (render thread).
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -84,56 +80,6 @@ impl Watch {
     }
 }
 
-fn region(addr: u64) -> Option<MEMORY_BASIC_INFORMATION> {
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
-    let ok = unsafe { VirtualQuery(addr as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
-    (ok && info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0).then_some(info)
-}
-
-#[repr(C, align(16))]
-struct Ctx(CONTEXT);
-
-/// Stops thread `tid` and walks its stack by the modules' unwind tables. Allocates nothing while
-/// the thread is stopped: it may hold the heap lock.
-unsafe fn stack_of(tid: u32, out: &mut [u64; 40]) -> usize {
-    let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
-    if h.is_null() {
-        return 0;
-    }
-    let mut n = 0;
-    if SuspendThread(h) != u32::MAX {
-        let mut c: Ctx = zeroed();
-        c.0.ContextFlags = CONTEXT_FULL_AMD64;
-        if GetThreadContext(h, &mut c.0) != 0 {
-            let c = &mut c.0;
-            while n < out.len() && c.Rip != 0 {
-                out[n] = c.Rip;
-                n += 1;
-                // Code outside any module (Wine's Unix side, generated code): no tables to go on.
-                if region(c.Rip).is_none_or(|r| r.Type != MEM_IMAGE) {
-                    break;
-                }
-                let mut base = 0u64;
-                let f = RtlLookupFunctionEntry(c.Rip, &mut base, null_mut());
-                if f.is_null() {
-                    // A leaf function: the return address is on top of the stack.
-                    if region(c.Rsp).is_none() {
-                        break;
-                    }
-                    c.Rip = *(c.Rsp as *const u64);
-                    c.Rsp += 8;
-                } else {
-                    let (mut data, mut frame) = (null_mut(), 0u64);
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, c, &mut data, &mut frame, null_mut());
-                }
-            }
-        }
-        ResumeThread(h);
-    }
-    CloseHandle(h);
-    n
-}
-
 /// `module+0xoffset` of a code address.
 fn named(pc: u64, names: &mut Vec<(usize, String)>) -> String {
     let Some(r) = region(pc).filter(|r| r.Type == MEM_IMAGE) else { return format!("{pc:#x}") };
@@ -150,24 +96,7 @@ fn named(pc: u64, names: &mut Vec<(usize, String)>) -> String {
 
 /// Logs the stack of every thread of the game that is in the game's code or ours.
 fn dump_threads() {
-    let (me, pid) = unsafe { (GetCurrentThreadId(), GetCurrentProcessId()) };
-    let mut tids = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return log_line("  (no thread list)");
-        }
-        let mut e: THREADENTRY32 = zeroed();
-        e.dwSize = size_of::<THREADENTRY32>() as u32;
-        let mut ok = Thread32First(snap, &mut e) != 0;
-        while ok {
-            if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
-                tids.push(e.th32ThreadID);
-            }
-            ok = Thread32Next(snap, &mut e) != 0;
-        }
-        CloseHandle(snap);
-    }
+    let tids = other_threads();
     let mut stacks = Vec::with_capacity(tids.len());
     for tid in tids {
         let mut pcs = [0u64; 40];

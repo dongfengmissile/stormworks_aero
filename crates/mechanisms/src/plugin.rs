@@ -55,6 +55,7 @@ pub unsafe extern "C" fn swml_set(id: *const c_char, value: *const c_char) {
 pub(crate) static PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
 fn bootstrap() {
+    let booted = stormworks_core::unload::Booted;
     let Some(dir) = stormworks_core::plugin::start("mechanisms", GAME_BUILD_LABEL, PLUGIN_BUILD_LABEL) else { return };
     let game = exe_dir().unwrap_or_else(|| dir.clone());
     let _ = PATHS.set((game, appdata()));
@@ -82,10 +83,12 @@ fn bootstrap() {
     }
     if disabled(&dir, "mechanisms_disable_overlay", "MECH_NO_OVERLAY") {
         log_line("overlay disabled by request (mechanisms_disable_overlay / MECH_NO_OVERLAY)");
+        stormworks_core::unload::OVERLAY_UP.store(true, Ordering::SeqCst);
     } else {
         start_overlay();
     }
     drop(installing);
+    drop(booted);
 
     // Verbose builds: the hang watch looks every second, a heartbeat every ten.
     #[cfg(feature = "logging")]
@@ -93,6 +96,9 @@ fn bootstrap() {
         let mut watch = crate::hang::Watch::new();
         for second in 1u64.. {
             thread::sleep(std::time::Duration::from_secs(1));
+            if stormworks_core::unload::STOP.load(Ordering::Relaxed) {
+                break;
+            }
             watch.check();
             if second % 10 == 0 {
                 log_line(&format!(
@@ -123,11 +129,25 @@ fn start_overlay() {
             .apply()
             .map_err(|status| format!("hudhook apply failed: {status:?}"))
     };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)) {
-        Ok(Ok(())) => log_line("overlay hooks applied"),
-        Ok(Err(e)) => log_line(&format!("overlay failed: {e}")),
-        Err(_) => log_line("overlay setup panicked"),
-    }
+    let failed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)) {
+        Ok(Ok(())) => return log_line("overlay hooks applied"),
+        Ok(Err(e)) => format!("overlay failed: {e}"),
+        Err(_) => "overlay setup panicked".into(),
+    };
+    log_line(&failed);
+    // No overlay frame will come: ready for the mod loader without one.
+    stormworks_core::unload::OVERLAY_UP.store(true, Ordering::SeqCst);
+}
+/// Mod loader: hooks in (and the overlay's first frame drawn), so the next plugin may load.
+#[no_mangle]
+pub extern "C" fn swml_ready() -> bool {
+    stormworks_core::unload::ready()
+}
+
+/// Mod loader: out of the game, so the DLL can be freed (and a new build loaded).
+#[no_mangle]
+pub extern "C" fn swml_unload() -> bool {
+    stormworks_core::unload::unload(|| {}, || {})
 }
 
 #[no_mangle]

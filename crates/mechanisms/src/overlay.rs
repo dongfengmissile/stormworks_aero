@@ -16,6 +16,7 @@ pub(crate) struct Overlay {
 
 impl ImguiRenderLoop for Overlay {
     fn initialize<'a>(&'a mut self, ctx: &mut Context, _render_context: &'a mut dyn RenderContext) {
+        stormworks_core::unload::note_window();
         ctx.set_ini_filename(None);
         log_line("overlay initialised");
     }

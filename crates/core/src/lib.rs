@@ -33,6 +33,8 @@ pub mod paint;
 #[cfg(windows)]
 pub mod toolbar;
 #[cfg(windows)]
+pub mod unload;
+#[cfg(windows)]
 pub mod plugin;
 #[cfg(all(windows, feature = "swml"))]
 pub mod swml;

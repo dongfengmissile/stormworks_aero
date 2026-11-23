@@ -51,6 +51,7 @@ fn install_panic_hook() {
 }
 
 fn bootstrap() {
+    let booted = stormworks_core::unload::Booted;
     let Some(dll_path) = self_module_path() else {
         return;
     };
@@ -108,6 +109,7 @@ fn bootstrap() {
 
     if disabled(&plugin_dir, "aero_disable_overlay", "AERO_NO_OVERLAY") {
         log_line("overlay disabled by request (aero_disable_overlay / AERO_NO_OVERLAY)");
+        stormworks_core::unload::OVERLAY_UP.store(true, Ordering::SeqCst);
     } else {
         let game = exe_dir().unwrap_or_else(|| plugin_dir.clone());
         let appdata = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Stormworks")).unwrap_or_default();
@@ -115,6 +117,7 @@ fn bootstrap() {
         start_overlay(game, appdata);
     }
     drop(installing);
+    drop(booted);
 
     // Verbose builds: per-10-second counters, so "never called" and "rejected" are distinguishable;
     // the hang watch looks every second.
@@ -123,6 +126,9 @@ fn bootstrap() {
     #[cfg(feature = "logging")]
     for second in 1u64.. {
         thread::sleep(std::time::Duration::from_secs(1));
+        if stormworks_core::unload::STOP.load(Ordering::Relaxed) {
+            break;
+        }
         watch.check();
         if second % 10 != 0 {
             continue;
@@ -159,11 +165,25 @@ fn start_overlay(game: PathBuf, appdata: PathBuf) {
             .apply()
             .map_err(|status| format!("hudhook apply failed: {status:?}"))
     };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)) {
-        Ok(Ok(())) => log_line("overlay hooks applied"),
-        Ok(Err(e)) => log_line(&format!("overlay failed: {e}")),
-        Err(_) => log_line("overlay setup panicked"),
-    }
+    let failed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)) {
+        Ok(Ok(())) => return log_line("overlay hooks applied"),
+        Ok(Err(e)) => format!("overlay failed: {e}"),
+        Err(_) => "overlay setup panicked".into(),
+    };
+    log_line(&failed);
+    // No overlay frame will come: ready for the mod loader without one.
+    stormworks_core::unload::OVERLAY_UP.store(true, Ordering::SeqCst);
+}
+/// Mod loader: hooks in (and the overlay's first frame drawn), so the next plugin may load.
+#[no_mangle]
+pub extern "C" fn swml_ready() -> bool {
+    stormworks_core::unload::ready()
+}
+
+/// Mod loader: out of the game, so the DLL can be freed (and a new build loaded).
+#[no_mangle]
+pub extern "C" fn swml_unload() -> bool {
+    stormworks_core::unload::unload(|| unsafe { crate::hooks::restore_jet_slot() }, crate::flight::restore_air_constants)
 }
 
 #[no_mangle]

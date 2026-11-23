@@ -4,8 +4,8 @@
 //! `install`; the toolbar init, editor event and mouse button hooks call them (both plugins hook
 //! them, chained through `crate::hook`).
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::logging::log_line;
 use crate::memory::{bytes_match, read_u32_at, read_usize_at, readable, PTR_MIN};
@@ -313,6 +313,7 @@ pub unsafe fn build_shelf(
     std::ptr::write_bytes((s + 0x88) as *mut u8, 0, 0xF0 - 0x88); // derived part: panel ptr, toggle group
     *((s + 0x90 + 0x18) as *mut u8) = 1; // group: one always selected
     (f.add_child)(iface, ctx, s);
+    added(iface, s, Added::Shelf);
     let w = ((s + 0x10) as *const f32).read_unaligned();
     ((s + 0x6C) as *mut f32).write_unaligned(-(w + x));
     ((s + 0x70) as *mut f32).write_unaligned(0.0);
@@ -396,6 +397,7 @@ pub unsafe fn add_tool_toggle(f: &Fns, toolbar: usize, shelf: usize, ctx: usize,
         return 0;
     }
     (f.add_child)(shelf, ctx, btn);
+    added(shelf, btn, Added::Toggle);
     // Next x on the shelf cursor, then grow the shelf.
     let f32_at = |a: usize| (a as *const f32).read_unaligned();
     let set = |a: usize, v: f32| (a as *mut f32).write_unaligned(v);
@@ -465,9 +467,110 @@ unsafe fn append(toolbar: usize, ctx: usize) {
         log_line("toolbar: tool shelf not found; no toolbar buttons");
         return;
     }
+    // Entries of an earlier toolbar went with its interface.
+    ADDED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let cursor = |a: usize| (a as *const f32).read_unaligned();
+    let (x0, w0) = (cursor(shelf + 0x58), cursor(shelf + 0x10));
     (f.separator)(shelf, ctx, 0.05);
+    if let Some(sep) = last_child(shelf) {
+        added(shelf, sep, Added::Separator);
+    }
     (p.append)(f, toolbar, shelf, ctx);
+    *TOOL_SHELF.lock().unwrap_or_else(|e| e.into_inner()) = (shelf, x0, w0, cursor(shelf + 0x58));
     APPENDED_TOOLBAR.store(toolbar, Ordering::SeqCst);
+}
+
+// --- Taking the plugin's UI out again (plugin unload). A UI element's children: a ring buffer of
+// pointers at +0x30, capacity +0x38, first slot +0x3C, count +0x40 (`ui_add_child`, 0x8FADE0).
+
+#[derive(Clone, Copy, PartialEq)]
+enum Added {
+    Shelf,
+    Toggle,
+    Separator,
+}
+
+/// What the plugin added to the current toolbar's UI: (parent, child, what).
+static ADDED: Mutex<Vec<(usize, usize, Added)>> = Mutex::new(Vec::new());
+/// The tool shelf, its cursor and width before our separator, and the cursor after our toggles.
+static TOOL_SHELF: Mutex<(usize, f32, f32, f32)> = Mutex::new((0, 0.0, 0.0, 0.0));
+/// 1: the unload asks the editor tick to take the UI out; 2: done.
+static TAKE_OUT: AtomicU8 = AtomicU8::new(0);
+
+fn added(parent: usize, child: usize, what: Added) {
+    ADDED.lock().unwrap_or_else(|e| e.into_inner()).push((parent, child, what));
+}
+
+unsafe fn child_slot(parent: usize, i: u32) -> Option<*mut usize> {
+    if !readable(parent + 0x30, 0x14) {
+        return None;
+    }
+    let (buf, cap, head, n) = (read_usize_at(parent + 0x30), read_u32_at(parent + 0x38), read_u32_at(parent + 0x3C), read_u32_at(parent + 0x40));
+    (buf >= PTR_MIN && cap != 0 && n <= cap && i < n).then(|| (buf + ((head as u64 + i as u64) % cap as u64) as usize * 8) as *mut usize)
+}
+
+unsafe fn last_child(parent: usize) -> Option<usize> {
+    let n = readable(parent + 0x40, 4).then(|| read_u32_at(parent + 0x40))?;
+    Some(*child_slot(parent, n.checked_sub(1)?)?)
+}
+
+/// Takes `child` out of `parent`'s children; the object itself is left (other game state may point at it).
+unsafe fn remove_child(parent: usize, child: usize) -> bool {
+    let n = read_u32_at(parent + 0x40);
+    let Some(i) = (0..n).find(|&i| child_slot(parent, i).is_some_and(|s| *s == child)) else { return false };
+    for j in i..n - 1 {
+        let (Some(a), Some(b)) = (child_slot(parent, j), child_slot(parent, j + 1)) else { return false };
+        *a = *b;
+    }
+    *((parent + 0x40) as *mut u32) = n - 1;
+    true
+}
+
+/// Editor tick, unloading: the plugin's buttons and shelves out of the toolbar it built them in.
+unsafe fn take_out_now(editor: usize, toolbar: Option<usize>) {
+    let items = std::mem::take(&mut *ADDED.lock().unwrap_or_else(|e| e.into_inner()));
+    if toolbar.is_none() || toolbar != Some(APPENDED_TOOLBAR.load(Ordering::SeqCst)) {
+        return; // not this toolbar's: they went with their interface
+    }
+    for &(parent, child, what) in items.iter().rev() {
+        match what {
+            Added::Toggle if selected(child) => {
+                *((child + BTN_SELECTED) as *mut u8) = 0;
+                if let (true, Some(f)) = (idle(editor), fns()) {
+                    (f.set_tool_mode)(editor, 0, 0);
+                }
+            }
+            Added::Shelf => set_shown(child, false, true),
+            _ => {}
+        }
+        if !remove_child(parent, child) {
+            log_line(&format!("toolbar: {child:#x} not found under {parent:#x}"));
+        }
+    }
+    // Ours were the last on the tool shelf: its cursor and width back.
+    let (shelf, x0, w0, end) = *TOOL_SHELF.lock().unwrap_or_else(|e| e.into_inner());
+    if shelf >= PTR_MIN && readable(shelf + 0x58, 4) && ((shelf + 0x58) as *const f32).read_unaligned() == end {
+        ((shelf + 0x58) as *mut f32).write_unaligned(x0);
+        ((shelf + 0x10) as *mut f32).write_unaligned(w0);
+    }
+    log_line(&format!("toolbar: {} UI elements taken out", items.len()));
+}
+
+/// Unload (any thread): has the editor tick take the plugin's UI out, if the workbench is open.
+pub fn take_out() {
+    if APPENDED_TOOLBAR.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    TAKE_OUT.store(1, Ordering::SeqCst);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while TAKE_OUT.load(Ordering::SeqCst) != 2 {
+        if std::time::Instant::now() >= until {
+            // Not in the workbench: the buttons go with its interface.
+            log_line("toolbar: workbench not running; UI left to its interface");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 type ToolbarInit = unsafe extern "system" fn(usize, usize);
@@ -533,6 +636,13 @@ pub unsafe fn on_tick(editor: usize) {
         let vt = MODULE_BASE.load(Ordering::Relaxed) + RVA_TOOLBAR_VTABLE;
         (toolbar >= PTR_MIN && readable(toolbar, 0x138) && read_usize_at(toolbar) == vt).then_some((toolbar, iface))
     })();
+    if crate::unload::STOP.load(Ordering::SeqCst) {
+        if TAKE_OUT.load(Ordering::SeqCst) == 1 {
+            take_out_now(editor, bar.map(|b| b.0));
+            TAKE_OUT.store(2, Ordering::SeqCst);
+        }
+        return;
+    }
     if let Some((toolbar, _)) = bar {
         if APPENDED_TOOLBAR.load(Ordering::SeqCst) != toolbar {
             append(toolbar, editor + OFF_UI_CTX);

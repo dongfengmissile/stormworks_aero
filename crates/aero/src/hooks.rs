@@ -245,6 +245,20 @@ unsafe fn install_jet_smoke_hook() {
     log_line("jet smoke hook installed");
 }
 
+/// Unload: the jet engine vtable slot back to the game's tick (if it is still ours).
+pub(crate) unsafe fn restore_jet_slot() {
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    let slot = (base + RVA_JET_TICK_SLOT) as *mut usize;
+    if ORIGINAL_JET_TICK.get().is_none() || *slot != jet_tick_detour as *const () as usize {
+        return;
+    }
+    let mut old = 0u32;
+    if VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) != 0 {
+        slot.write(base + RVA_JET_TICK);
+        VirtualProtect(slot as *const c_void, 8, old, &mut old);
+    }
+}
+
 /// Stalled-voxel paint in the game render; failure only loses the red blocks.
 unsafe fn install_paint_hook() {
     if crate::plugin::paint_disabled() {
