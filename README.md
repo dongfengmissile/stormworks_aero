@@ -34,7 +34,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 Logs go to:
 
 ```
-<Stormworks install>/Mods/logs/aero.log
+<Stormworks install>/UserData/logs/aero.log
 ```
 
 ## Keybindings

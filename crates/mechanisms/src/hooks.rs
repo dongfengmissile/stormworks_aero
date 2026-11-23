@@ -42,7 +42,7 @@ unsafe extern "system" fn post_step_sync_detour(physics_scene: usize) {
 pub(crate) unsafe fn install_contact_hook() {
     let at = MODULE_BASE.load(Ordering::SeqCst) + RVA_POST_STEP_SYNC;
     match install("physics_scene_post_step_sync", at, &POST_STEP_SYNC_PROLOGUE, post_step_sync_detour as *mut c_void, &ORIGINAL_POST_STEP_SYNC) {
-        Ok(()) => log_line("contact log on: logs/mechanisms_contacts.log"),
+        Ok(()) => log_line("contact log on: UserData/logs/mechanisms_contacts.log"),
         Err(e) => log_line(&format!("{e}: no contact log")),
     }
 }

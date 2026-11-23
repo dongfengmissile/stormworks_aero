@@ -36,13 +36,13 @@ fn install_panic_hook() {
     }));
 }
 
-/// Opens `<dll folder>/logs/<name>.log` (the last run's kept as `<name>.prev.log`), installs the
+/// Opens `<game>/UserData/logs/<name>.log` (the last run's kept as `<name>.prev.log`), installs the
 /// fault handler and records the game's base. Returns the DLL's folder; None if the game's base is
 /// unknown (then nothing may be hooked).
 pub fn start(name: &str, game_build: &str, plugin_build: &str) -> Option<PathBuf> {
     let dll_path = crate::memory::self_module_path()?;
     let plugin_dir = dll_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-    let log_dir = plugin_dir.join("logs");
+    let log_dir = exe_dir().unwrap_or_else(|| plugin_dir.clone()).join("UserData").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join(format!("{name}.log"));
     if log_path.exists() {

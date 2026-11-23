@@ -55,7 +55,7 @@ fn bootstrap() {
         return;
     };
     let plugin_dir = dll_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-    let log_dir = plugin_dir.join("logs");
+    let log_dir = exe_dir().unwrap_or_else(|| plugin_dir.clone()).join("UserData").join("logs");
     let _ = fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("aero.log");
     if log_path.exists() {

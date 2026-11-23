@@ -2,7 +2,7 @@
 //! loops, to learn when a shallow rub pushes (knowledge/vehicle-model.md "Contacts between a
 //! vehicle's bodies"). Four times a second, while a loop joint moves or a contact pushes, writes
 //! the loop joints' positions and every contact between the vehicle's bodies to
-//! `logs/mechanisms_contacts.log`.
+//! `UserData/logs/mechanisms_contacts.log`.
 
 use std::collections::HashMap;
 use std::io::Write;
