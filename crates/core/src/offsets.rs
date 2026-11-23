@@ -127,6 +127,32 @@ pub const RVA_POST_STEP_SYNC: usize = 0x001a_3a10;
 /// Up to the first `call rel32` (at +0x16).
 pub const POST_STEP_SYNC_PROLOGUE: [u8; 22] =
     [0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8d, 0x51, 0x48, 0x48, 0x89, 0x6c, 0x24, 0x38, 0x48, 0x8b, 0xf9];
+/// Joints in game (knowledge/vehicle-model.md, `22e792753489`): a joint's parent half
+/// (`def+0x2B8 & 0x40`) holds its child half at `+0x148` and an info record at `+0x158`, whose
+/// `+0x120` f32 is the slider position (m) or hinge angle (rad). A part's body is at `+0x28`.
+pub const OFF_COMP_BODY: usize = 0x28;
+pub const OFF_JOINT_CHILD: usize = 0x148;
+pub const OFF_JOINT_INFO: usize = 0x158;
+pub const OFF_INFO_POSITION: usize = 0x120;
+/// Bullet contacts (knowledge/vehicle-model.md "Contacts between a vehicle's bodies", rub RE):
+/// physics scene `+0x08` btCollisionDispatcher, its manifold array (`+0x14` i32 count, `+0x20`
+/// pointers); a manifold's points at `+0x10` (368 B each), body0/body1 `+0x5D0`/`+0x5D8`, count
+/// `+0x5E0`; a point's local points on A/B (own body's frame, f64x3) `+0x00`/`+0x20`, distance
+/// `+0xA0` (f64, < 0 deep), applied impulse `+0xE8` (f64). A body's rigid body is reached from its
+/// physics object (`body+0x718`) at `+0xB8`, and points back to it at `+0x1F8`.
+pub const OFF_PHYS_DISPATCHER: usize = 0x08;
+pub const OFF_DISP_MANIFOLD_COUNT: usize = 0x14;
+pub const OFF_DISP_MANIFOLDS: usize = 0x20;
+pub const OFF_MANIFOLD_POINTS: usize = 0x10;
+pub const MANIFOLD_POINT_SIZE: usize = 368;
+pub const OFF_MANIFOLD_BODY0: usize = 0x5D0;
+pub const OFF_MANIFOLD_BODY1: usize = 0x5D8;
+pub const OFF_MANIFOLD_COUNT: usize = 0x5E0;
+pub const OFF_POINT_LOCAL_A: usize = 0x00;
+pub const OFF_POINT_LOCAL_B: usize = 0x20;
+pub const OFF_POINT_DISTANCE: usize = 0xA0;
+pub const OFF_POINT_IMPULSE: usize = 0xE8;
+pub const OFF_RB_USER: usize = 0x1F8;
 /// The physics scene inside c_scene.
 pub const OFF_SCENE_PHYSICS: usize = 0x64D0;
 /// c_scene vehicle container ring (container 0x4990 + 0x320): records

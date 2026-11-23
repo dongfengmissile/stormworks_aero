@@ -31,6 +31,7 @@ pub(crate) static ICONS: Mutex<Vec<(&'static str, imgui::TextureId)>> = Mutex::n
 const RED: [u8; 3] = [230, 32, 32];
 const ORANGE: [u8; 3] = [245, 150, 20];
 const BLUE: [u8; 3] = [50, 110, 230];
+const MAGENTA: [u8; 3] = [215, 60, 215];
 
 struct Built {
     key: (u64, bool),
@@ -53,8 +54,9 @@ struct Built {
 
 
 struct Label {
-    /// Index into `Report::all`.
-    joint: usize,
+    /// Opens with the mouse over a part of this joint (`Report::all`), or over one of `parts`.
+    joint: Option<usize>,
+    parts: Vec<u32>,
     at: crate::math::V3,
     title: String,
     text: String,
@@ -160,8 +162,12 @@ fn start(m: &mut Mode, snap: &crate::editor::Snapshot, key: (u64, bool)) {
                 .filter_map(|(a, j)| {
                     let (title, text, status) = report.describe(&comps, &|i| names[i].clone(), j.comp)?;
                     (status != Status::Free || report.sweeps.is_some()).then_some(())?;
-                    Some(Label { joint: a, at: report.joint_anchor(j)?, title, text, status })
+                    Some(Label { joint: Some(a), parts: Vec::new(), at: report.joint_anchor(j)?, title, text, status })
                 })
+                // Rubbing: one label on each part rubbed on, after the joints so it opens over them.
+                .chain(report.rub_notes().into_iter().filter_map(|(on, parts, text, status)| {
+                    Some(Label { joint: None, parts, at: report.anchor(on as usize)?, title: names[on as usize].clone(), text, status })
+                }))
                 .collect();
             // Lane names say where the joint is ("left rear"), numbered only if still alike.
             let lane_at: Vec<_> = report.tree.iter().map(|j| report.joint_anchor(j)).collect();
@@ -210,8 +216,9 @@ fn publish_pose(b: &Built) {
     crate::posing::publish_pose_target(&b.report.tree, b.report.n_bodies, &b.report.settings);
 }
 
-/// Red: parts in contact or stopping a joint; orange: the halves of a locked joint; with the
-/// Fixed tool on, blue: the fixed sub-grids. Whether anything is painted.
+/// Red: parts in contact or stopping a joint; magenta: parts sinking 4 cm or more into each other
+/// inside a loop; orange: the
+/// halves of a locked joint; with the Fixed tool on, blue: the fixed sub-grids. Whether anything is painted.
 fn paint(b: &Built, fixing: bool) -> bool {
     let mut per_body: Vec<crate::paint::VoxelColours> = Vec::new();
     let fixed = (0..b.comps.len()).filter(|&c| fixing && b.report.fixed.get(b.comps[c].body as usize) == Some(&true)).map(|c| (c as u32, None));
@@ -220,6 +227,7 @@ fn paint(b: &Built, fixing: bool) -> bool {
         let col = crate::paint::rgba(match status {
             None => BLUE,
             Some(Status::Locked) => ORANGE,
+            Some(Status::Rubs) => MAGENTA,
             Some(_) => RED,
         });
         let body = b.comps[c as usize].body as usize;
@@ -337,7 +345,8 @@ pub(crate) fn draw_fix_hint(ui: &imgui::Ui) {
     dl.add_text([at[0] + pad, at[1] + pad], [0.95, 0.95, 0.95, 1.0], text);
 }
 
-/// Each joint's label: at the joint, one line; over it (or over a part it moves), everything.
+/// Each label: an icon at the joint (or the part rubbed on); with the mouse on the icon, or on a part
+/// the label is about, the text beside it.
 /// Drawn on top of the vehicle, so joints inside the fuselage show too. Overlay frame.
 pub(crate) fn draw_labels(ui: &imgui::Ui) {
     // Labels sit where the analysis put the joints, not where a sequence moved them.
@@ -351,20 +360,18 @@ pub(crate) fn draw_labels(ui: &imgui::Ui) {
     let size = ui.io().display_size;
     let mouse = ui.io().mouse_pos;
     let ndc = [(mouse[0] / size[0] * 2.0 - 1.0) as f64, (mouse[1] / size[1] * 2.0 - 1.0) as f64];
-    let under = crate::mech::pick(&b.report.hulls, &b.report.poses, &clip, ndc).and_then(|c| b.report.joint_at(&b.comps, c as usize));
+    let pick = crate::mech::pick(&b.report.hulls, &b.report.poses, &clip, ndc);
+    let under = pick.and_then(|c| b.report.joint_at(&b.comps, c as usize));
     let dl = ui.get_background_draw_list();
     let (pad, line) = (5.0, ui.text_line_height());
-    let mut open = None;
+    // The label whose icon the mouse is on, else the last one about the part under it.
+    let mut open: Option<(&Label, [f32; 2], bool)> = None;
     for l in &b.labels {
         let (x, y, depth) = crate::ui::project(&clip, size[0], size[1], l.at);
         if depth <= 0.0 {
             continue;
         }
         let col = colour(l.status);
-        let short = l.text.lines().next().unwrap_or("");
-        let at = [x + 14.0, y - line * 0.5 - pad];
-        let end = [at[0] + ui.calc_text_size(short)[0] + 2.0 * pad, at[1] + line + 2.0 * pad];
-        let over = (at[0]..end[0]).contains(&mouse[0]) && (at[1]..end[1]).contains(&mouse[1]);
         // The game's warning or tick icon on a disc of the status colour, like its round buttons.
         dl.add_circle([x, y], 11.0, col).filled(true).build();
         let (name, mark) = if l.status == Status::Free { ("action_tick", "v") } else { ("warning", "!") };
@@ -372,15 +379,14 @@ pub(crate) fn draw_labels(ui: &imgui::Ui) {
             Some(tex) => dl.add_image(tex, [x - 8.0, y - 8.0], [x + 8.0, y + 8.0]).build(),
             None => dl.add_text([x - 3.0, y - line * 0.5], [1.0; 4], mark),
         }
-        dl.add_rect(at, end, [0.08, 0.08, 0.09, 0.85]).filled(true).rounding(4.0).build();
-        dl.add_rect(at, end, col).rounding(4.0).build();
-        dl.add_text([at[0] + pad, at[1] + pad], [0.95, 0.95, 0.95, 1.0], short);
-        if over || under == Some(l.joint) {
-            open = Some((l, at));
+        let on_icon = (mouse[0] - x).hypot(mouse[1] - y) <= 11.0;
+        let on_part = (l.joint.is_some() && l.joint == under) || pick.is_some_and(|c| l.parts.contains(&c));
+        if on_icon || (on_part && !open.is_some_and(|o| o.2)) {
+            open = Some((l, [x + 14.0, y - line * 0.5 - pad], on_icon));
         }
     }
     // The open one last, so it sits on top.
-    if let Some((l, at)) = open {
+    if let Some((l, at, _)) = open {
         let w = ui.calc_text_size(&l.title)[0].max(ui.calc_text_size(&l.text)[0]);
         let n = 1 + l.text.lines().count();
         let end = [at[0] + w + 2.0 * pad, at[1] + n as f32 * line + 2.0 * pad];
@@ -558,5 +564,6 @@ fn colour(s: Status) -> [f32; 4] {
         Status::Free => [0.35, 0.8, 0.35, 1.0],
         Status::Hits => [0.95, 0.25, 0.25, 1.0],
         Status::Locked => [0.96, 0.6, 0.1, 1.0],
+        Status::Rubs => [0.84, 0.24, 0.84, 1.0],
     }
 }

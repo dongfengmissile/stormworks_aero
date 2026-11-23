@@ -12,6 +12,8 @@ pub mod mech;
 use stormworks_core::{editor, fault, hook, logging, markhooks, memory, offsets, paint, state};
 #[cfg(all(windows, feature = "logging"))]
 use stormworks_core::hang;
+#[cfg(all(windows, feature = "logging"))]
+mod contacts;
 #[cfg(windows)]
 mod hooks;
 #[cfg(windows)]

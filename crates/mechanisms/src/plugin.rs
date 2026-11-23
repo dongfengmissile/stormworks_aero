@@ -36,6 +36,11 @@ fn bootstrap() {
         }
         // Joint settings in the `mech` attribute; older files have them in the aero plugin's.
         unsafe { crate::markhooks::install(b"mech\0", Some((b"aero\0", crate::marks::from_aero))) };
+        #[cfg(feature = "logging")]
+        {
+            crate::contacts::set_path(dir.join("logs").join("mechanisms_contacts.log"));
+            unsafe { crate::hooks::install_contact_hook() };
+        }
         if disabled(&dir, "mechanisms_disable_paint", "MECH_NO_PAINT") {
             log_line("block paint disabled by request (mechanisms_disable_paint)");
         } else {

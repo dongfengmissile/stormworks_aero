@@ -2,7 +2,7 @@
 //! which are locked because other joints on the same sub-grids fight them (two pivots whose axes
 //! do not line up, a loop of joints that cannot close as it moves).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::defs::Library;
 use crate::math::{v3, V3};
@@ -153,6 +153,29 @@ pub fn fixed_bodies(tree: &[JointLink], all: &[JointLink], n_bodies: usize) -> V
     (0..n_bodies).map(|b| !tree.iter().any(|j| j.child == b) || all.iter().any(|j| j.comp == crate::joints::WELD && j.child == b)).collect()
 }
 
+/// Which joints (`edges`: the two bodies each joins) are on a closed loop: their bodies stay joined
+/// without them. Two joints between the same two bodies are a loop too.
+pub fn on_loops(edges: &[(usize, usize)]) -> Vec<bool> {
+    (0..edges.len())
+        .map(|e| {
+            let (a, b) = edges[e];
+            let mut seen = vec![a];
+            let mut k = 0;
+            while let Some(&x) = seen.get(k) {
+                for (i, &(p, q)) in edges.iter().enumerate() {
+                    for (u, v) in [(p, q), (q, p)] {
+                        if i != e && u == x && !seen.contains(&v) {
+                            seen.push(v);
+                        }
+                    }
+                }
+                k += 1;
+            }
+            a != b && seen.contains(&b)
+        })
+        .collect()
+}
+
 /// Degrees of freedom of each mechanism (`mech_of`, `mechanisms`) in a basis of allowed motions.
 fn dofs(basis: &[Vec<f64>], col: &[Option<usize>], mech_of: &[usize], n_mech: usize) -> Vec<usize> {
     (0..n_mech)
@@ -301,29 +324,42 @@ fn null_space(mut a: Vec<Vec<f64>>, n: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-// --- Collision (knowledge/vehicle-model.md "Body collision shapes and filtering"): every body of
-// a vehicle collides with every other, the two bodies of a joint included, through the physics
-// shapes of the voxels with `flags & 1`. Each is Bullet's shape with a 0.04 m margin: the voxel
-// shrunk by 0.042 m, then rounded out by 0.04 m. So each surface sits 2 mm inside its voxel's
-// faces (voxels whose faces touch are 4 mm apart) and the edges are rounded. The game's solver
-// lets shapes sink `SLOP` into each other before a contact pushes back (contact RE).
+// --- Collision (knowledge/vehicle-model.md "Body collision shapes and filtering", "Contacts between
+// a vehicle's bodies"): every body of a vehicle collides with every other, the two bodies of a joint
+// included, through the physics shapes of the voxels with `flags & 1`, which the game merges per
+// body into records (`records`). A record with no cut plane is a box, 2 mm inside its voxels'
+// outer faces; two boxes meet with sharp corners (Bullet's box-box test). A record with a plane
+// is a hull: its core (0.042 m inside) rounded by a 0.04 m margin. A box in a pair with a hull is
+// its core rounded by its own margin, `box_margin`: about 1 cm for a one-voxel box, so its
+// corners are nearly sharp (both margins read in game, 2026-11). The game's solver lets shapes sink `SLOP` into each other before a contact pushes back.
 
-/// Bullet's collision margin, and how far inside the voxel the shape's core sits, metres.
+/// Bullet's collision margin, and how far inside the voxel a hull's core sits, metres.
 const MARGIN: f64 = 0.04;
+/// A btBoxShape's margin from its outer half extents, metres: Bullet's `setSafeMargin`, 0.1 of
+/// the smallest, at most `MARGIN` (0.0123 for one voxel, as read in game).
+fn box_margin(half: f64) -> f64 {
+    (0.1 * half).min(MARGIN)
+}
 const CORE: f64 = 0.042;
 /// Bullet's `linearSlop`, which the game sets to 0.05 (`physics_world_create` `0x1A36A0`): a contact
 /// shallower than this adds no push-out, so a joint turns on until its parts are 5 cm deep.
 const SLOP: f64 = 0.05;
 
-/// One convex piece of a part's collision shape, aero frame metres, as built: its core, which
-/// the game rounds with `MARGIN`.
+/// One convex piece of a part's collision shape, aero frame metres, as built: its core, rounded
+/// by `margin`, and for a piece of a box its sharp outer box.
 #[derive(Clone, Debug)]
 pub struct Hull {
     pub comp: u32,
     pub body: usize,
     pts: Vec<V3>,
+    outer: Option<Vec<V3>>,
+    margin: f64,
     normals: Vec<V3>,
     edges: Vec<V3>,
+}
+
+fn to_aero(p: V3) -> V3 {
+    v3(p.z * 0.25, p.x * 0.25, -p.y * 0.25)
 }
 
 fn push_dir(v: &mut Vec<V3>, d: V3) {
@@ -336,8 +372,7 @@ fn push_dir(v: &mut Vec<V3>, d: V3) {
 impl Hull {
     /// From a placed solid in grid units (`voxel::place`).
     pub fn from_solid(comp: u32, body: usize, s: &Solid) -> Hull {
-        let to_aero = |p: V3| v3(p.z * 0.25, p.x * 0.25, -p.y * 0.25);
-        let mut h = Hull { comp, body, pts: Vec::new(), normals: Vec::new(), edges: Vec::new() };
+        let mut h = Hull { comp, body, pts: Vec::new(), outer: None, margin: MARGIN, normals: Vec::new(), edges: Vec::new() };
         for f in s.iter().filter(|f| f.len() >= 3) {
             let f: Vec<V3> = f.iter().map(|p| to_aero(*p)).collect();
             push_dir(&mut h.normals, (f[1] - f[0]).cross(f[2] - f[0]));
@@ -351,8 +386,22 @@ impl Hull {
         h
     }
 
+    /// A box piece: `s` is its sharp outer box (placed, grid units), `margin` out from the core.
+    pub fn with_outer(mut self, s: &Solid, margin: f64) -> Hull {
+        self.margin = margin;
+        let mut pts: Vec<V3> = Vec::new();
+        for p in s.iter().flatten().map(|p| to_aero(*p)) {
+            if !pts.iter().any(|q| (*q - p).len() < 1e-9) {
+                pts.push(p);
+            }
+        }
+        self.outer = Some(pts);
+        self
+    }
+
     fn moved(&self, t: &Pose) -> Hull {
-        Hull { comp: self.comp, body: self.body, pts: self.pts.iter().map(|p| t.apply(*p)).collect(), normals: self.normals.iter().map(|n| t.dir(*n)).collect(), edges: self.edges.iter().map(|e| t.dir(*e)).collect() }
+        let pts = |v: &[V3]| v.iter().map(|p| t.apply(*p)).collect();
+        Hull { comp: self.comp, body: self.body, pts: pts(&self.pts), outer: self.outer.as_deref().map(pts), margin: self.margin, normals: self.normals.iter().map(|n| t.dir(*n)).collect(), edges: self.edges.iter().map(|e| t.dir(*e)).collect() }
     }
 
     fn bounds(&self) -> (V3, V3) {
@@ -361,16 +410,20 @@ impl Hull {
         (lo, hi)
     }
 
-    /// Whether the rounded shapes are at least `SLOP` deep in each other. Separating axis test on
-    /// the cores, plus the margin. Conservative where two rounded corners meet (the true
-    /// separating direction is not among the axes).
+    /// Whether the shapes are at least `SLOP` deep in each other.
     fn hits(&self, o: &Hull) -> bool {
         self.depth(o, SLOP) >= SLOP
     }
 
-    /// How deep the rounded shapes are in each other, metres: the least overlap over the
-    /// separating axes (below 0: apart). Stops early once below `enough`.
+    /// How deep the shapes are in each other as Bullet measures it, metres: the least overlap over
+    /// the separating axes (below 0: apart). Two box pieces: their sharp outer boxes. Otherwise
+    /// the cores plus both margins: exact while the cores are apart, conservative once they
+    /// overlap. Stops early once below `enough`.
     fn depth(&self, o: &Hull, enough: f64) -> f64 {
+        let (a, b, pad) = match (&self.outer, &o.outer) {
+            (Some(a), Some(b)) => (a, b, 0.0),
+            _ => (&self.pts, &o.pts, self.margin + o.margin),
+        };
         let over = |ax: V3| {
             let l = ax.len();
             if l < 1e-9 {
@@ -378,18 +431,36 @@ impl Hull {
             }
             let ax = ax * (1.0 / l);
             let span = |pts: &[V3]| pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.dot(ax)), hi.max(p.dot(ax))));
-            let ((a0, a1), (b0, b1)) = (span(&self.pts), span(&o.pts));
+            let ((a0, a1), (b0, b1)) = (span(a), span(b));
             // How far to push either way to part them: a thin part right through a block is deep.
-            (a1 - b0).min(b1 - a0) + 2.0 * MARGIN
+            (a1 - b0).min(b1 - a0)
         };
         let mut d = f64::INFINITY;
         for ax in self.normals.iter().chain(&o.normals).copied().chain(self.edges.iter().flat_map(|&e| o.edges.iter().map(move |&f| e.cross(f)))) {
             d = d.min(over(ax));
-            if d < enough {
-                break;
+            if d + pad < enough {
+                return d + pad;
             }
         }
-        d
+        if d < 0.0 && pad > 0.0 {
+            // Cores apart: their distance may also run corner to corner or corner to edge.
+            // shortcut: tries every vertex against every edge direction through every vertex, a superset; fine for pieces of a few dozen points.
+            let near = |p: &[V3], q: &[V3], edges: &[V3]| {
+                let mut d = f64::INFINITY;
+                for &x in p {
+                    for &y in q {
+                        let w = x - y;
+                        d = d.min(over(w));
+                        for &e in edges {
+                            d = d.min(over(w - e * w.dot(e)));
+                        }
+                    }
+                }
+                d
+            };
+            d = d.min(near(a, b, &o.edges)).min(near(b, a, &self.edges));
+        }
+        d + pad
     }
 }
 
@@ -440,17 +511,34 @@ const CUTS: [([i32; 3], [i32; 3]); 41] = [
     ([-1, 4, -1], [-1, -1, -1]),
 ];
 
-/// The cut plane of shape `id` in the vehicle grid (`n·p <= d`, voxel units, cell centre origin),
-/// as the game makes it: through the voxel's matrix `a6` then the part's `rot` (mirror folded in),
-/// raw integers, so a stretched part skews the plane but never the cell.
-fn cut_plane(id: i32, a6: &[i32; 9], rot: &[i32; 9]) -> Option<crate::shape::Plane> {
+/// A cut plane as the game keeps it on a cell (`physics_cell_ctor` 0x473D00): int normal and plane
+/// point in cell-corner units (the cell at `pos` is [pos, pos + 1]), `n·x <= n·pt` kept.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cut {
+    n: [i32; 3],
+    pt: [i32; 3],
+    id: i32,
+}
+
+/// Shape `id`'s cut for a cell at `pos`: through the voxel's matrix `a6` then the part's `rot`
+/// (mirror folded in), raw integers, so a stretched part skews the plane but never the cell.
+fn cut_at(id: i32, a6: &[i32; 9], rot: &[i32; 9], pos: [i32; 3]) -> Option<Cut> {
     let (n, p) = CUTS.get(usize::try_from(id).ok()?.checked_sub(1)?)?;
     let mul = |v: [i32; 3], m: &[i32; 9]| [0, 1, 2].map(|k| v[0] * m[k] + v[1] * m[3 + k] + v[2] * m[6 + k]);
     let (n, p) = (mul(mul(*n, a6), rot), mul(mul(*p, a6), rot));
-    // The point from the cell's low corner, (P + 1) / 2 as the game's C division rounds it.
-    let q = p.map(|v| ((v + 1) / 2) as f64 - 0.5);
-    let n = v3(n[0] as f64, n[1] as f64, n[2] as f64);
-    Some(crate::shape::Plane { n, d: n.dot(v3(q[0], q[1], q[2])) })
+    // (P + 1) / 2 as the game's C division rounds it.
+    Some(Cut { n, pt: [0, 1, 2].map(|k| pos[k] + (p[k] + 1) / 2), id })
+}
+
+fn fv(a: [i32; 3]) -> V3 {
+    v3(a[0] as f64, a[1] as f64, a[2] as f64)
+}
+
+#[cfg(test)]
+/// The cut plane of shape `id` in the vehicle grid (`n·p <= d`, voxel units, cell centre origin).
+fn cut_plane(id: i32, a6: &[i32; 9], rot: &[i32; 9]) -> Option<crate::shape::Plane> {
+    let c = cut_at(id, a6, rot, [0; 3])?;
+    Some(crate::shape::Plane { n: fv(c.n), d: fv(c.n).dot(fv(c.pt) - v3(0.5, 0.5, 0.5)) })
 }
 
 /// The 1:4 slopes, whose cut plane the game does not move in (`physics_cells_build_records`).
@@ -458,53 +546,329 @@ fn flush_cut(id: i32) -> bool {
     matches!(id, 6..=9 | 12..=15 | 18..=25 | 28..=31)
 }
 
+/// Shape ids whose cut face is a triangle (`0x47EBF0`); the rest are quads.
+fn tri_cut(id: i32) -> bool {
+    matches!(id, 2 | 3 | 11 | 15 | 17 | 21 | 25 | 26 | 28 | 32 | 34 | 38)
+}
+
+/// One `flags & 1` voxel of a body, in the order the game adds them (`body_build_physics_cells`).
+struct Cell {
+    comp: u32,
+    pos: [i32; 3],
+    cut: Option<Cut>,
+    /// The cut cell's corners from its centre (voxel units), for `compare`.
+    verts: Vec<V3>,
+}
+
+impl Cell {
+    fn new(comp: u32, pos: [i32; 3], cut: Option<Cut>) -> Cell {
+        let verts = cut.map_or(Vec::new(), |c| {
+            let plane = crate::shape::Plane { n: fv(c.n), d: fv(c.n).dot(fv(c.pt) - fv(pos) - v3(0.5, 0.5, 0.5)) };
+            let mut v: Vec<V3> = Vec::new();
+            for p in crate::shape::clip_solid(&voxel_solid(None), &plane).into_iter().flatten() {
+                if !v.iter().any(|q| (*q - p).len() < 1e-9) {
+                    v.push(p);
+                }
+            }
+            v
+        });
+        Cell { comp, pos, cut, verts }
+    }
+}
+
+fn idot(a: [i32; 3], b: [i32; 3]) -> i64 {
+    (0..3).map(|k| a[k] as i64 * b[k] as i64).sum()
+}
+
+fn isub(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Cell [p, p + 1] against a plane (`0x47F140`): 1 outside (or touching it from outside),
+/// 0 straddling, -1 inside (or touching it from inside).
+fn class(p: [i32; 3], c: &Cut) -> i32 {
+    let lo = [0, 1, 2].map(|k| p[k] + (c.n[k] < 0) as i32);
+    let hi = [0, 1, 2].map(|k| p[k] + (c.n[k] > 0) as i32);
+    if idot(c.n, isub(lo, c.pt)) >= 0 {
+        1
+    } else if idot(c.n, isub(hi, c.pt)) > 0 {
+        0
+    } else {
+        -1
+    }
+}
+
+/// A cell against a record plane (`0x47EBF0`): -1 fits inside, 0 lies on it, 1 conflicts.
+fn compare(cell: &Cell, pl: &Cut) -> i32 {
+    let lo = [0, 1, 2].map(|k| cell.pos[k] + (pl.n[k] < 0) as i32);
+    let hi = [0, 1, 2].map(|k| cell.pos[k] + (pl.n[k] > 0) as i32);
+    let (l, h) = (idot(pl.n, isub(lo, pl.pt)), idot(pl.n, isub(hi, pl.pt)));
+    if l >= 0 {
+        return 1;
+    }
+    if h < 0 {
+        return -1;
+    }
+    let Some(c) = &cell.cut else { return if h == 0 { 0 } else { 1 } };
+    if h == 0 {
+        return -1;
+    }
+    if c.n == pl.n {
+        // As decoded (rub RE, sign not cross-checked on a real case).
+        return match idot(pl.n, isub(c.pt, pl.pt)) {
+            d if d > 0 => -1,
+            0 => 0,
+            _ => 1,
+        };
+    }
+    let n = fv(pl.n).norm();
+    let origin = fv(pl.pt) - v3(0.5, 0.5, 0.5);
+    let mut on = 0;
+    for v in &cell.verts {
+        let s = n.dot(fv(cell.pos) + *v - origin);
+        if s > 0.01 {
+            return 1;
+        }
+        on += (s.abs() <= 0.01) as usize;
+    }
+    (on as i32 - if tri_cut(c.id) { 3 } else { 4 }).signum()
+}
+
+/// One collision record of a body: its box of positions (inclusive), cut planes, and the cells it
+/// took in (the seed first).
+struct Record {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    planes: Vec<Cut>,
+    cells: Vec<usize>,
+}
+
+fn positions(lo: [i32; 3], hi: [i32; 3]) -> impl Iterator<Item = [i32; 3]> {
+    (lo[0]..=hi[0]).flat_map(move |x| (lo[1]..=hi[1]).flat_map(move |y| (lo[2]..=hi[2]).map(move |z| [x, y, z])))
+}
+
+/// The game's collision records for one body's cells (`physics_cells_build_records` 0x480980,
+/// greedy merge 0x47F220; knowledge/vehicle-model.md "Merging").
+fn records(cells: &[Cell]) -> Vec<Record> {
+    // One leaf per position; a later cell there replaces the earlier one.
+    let oct: HashMap<[i32; 3], usize> = cells.iter().enumerate().map(|(i, c)| (c.pos, i)).collect();
+    let mut used = vec![false; cells.len()];
+    let mut out = Vec::new();
+    for seed in 0..cells.len() {
+        if used[seed] {
+            continue;
+        }
+        let mut r = Record { lo: cells[seed].pos, hi: cells[seed].pos, planes: cells[seed].cut.into_iter().collect(), cells: vec![seed] };
+        let mut blocked = [false; 6];
+        loop {
+            let mut changed = false;
+            for f in 0..6 {
+                let (ax, up) = (f % 3, f < 3);
+                if blocked[f] {
+                    continue;
+                }
+                if (up && r.hi[ax] >= 255) || (!up && r.lo[ax] <= -256) {
+                    blocked[f] = true;
+                    continue;
+                }
+                let layer = if up { r.hi[ax] + 1 } else { r.lo[ax] - 1 };
+                let (a1, a2) = [(1, 2), (0, 2), (0, 1)][ax];
+                let (lo, hi) = (r.lo, r.hi);
+                let slab: Vec<[i32; 3]> = (lo[a1]..=hi[a1])
+                    .flat_map(|u| {
+                        (lo[a2]..=hi[a2]).map(move |w| {
+                            let mut p = [0; 3];
+                            (p[ax], p[a1], p[a2]) = (layer, u, w);
+                            p
+                        })
+                    })
+                    .collect();
+                match grow(&r, &slab, cells, &oct, &used) {
+                    None => blocked[f] = true,
+                    Some(None) => {}
+                    Some(Some(pending)) => {
+                        for pl in pending {
+                            if !r.planes.iter().any(|q| q.n == pl.n && idot(q.n, isub(pl.pt, q.pt)) == 0) {
+                                r.planes.push(pl);
+                            }
+                        }
+                        if up {
+                            r.hi[ax] += 1;
+                        } else {
+                            r.lo[ax] -= 1;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Consumed: every position in the box inside or straddling all its planes.
+        used[seed] = true;
+        for p in positions(r.lo, r.hi) {
+            if r.planes.iter().all(|pl| class(p, pl) <= 0) {
+                if let Some(&i) = oct.get(&p) {
+                    if !used[i] && p != cells[seed].pos {
+                        r.cells.push(i);
+                    }
+                    used[i] = true;
+                }
+            }
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// One layer `slab` against record `r`: None blocks that face, Some(None) adds nothing, else the
+/// layer joins with these new planes.
+fn grow(r: &Record, slab: &[[i32; 3]], cells: &[Cell], oct: &HashMap<[i32; 3], usize>, used: &[bool]) -> Option<Option<Vec<Cut>>> {
+    let outside = |p: [i32; 3]| r.planes.iter().any(|pl| class(p, pl) > 0);
+    let (mut pending, mut absorbed) = (Vec::new(), false);
+    for &p in slab {
+        if outside(p) {
+            continue; // cut away: neither taken nor in the way
+        }
+        let &i = oct.get(&p)?;
+        if used[i] {
+            return None;
+        }
+        let leaf = &cells[i];
+        let Some(c) = &leaf.cut else {
+            if r.planes.iter().any(|pl| class(p, pl) >= 0) {
+                return None; // a plain cell across a cut
+            }
+            absorbed = true;
+            continue;
+        };
+        if r.planes.iter().any(|pl| pl.n == c.n && idot(pl.n, isub(c.pt, pl.pt)) == 0) {
+            absorbed = true;
+            continue;
+        }
+        let mut on = false;
+        for pl in r.planes.iter().filter(|pl| class(p, pl) == 0) {
+            match compare(leaf, pl) {
+                1 => return None,
+                0 => on = true,
+                _ => {}
+            }
+        }
+        if !on {
+            // Its plane must not cut the record's cells.
+            for q in positions(r.lo, r.hi).filter(|q| class(*q, c) >= 0) {
+                if let Some(&b) = oct.get(&q) {
+                    if cells[b].cut.is_none() || compare(&cells[b], c) > 0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        pending.push(*c);
+        absorbed = true;
+    }
+    if !absorbed {
+        return Some(None);
+    }
+    for &p in slab.iter().filter(|p| !pending.is_empty() && !outside(**p)) {
+        let Some(&i) = oct.get(&p) else { continue };
+        let leaf = &cells[i];
+        let ok = leaf.cut.is_some() && pending.iter().chain(&r.planes).any(|pl| class(p, pl) == 0 && compare(leaf, pl) == 0);
+        if pending.iter().any(|pl| class(p, pl) == 0) && !ok {
+            return None;
+        }
+    }
+    Some(Some(pending))
+}
+
+/// A box from `lo` to `hi`, as faces.
+fn box_solid(a: V3, b: V3) -> Solid {
+    let corner = |k: usize| v3(if k & 1 == 0 { a.x } else { b.x }, if k & 2 == 0 { a.y } else { b.y }, if k & 4 == 0 { a.z } else { b.z });
+    let faces = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+    faces.iter().map(|f| f.iter().map(|&k| corner(k)).collect()).collect()
+}
+
 /// Every part's collision pieces as the game builds them when the vehicle spawns
-/// (knowledge/vehicle-model.md "Body collision shapes"): each `flags & 1` voxel a unit cell at
-/// its grid cell (the part's matrix moves it but never stretches it), cut by its plane; as the
-/// core inside the `MARGIN` (planes moved in by `CORE`), the way `Hull::depth` takes them.
-/// shortcut: cells are not merged into records as the game does; that only drops the 4 mm seams
-/// and rounded edges between cells of one body, which never decide a 5 cm contact.
+/// (knowledge/vehicle-model.md "Body collision shapes"): each body's `flags & 1` voxels (unit cells
+/// at their grid cells; the part's matrix moves them but never stretches them) merged into records
+/// (`records`), each record cut into one piece per cell so contacts name a part. A cell inside its
+/// record reaches its neighbours (no gap); on the record's outside it sits 2 mm in (outer box) or
+/// 0.042 m in (core).
+/// shortcut: depth is taken per cell piece, not per record; it differs only where the deepest way
+/// out runs along a merged row, check the contact log if a case looks off.
 pub fn hulls(comps: &[Comp], lib: &mut Library) -> Vec<Hull> {
     const IN: f64 = CORE / crate::voxel::VOXEL_M;
-    let core = |plane: Option<crate::shape::Plane>, flush: bool| {
-        let k = 1.0 - 2.0 * IN;
-        let cube: Solid = voxel_solid(None).into_iter().map(|f| f.into_iter().map(|p| p * k).collect()).collect();
-        match plane {
-            Some(p) => crate::shape::clip_solid(&cube, &crate::shape::Plane { n: p.n, d: p.d - if flush { 0.0 } else { IN * p.n.len() } }),
-            None => cube,
-        }
-    };
+    const OUT: f64 = 0.002 / crate::voxel::VOXEL_M;
+    let mut bodies: Vec<Vec<Cell>> = Vec::new();
     let mut out = Vec::new();
     for (i, c) in comps.iter().enumerate() {
         let (comp, body) = (i as u32, c.body as usize);
-        let at = |g: [i32; 3]| Comp { pos: g, rot: crate::vehicle::IDENTITY, ..c.clone() };
+        if bodies.len() <= body {
+            bodies.resize_with(body + 1, Vec::new);
+        }
         let Some(def) = lib.get(&c.def) else {
-            out.push(Hull::from_solid(comp, body, &crate::voxel::place(&core(None, false), &at(c.pos))));
+            bodies[body].push(Cell::new(comp, c.pos, None));
             continue;
         };
         // A resized microcontroller repeats its voxel over width x length cells.
         let [w, l] = c.size.map_or([1, 1], |s| s.map(|n| n.clamp(1, 16)));
         for v in &def.collision {
-            let plane = cut_plane(v.shape, &v.rot, &c.rot);
-            let solid = core(plane, flush_cut(v.shape));
-            if solid.len() < 4 {
-                continue; // the cut leaves no core: the game's hull has no points either
-            }
             for (x, z) in (0..w).flat_map(|x| (0..l).map(move |z| (x, z))) {
                 let g = c.cell([v.pos[0] + x, v.pos[1], v.pos[2] + z]);
-                out.push(Hull::from_solid(comp, body, &crate::voxel::place(&solid, &at(g))));
+                bodies[body].push(Cell::new(comp, g, if v.shape == 0 { None } else { cut_at(v.shape, &v.rot, &c.rot, g) }));
             }
         }
         if let Some((lo, hi)) = def.collision_box {
-            // Part frame metres -> voxel units; Bullet's box keeps its margin inside the extents.
-            let m = MARGIN / crate::voxel::VOXEL_M;
+            // Its own child, a box: part frame metres -> voxel units; Bullet keeps the margin inside.
+            let half = hi - lo;
+            let margin = box_margin(half.x.min(half.y).min(half.z) / 2.0);
+            let m = margin / crate::voxel::VOXEL_M;
             let (a, b) = (lo * 4.0 + v3(m, m, m), hi * 4.0 - v3(m, m, m));
             if a.x < b.x && a.y < b.y && a.z < b.z {
-                let corner = |k: usize| v3(if k & 1 == 0 { a.x } else { b.x }, if k & 2 == 0 { a.y } else { b.y }, if k & 4 == 0 { a.z } else { b.z });
-                let faces = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
-                let local: Solid = faces.iter().map(|f| f.iter().map(|&k| corner(k)).collect()).collect();
                 // The game turns it by the part's raw matrix, stretched or not.
-                out.push(Hull::from_solid(comp, body, &crate::voxel::place(&local, c)));
+                out.push(Hull::from_solid(comp, body, &crate::voxel::place(&box_solid(a, b), c)).with_outer(&crate::voxel::place(&box_solid(lo * 4.0, hi * 4.0), c), margin));
+            }
+        }
+    }
+    for (body, cells) in bodies.iter().enumerate() {
+        for r in records(cells) {
+            // A cell's box: flush with its neighbours inside the record, `inset` in on its outside.
+            let cell_box = |pos: [i32; 3], inset: f64| {
+                let side = |k: usize, up: bool| if (up && pos[k] == r.hi[k]) || (!up && pos[k] == r.lo[k]) { 0.5 - inset } else { 0.5 };
+                box_solid(v3(-side(0, false), -side(1, false), -side(2, false)), v3(side(0, true), side(1, true), side(2, true)))
+            };
+            let at = |pos: [i32; 3]| Comp { pos, rot: crate::vehicle::IDENTITY, ..comps[cells[r.cells[0]].comp as usize].clone() };
+            if r.planes.is_empty() {
+                let thin = (0..3).map(|k| r.hi[k] - r.lo[k] + 1).min().unwrap_or(1);
+                let margin = box_margin(thin as f64 * crate::voxel::VOXEL_M / 2.0 - 0.002);
+                for &i in &r.cells {
+                    let c = &cells[i];
+                    let core = cell_box(c.pos, OUT + margin / crate::voxel::VOXEL_M);
+                    out.push(Hull::from_solid(c.comp, body, &crate::voxel::place(&core, &at(c.pos))).with_outer(&crate::voxel::place(&cell_box(c.pos, OUT), &at(c.pos)), margin));
+                }
+                continue;
+            }
+            // A hull: the record's core box cut by its planes (the 1:4 slopes not moved in).
+            let planes = |pos: [i32; 3]| -> Vec<crate::shape::Plane> {
+                (r.planes.iter())
+                    .map(|pl| {
+                        let n = fv(pl.n);
+                        crate::shape::Plane { n, d: n.dot(fv(pl.pt) - v3(0.5, 0.5, 0.5) - fv(pos)) - if flush_cut(pl.id) { 0.0 } else { IN * n.len() } }
+                    })
+                    .collect()
+            };
+            let cut = |s: Solid, pos: [i32; 3]| planes(pos).iter().fold(s, |s, p| crate::shape::clip_solid(&s, p));
+            let whole = cut(box_solid(fv(r.lo) - v3(0.5 - IN, 0.5 - IN, 0.5 - IN), fv(r.hi) + v3(0.5 - IN, 0.5 - IN, 0.5 - IN)), [0; 3]);
+            if whole.len() < 4 {
+                continue; // fewer than 4 points: the game adds no shape at all
+            }
+            for &i in &r.cells {
+                let c = &cells[i];
+                let solid = cut(cell_box(c.pos, IN), c.pos);
+                if solid.len() >= 4 {
+                    out.push(Hull::from_solid(c.comp, body, &crate::voxel::place(&solid, &at(c.pos))));
+                }
             }
         }
     }
@@ -555,8 +919,10 @@ pub fn sweep(tree: &[JointLink], j: usize, settings: &[f64], n_bodies: usize, hu
     let cell = |p: V3| [p.x, p.y, p.z].map(|v| (v / CELL).floor() as i32);
     let rest: Vec<Hull> = hulls.iter().filter(|h| !moving[h.body]).map(|h| h.moved(&poses[h.body])).collect();
     let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
+    let pad = v3(MARGIN, MARGIN, MARGIN); // the cores' bounds, not the shapes'
     for (k, h) in rest.iter().enumerate() {
         let (lo, hi) = h.bounds();
+        let (lo, hi) = (lo - pad, hi + pad);
         let (a, b) = (cell(lo), cell(hi));
         for x in a[0]..=b[0] {
             for y in a[1]..=b[1] {
@@ -575,6 +941,7 @@ pub fn sweep(tree: &[JointLink], j: usize, settings: &[f64], n_bodies: usize, hu
         for h in &carried {
             let m = h.moved(&poses[h.body]);
             let (lo, hi) = m.bounds();
+            let (lo, hi) = (lo - pad, hi + pad);
             let (a, b) = (cell(lo), cell(hi));
             pass += 1;
             for x in a[0]..=b[0] {
@@ -631,6 +998,127 @@ pub fn sweep(tree: &[JointLink], j: usize, settings: &[f64], n_bodies: usize, hu
     let (down, up) = (go(lo), go(hi));
     let all_round = all_round && down.hit.is_none() && up.hit.is_none();
     Sweep { now, down, up, all_round }
+}
+
+/// Two parts of a loop's sub-grids that sink into each other while the loop moves. Under the game's
+/// 5 cm slack a contact never pushes, but the loop's joints stretch under load (about 1 cm seen),
+/// and at 5 cm the contact fights the loop: phantom forces that shove the whole vehicle
+/// (knowledge/vehicle-model.md "Contact slack", from the in-game contact log).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rub {
+    /// The driving joint (`tree`), the part that sinks in, the part it sinks into (on the sub-grid
+    /// nearer the fixed one), how deep at most (m) and the joint's setting there, and whether it
+    /// reaches the 5 cm stop.
+    pub joint: usize,
+    pub part: u32,
+    pub on: u32,
+    pub depth: f64,
+    pub at: f64,
+    pub hit: bool,
+}
+
+/// Deeper than this inside a loop can reach the 5 cm stop under load.
+/// shortcut: from one vehicle (4.7 cm by geometry reached 5 cm and pushed, 4.3 cm did not, 2 cm
+/// fixed it); tune with more contact logs.
+const RUB_WARN: f64 = 0.04;
+
+/// Drives joint `t` of `tree` through its travel (`pose::reach`), the loops closed, and lists the
+/// parts of the sub-grids `group` that sink `RUB_WARN` or more into each other (`Rub`), up to where
+/// a part first goes 5 cm in (the game stops it there: a hit). Parts built 5 cm or more in each
+/// other are left out. `fixed`: per body, it stays put.
+pub fn loop_rubs(tree: &[JointLink], links: &[JointLink], n_bodies: usize, settings: &[f64], hulls: &[Hull], fixed: &[bool], t: usize, group: &[usize]) -> Vec<Rub> {
+    // The other joints between the loops and the fixed body follow, as in `pose::reach`.
+    let loops: Vec<usize> = links.iter().filter(|l| !tree.iter().any(|j| j.comp == l.comp)).flat_map(|l| [l.parent, l.child]).collect();
+    let free: Vec<usize> = crate::pose::above(tree, loops).into_iter().filter(|&i| i != t).collect();
+    let mut follow = tree.to_vec();
+    for &i in &free {
+        follow[i].free = true;
+    }
+    let (lo, hi) = crate::pose::reach(tree, links, n_bodies, settings, t);
+    let cur = settings[t];
+    let (lo, hi) = (if lo.is_finite() { lo } else { cur - std::f64::consts::PI }, if hi.is_finite() { hi } else { cur + std::f64::consts::PI });
+    let still = |b: usize| fixed.get(b).copied().unwrap_or(false);
+    const CELL: f64 = 0.5;
+    let cell = |v: V3| [v.x, v.y, v.z].map(|x| (x / CELL).floor() as i32);
+    let cells = |h: &Hull| {
+        let (a, b) = h.bounds();
+        let (a, b) = (cell(a - v3(MARGIN, MARGIN, MARGIN)), cell(b + v3(MARGIN, MARGIN, MARGIN)));
+        (a[0]..=b[0]).flat_map(move |x| (a[1]..=b[1]).flat_map(move |y| (a[2]..=b[2]).map(move |z| [x, y, z])))
+    };
+    // The fixed sub-grids' parts in a grid once; the moving ones each step.
+    let poses0 = body_poses(tree, n_bodies, &|i, _| settings[i]);
+    let fixed_hulls: Vec<Hull> = hulls.iter().filter(|h| group.contains(&h.body) && still(h.body)).map(|h| h.moved(&poses0[h.body])).collect();
+    let mut fixed_grid: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+    for (k, h) in fixed_hulls.iter().enumerate() {
+        for c in cells(h) {
+            fixed_grid.entry(c).or_default().push(k);
+        }
+    }
+    let moving: Vec<&Hull> = hulls.iter().filter(|h| group.contains(&h.body) && !still(h.body)).collect();
+    let mut level = vec![0usize; n_bodies];
+    for l in tree {
+        level[l.child] = level[l.parent] + 1;
+    }
+    // Each step's touching pairs of parts (the one that rubs, the one rubbed on) and how deep.
+    let touching = |s: &[f64]| -> HashMap<(u32, u32), f64> {
+        let p = body_poses(tree, n_bodies, &|i, _| s[i]);
+        let moved: Vec<Hull> = moving.iter().map(|h| h.moved(&p[h.body])).collect();
+        let mut grid: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+        let mut near: HashSet<(bool, usize, usize)> = HashSet::new();
+        for (k, h) in moved.iter().enumerate() {
+            for c in cells(h) {
+                near.extend(fixed_grid.get(&c).into_iter().flatten().map(|&o| (true, o, k)));
+                let here = grid.entry(c).or_default();
+                near.extend(here.iter().filter(|&&o| moved[o].body != h.body).map(|&o| (false, o, k)));
+                here.push(k);
+            }
+        }
+        let mut out: HashMap<(u32, u32), f64> = HashMap::new();
+        for (on_fixed, o, k) in near {
+            let other = if on_fixed { &fixed_hulls[o] } else { &moved[o] };
+            let m = &moved[k];
+            let pair = if on_fixed || (level[other.body], other.comp) < (level[m.body], m.comp) { (m.comp, other.comp) } else { (other.comp, m.comp) };
+            let d = m.depth(other, 0.0);
+            if d > 0.0 {
+                let e = out.entry(pair).or_insert(d);
+                *e = e.max(d);
+            }
+        }
+        out
+    };
+    let start = touching(settings);
+    let built: HashSet<(u32, u32)> = start.iter().filter(|(_, d)| **d >= SLOP).map(|(pk, _)| *pk).collect();
+    // Per pair of parts: deepest, where, and whether it stops the joint.
+    let mut seen: HashMap<(u32, u32), (f64, f64, bool)> = HashMap::new();
+    let mut note = |pairs: &HashMap<(u32, u32), f64>, at: f64| {
+        for (&pk, &d) in pairs.iter().filter(|(pk, _)| !built.contains(pk)) {
+            let e = seen.entry(pk).or_insert((0.0, at, false));
+            if d > e.0 {
+                *e = (d, at, d >= SLOP);
+            }
+        }
+    };
+    note(&start, cur);
+    for end in [lo, hi] {
+        let step = if tree[t].slide { 0.01 } else { 0.02 };
+        let n = ((end - cur).abs() / step).ceil().clamp(1.0, 100.0) as usize;
+        let mut s = settings.to_vec();
+        for k in 1..=n {
+            s[t] = cur + (end - cur) * k as f64 / n as f64;
+            if crate::pose::settle(&follow, links, n_bodies, &mut s, &free, &|_, _| {}) > crate::pose::JAM {
+                break;
+            }
+            let pairs = touching(&s);
+            note(&pairs, s[t]);
+            if pairs.iter().any(|(pk, d)| *d >= SLOP && !built.contains(pk)) {
+                break; // a real hit: the game stops the joint here
+            }
+        }
+    }
+    (seen.into_iter())
+        .filter(|(_, (d, _, _))| *d >= RUB_WARN)
+        .map(|((part, on), (depth, at, hit))| Rub { joint: t, part, on, depth: depth.min(SLOP), at, hit })
+        .collect()
 }
 
 // --- Sequence frames: free joints held by loops and by contact.
@@ -802,6 +1290,8 @@ pub struct Report {
     pub hulls: Vec<Hull>,
     /// Per posing joint, once checked: None for a joint that is locked or in a loop.
     pub sweeps: Option<Vec<Option<Sweep>>>,
+    /// Once checked: parts that rub while a loop's driving joint moves.
+    pub rubs: Vec<Rub>,
 }
 
 /// How a joint's result reads at a glance (the tooltip title and the paint).
@@ -810,6 +1300,8 @@ pub enum Status {
     Free,
     /// Touches something now, or stops before its end of travel.
     Hits,
+    /// Rubs inside a loop as the loop moves (`Rub`): parts only, not joints.
+    Rubs,
     Locked,
 }
 
@@ -831,8 +1323,9 @@ impl Report {
         mobility.truncate(all.len());
         let mech_of = mechanisms(&tree, &links, n_bodies);
         let hulls = hulls(comps, lib);
-        let mut r = Report { tree, all, links, fixed, n_bodies, wanted, settings, poses, mobility, mech_of, dof, hulls, sweeps: None };
+        let mut r = Report { tree, all, links, fixed, n_bodies, wanted, settings, poses, mobility, mech_of, dof, hulls, sweeps: None, rubs: Vec::new() };
         if check {
+            r.rubs = (0..r.tree.len()).filter_map(|t| Some((t, r.loop_group(t)?))).flat_map(|(t, g)| loop_rubs(&r.tree, &r.links, r.n_bodies, &r.settings, &r.hulls, &r.fixed, t, &g)).collect();
             r.sweeps = Some((0..r.tree.len()).map(|t| r.sweepable(t).then(|| sweep(&r.tree, t, &r.settings, r.n_bodies, &r.hulls))).collect());
         }
         r
@@ -841,6 +1334,18 @@ impl Report {
     /// `all` index of posing joint `t`.
     fn joint_of(&self, t: usize) -> Option<usize> {
         self.all.iter().position(|j| j.comp == self.tree[t].comp)
+    }
+
+    /// The sub-grids of the loop driven posing joint `t` moves, if it is driven, free and on one.
+    fn loop_group(&self, t: usize) -> Option<Vec<usize>> {
+        let a = self.joint_of(t).filter(|&a| !self.tree[t].free && self.mobility[a] == Mobility::Free)?;
+        let mates = loop_mates(&self.links, a);
+        let mut g: Vec<usize> = mates.iter().chain([&a]).flat_map(|&i| [self.links[i].parent, self.links[i].child]).collect();
+        g.sort_unstable();
+        g.dedup();
+        // shortcut: loops of two sub-grids (two pivots in line on one control surface) are left out as
+        // harmless; check that if phantom forces show up on one.
+        (g.len() > 2).then_some(g)
     }
 
     /// Free and not in a loop (the tree pose would pull a loop apart).
@@ -859,7 +1364,7 @@ impl Report {
             Mobility::Fixed => Status::Free,
             Mobility::Free => {
                 let t = self.tree.iter().position(|l| l.comp == self.all[a].comp);
-                if t.is_some_and(|t| self.short(t)) {
+                if t.is_some_and(|t| self.short(t) || self.rubs.iter().any(|r| r.joint == t && r.hit)) {
                     return Status::Hits;
                 }
                 let s = t.and_then(|t| self.sweeps.as_ref()?.get(t)?.as_ref());
@@ -911,6 +1416,10 @@ impl Report {
                 out.extend([(j.comp as u32, Status::Locked), (j.half as u32, Status::Locked)]);
             }
         }
+        out.extend(self.rubs.iter().flat_map(|r| {
+            let s = if r.hit { Status::Hits } else { Status::Rubs };
+            [(r.part, s), (r.on, s)]
+        }));
         for s in self.sweeps.iter().flatten().flatten() {
             for c in s.now.iter().chain(s.down.hit.iter()).chain(s.up.hit.iter()) {
                 out.extend([(c.moving, Status::Hits), (c.other, Status::Hits)]);
@@ -938,6 +1447,20 @@ impl Report {
                     let v = l.sign * self.settings[t];
                     format!("Stops at {}", if l.slide { format!("{v:+.2} m") } else { format!("{:+.0}°", v.to_degrees()) })
                 }
+                Some(t) if self.rubs.iter().any(|r| r.joint == t && r.hit) => {
+                    let l = &self.tree[t];
+                    let fmt = |v: f64| if l.slide { format!("{:+.2} m", l.sign * v) } else { format!("{:+.0}°", (l.sign * v).to_degrees()) };
+                    let mut hits: Vec<&Rub> = self.rubs.iter().filter(|r| r.joint == t && r.hit).collect();
+                    hits.sort_by(|x, y| (l.sign * x.at).total_cmp(&(l.sign * y.at)));
+                    let mut lines: Vec<String> = hits.iter().map(|r| format!("Hits {} at {}", name(r.on as usize), fmt(r.at))).collect();
+                    if lines.len() > 4 {
+                        let more = lines.len() - 3;
+                        lines.truncate(3);
+                        lines.push(format!("and {more} more parts"));
+                    }
+                    lines.push("May cause phantom forces".into());
+                    lines.join("\n")
+                }
                 Some(t) => match self.sweeps.as_ref().and_then(|s| s.get(t)?.as_ref()) {
                     Some(s) => self.sweep_text(t, s, name),
                     None => "Free".to_string(),
@@ -946,6 +1469,23 @@ impl Report {
             },
         };
         Some((title, text, self.status(a)))
+    }
+
+    /// One note per part sunk into: the part, the parts that sink into it, the text (one line per
+    /// part, deepest first, then what it does) and the status (a hit or a rub).
+    pub fn rub_notes(&self) -> Vec<(u32, Vec<u32>, String, Status)> {
+        // Hits show on their joint's label (`describe`).
+        let mut on: Vec<u32> = self.rubs.iter().filter(|r| !r.hit).map(|r| r.on).collect();
+        on.sort_unstable();
+        on.dedup();
+        (on.into_iter())
+            .map(|c| {
+                let mut rubs: Vec<&Rub> = self.rubs.iter().filter(|r| r.on == c && !r.hit).collect();
+                rubs.sort_by(|x, y| y.depth.total_cmp(&x.depth));
+                let parts = [c].into_iter().chain(rubs.iter().map(|r| r.part)).collect();
+                (c, parts, "Rubbing: may cause phantom forces".into(), Status::Rubs)
+            })
+            .collect()
     }
 
     fn sweep_text(&self, t: usize, s: &Sweep, name: &dyn Fn(usize) -> String) -> String {
@@ -1137,6 +1677,100 @@ mod tests {
     }
 
     #[test]
+    fn loops_found_by_joint() {
+        // Swing wing: fuselage 0, cylinder 1, rod 2, wing 3, in a loop; a door 4 on the fuselage; two
+        // hinges side by side on 5.
+        let e = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 4), (0, 5), (5, 0)];
+        assert_eq!(on_loops(&e), vec![true, true, true, true, false, true, true]);
+    }
+
+    /// A plain voxel's collision piece centred on aero point `p`, as `hulls` builds a one-cell box
+    /// record: core and sharp outer box.
+    fn block(comp: u32, body: usize, p: V3) -> Hull {
+        let o = v3(p.y / 0.25, -p.z / 0.25, p.x / 0.25);
+        let h = 0.5 - 0.002 / 0.25;
+        Hull::from_solid(comp, body, &cube(p)).with_outer(&box_solid(o - v3(h, h, h), o + v3(h, h, h)), box_margin(0.123))
+    }
+
+    #[test]
+    fn rounded_depth_across_corners() {
+        // Two hulls side by side diagonally: their cores' nearest features are parallel edges
+        // (x and y apart), then corners (x, y and z), so the depth is the margins less the true
+        // distance, not the per-face gap.
+        let a = Hull::from_solid(0, 0, &cube(V3::ZERO));
+        let gap = 0.2 - 2.0 * (0.125 - CORE);
+        for (off, n) in [(v3(0.2, 0.2, 0.0), 2.0f64), (v3(0.2, 0.2, 0.2), 3.0)] {
+            let d = a.depth(&Hull::from_solid(1, 1, &cube(off)), -1.0);
+            assert!((d - (2.0 * MARGIN - gap * n.sqrt())).abs() < 1e-6, "{n}: {d}");
+        }
+    }
+
+    #[test]
+    fn rubbing_inside_a_loop() {
+        // A block turning beside a block on the fixed body, held by two hinges in line (a loop):
+        // like a pivot head turning beside a block. The sharp corners go in 4.7 cm at 45°.
+        let z = v3(0.0, 0.0, 1.0);
+        let tree = vec![JointLink { travel: (-1.6, 1.6), ..hinge(0, 1, V3::ZERO, z) }];
+        let links = [tree.clone(), vec![JointLink { comp: 1, free: true, ..tree[0].clone() }]].concat();
+        let hulls = vec![block(10, 0, V3::ZERO), block(11, 1, v3(0.25, 0.0, 0.0))];
+        let rubs = loop_rubs(&tree, &links, 2, &[0.0], &hulls, &[true, false], 0, &[0, 1]);
+        assert_eq!(rubs.len(), 1, "{rubs:?}");
+        let r = rubs[0];
+        assert!((r.part, r.on) == (11, 10) && !r.hit && (0.045..0.049).contains(&r.depth) && (0.7..0.86).contains(&r.at.abs()), "{r:?}");
+        // Two hulls, rounded by 4 cm, go in only 3 cm: under the warning.
+        let round = vec![Hull::from_solid(10, 0, &cube(V3::ZERO)), Hull::from_solid(11, 1, &cube(v3(0.25, 0.0, 0.0)))];
+        assert!(loop_rubs(&tree, &links, 2, &[0.0], &round, &[true, false], 0, &[0, 1]).is_empty());
+        // The pivot's own other half counts the same (the game does not skip it).
+        let halves = [tree.clone(), vec![JointLink { comp: 10, half: 11, free: true, ..tree[0].clone() }]].concat();
+        assert_eq!(loop_rubs(&tree, &halves, 2, &[0.0], &hulls, &[true, false], 0, &[0, 1]).len(), 1);
+        // A block in the way: the loop drives the part 5 cm into it (a hit), and the rub past it is
+        // not reached.
+        let hulls = [hulls, vec![block(12, 0, v3(0.25, 0.25, 0.0))]].concat();
+        let rubs = loop_rubs(&tree, &links, 2, &[0.0], &hulls, &[true, false], 0, &[0, 1]);
+        assert!(rubs.iter().any(|r| r.hit && (r.part, r.on) == (11, 12) && r.at > 0.0), "{rubs:?}");
+        assert!(rubs.iter().filter(|r| !r.hit).all(|r| r.at < 0.0), "{rubs:?}");
+        // Under 4 cm is left out: a block 1.6 cm into a fixed one, slid along it.
+        let x = v3(1.0, 0.0, 0.0);
+        let tree = vec![JointLink { slide: true, travel: (-0.1, 0.1), ..hinge(0, 1, V3::ZERO, x) }];
+        let links = [tree.clone(), vec![JointLink { comp: 1, free: true, ..tree[0].clone() }]].concat();
+        let hulls = vec![block(10, 0, V3::ZERO), block(11, 1, v3(0.0, 0.23, 0.0))];
+        assert!(loop_rubs(&tree, &links, 2, &[0.0], &hulls, &[true, false], 0, &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn records_merge_as_the_game_does() {
+        // The cut cells' corners, as many as the game keeps (`0x473D00`, rub RE table).
+        let counts = [6, 4, 7, 8, 6, 8, 8, 8, 6, 6, 4, 6, 6, 6, 4, 7, 4, 8, 7, 6, 4, 8, 8, 7, 4, 9, 8, 9, 10, 10, 8, 8, 7, 9, 9, 8, 7, 8, 8, 8, 7];
+        for (id, &n) in (1..=41).zip(&counts) {
+            let c = Cell::new(0, [0; 3], cut_at(id, &crate::vehicle::IDENTITY, &crate::vehicle::IDENTITY, [0; 3]));
+            assert_eq!(c.verts.len(), n, "id {id}");
+        }
+        // Two cubes then a wedge (id 1) in a row: one 2x1x1 box and the wedge's own hull.
+        let w = |x: i32| cut_at(1, &crate::vehicle::IDENTITY, &crate::vehicle::IDENTITY, [x, 0, 0]);
+        let cells = [Cell::new(0, [0, 0, 0], None), Cell::new(1, [1, 0, 0], None), Cell::new(2, [2, 0, 0], w(2))];
+        let r = records(&cells);
+        assert_eq!(r.len(), 2);
+        assert!(r[0].planes.is_empty() && (r[0].lo, r[0].hi) == ([0, 0, 0], [1, 0, 0]) && r[0].cells == vec![0, 1]);
+        assert!(r[1].planes.len() == 1 && r[1].cells == vec![2]);
+        // Wedges of one slope merge into one hull, and the cubes below their flat sides join it; a
+        // missing cube under the row stops that face.
+        let cells = [Cell::new(0, [0, 0, 0], w(0)), Cell::new(1, [1, 0, 0], w(1)), Cell::new(2, [0, -1, 0], None), Cell::new(3, [1, -1, 0], None)];
+        let r = records(&cells);
+        assert!(r.len() == 1 && r[0].cells.len() == 4, "{:?}", r.iter().map(|r| (r.lo, r.hi, r.cells.clone())).collect::<Vec<_>>());
+        let r = records(&cells[..3]);
+        assert_eq!(r.iter().map(|r| r.cells.clone()).collect::<Vec<_>>(), vec![vec![0, 1], vec![2]]);
+        // Pieces: a cell inside a box record reaches its neighbour (no gap); the outside is 2 mm in.
+        let mut lib = crate::defs::Library::new(std::path::Path::new("/nonexistent"), std::path::Path::new("/nonexistent"));
+        let xml = r#"<vehicle><bodies><body><components><c d="none"><o r="1,0,0,0,1,0,0,0,1"><vp/></o></c><c d="none"><o r="1,0,0,0,1,0,0,0,1"><vp z="1"/></o></c></components></body></bodies></vehicle>"#;
+        let comps = crate::vehicle::parse_vehicle_xml(xml);
+        assert_eq!(comps.iter().map(|c| c.pos).collect::<Vec<_>>(), vec![[0, 0, 0], [0, 0, 1]]);
+        let h = hulls(&comps, &mut lib);
+        let span = |h: &Hull| h.outer.as_ref().unwrap().iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
+        let (a, b) = (span(&h[0]), span(&h[1]));
+        assert!((a.0 + 0.123).abs() < 1e-9 && (a.1 - 0.125).abs() < 1e-9 && (b.0 - 0.125).abs() < 1e-9 && (b.1 - 0.373).abs() < 1e-9, "{a:?} {b:?}");
+    }
+
+    #[test]
     fn chosen_fixed_body_holds_still() {
         // A swing wing: the wing is body 0, the fuselage body 1 on a driven pivot.
         let z = v3(0.0, 0.0, 1.0);
@@ -1248,7 +1882,7 @@ mod tests {
                 hulls.push(Hull::from_solid(2, 0, &cube(v3(1.0 + 0.25 * k as f64, y, 0.0))));
             }
         }
-        let r = Report { all: tree.clone(), links: tree.clone(), fixed: vec![true, false, false, false], tree, n_bodies: 4, wanted: vec![0.0; 3], settings: vec![0.0; 3], poses: Vec::new(), mobility: Vec::new(), mech_of: Vec::new(), dof: Vec::new(), hulls, sweeps: None };
+        let r = Report { all: tree.clone(), links: tree.clone(), fixed: vec![true, false, false, false], tree, n_bodies: 4, wanted: vec![0.0; 3], settings: vec![0.0; 3], poses: Vec::new(), mobility: Vec::new(), mech_of: Vec::new(), dof: Vec::new(), hulls, sweeps: None, rubs: Vec::new() };
         let mut st = Settler::default();
         let s = st.frame(&r, &[FRAC_PI_2, 0.0, 0.0]);
         let p = body_poses(&r.tree, 4, &|i, _| s[i]);
@@ -1417,5 +2051,6 @@ mod tests {
         assert!(m.iter().all(|m| matches!(m, Mobility::Locked { .. })), "{m:?}");
     }
 }
+
 
 
