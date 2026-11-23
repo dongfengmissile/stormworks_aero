@@ -1,13 +1,13 @@
 //! DLL entry and bootstrap (log, fault handler, kill switches, hooks, overlay).
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
 
 use stormworks_core::plugin::{appdata, disabled, exe_dir};
+use stormworks_core::swml::{self, Bind, Setting, Value};
 use windows_sys::Win32::Foundation::HINSTANCE;
 use windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 
@@ -17,6 +17,39 @@ use crate::state::SELF_MODULE;
 
 /// Compile-time stamp of THIS binary, logged at bootstrap: tells which DLL the game loaded.
 const PLUGIN_BUILD_LABEL: &str = env!("MECH_BUILD_STAMP");
+
+pub(crate) static MECH_KEY: Bind = Bind::new("Shift");
+pub(crate) static PLAY_KEY: Bind = Bind::new("Space");
+pub(crate) static DELETE_KEY: Bind = Bind::new("Delete");
+pub(crate) static CANCEL_KEY: Bind = Bind::new("Escape");
+
+/// Every key, for the proxy mod loader's manager.
+fn settings() -> [Setting; 4] {
+    [
+        Setting {
+            id: "mech_modifier",
+            label: "Fix several sub-grids (mechanisms click)",
+            tip: "Hold and click to fix more than one sub-grid.",
+            value: Value::Hold(&MECH_KEY),
+        },
+        Setting { id: "sequence_play", label: "Play sequence (sequence window)", tip: "Play the sequence.", value: Value::Key(&PLAY_KEY) },
+        Setting { id: "sequence_delete_move", label: "Delete move (sequence window)", tip: "Delete the selected move.", value: Value::Key(&DELETE_KEY) },
+        Setting { id: "dialog_cancel", label: "Cancel dialog (sequence window)", tip: "Close the open dialog.", value: Value::Key(&CANCEL_KEY) },
+    ]
+}
+
+#[no_mangle]
+pub extern "C" fn swml_describe() -> *const c_char {
+    static TEXT: OnceLock<CString> = OnceLock::new();
+    TEXT.get_or_init(|| CString::new(swml::describe(&settings())).unwrap_or_default()).as_ptr()
+}
+
+/// # Safety
+/// NUL-terminated strings, from the mod loader.
+#[no_mangle]
+pub unsafe extern "C" fn swml_set(id: *const c_char, value: *const c_char) {
+    swml::set(&settings(), id, value)
+}
 
 /// The game's folder and `%APPDATA%/Stormworks`.
 pub(crate) static PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
@@ -59,7 +92,7 @@ fn bootstrap() {
     {
         let mut watch = crate::hang::Watch::new();
         for second in 1u64.. {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(std::time::Duration::from_secs(1));
             watch.check();
             if second % 10 == 0 {
                 log_line(&format!(
@@ -110,7 +143,6 @@ pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, reserved: *mut c_
         }
         SELF_MODULE.store(module as usize, Ordering::SeqCst);
         let _ = thread::Builder::new().name("stormworks-mechanisms-bootstrap".into()).spawn(|| {
-            thread::sleep(Duration::from_millis(500));
             bootstrap();
         });
     }

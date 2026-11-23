@@ -171,10 +171,23 @@ unsafe fn register_icons(f: &Fns, ctx: usize) -> bool {
         }
     }
     ICON_TEX.store(gl, Ordering::SeqCst);
+    // The game thread normally draws too: then the pixels go in now and the buttons have their
+    // icons from the first frame, instead of once the overlay has started.
+    if gl_current() {
+        upload_icons();
+    }
     true
 }
 
-/// Render thread, GL context current: write our icon pixels into the atlas texture once per texture.
+/// An OpenGL context is current on this thread. Checked before `paint::gl()`, which would cache
+/// "no GL" for good if first asked without one.
+fn gl_current() -> bool {
+    let Some(f) = crate::paint::gl_proc(c"wglGetCurrentContext") else { return false };
+    unsafe { std::mem::transmute::<usize, unsafe extern "system" fn() -> usize>(f)() != 0 }
+}
+
+/// GL context current (render thread, or the game thread at registration): write our icon pixels
+/// into the atlas texture once per texture.
 pub(crate) fn upload_icons() {
     let tex = ICON_TEX.load(Ordering::SeqCst);
     if tex == 0 || ICONS_UPLOADED.load(Ordering::Relaxed) == tex {

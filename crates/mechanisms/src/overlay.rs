@@ -49,7 +49,7 @@ impl ImguiRenderLoop for Overlay {
             let on = crate::toolbar::mech_active();
             crate::editor::WANTED.store(on, Ordering::Relaxed);
             crate::editor::PICK_WANTED.store(on, Ordering::Relaxed);
-            crate::mechmode::SHIFT.store(ui.io().key_shift, Ordering::Relaxed);
+            crate::mechmode::SHIFT.store(crate::plugin::MECH_KEY.down(ui), Ordering::Relaxed);
             if on {
                 crate::mechmode::draw_fix_hint(ui);
                 crate::mechmode::draw_labels(ui);

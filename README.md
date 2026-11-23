@@ -39,6 +39,8 @@ Logs go to:
 
 ## Keybindings
 
+The defaults below; every key (and the "All vehicles" settings) can be changed in the proxy mod loader's mod manager (F6), which then keeps the settings in `<Stormworks>/UserData/StormworksAero.ini` instead of `aero.xml`.
+
 | key | |
 |---|---|
 | F7 | analysis window: AoA / Mach sweeps, stability derivatives, response simulation, area ruling, voxel view, the pitch / collective for each propeller and rotor's maximum thrust |

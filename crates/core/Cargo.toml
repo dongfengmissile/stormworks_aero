@@ -10,8 +10,11 @@ name = "stormworks_core"
 
 [features]
 logging = []
+# Settings and key bindings for the proxy mod loader's manager (`swml`).
+swml = ["dep:imgui"]
 
 [target.'cfg(windows)'.dependencies]
+imgui = { version = "0.12", optional = true }
 minhook = "0.9"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

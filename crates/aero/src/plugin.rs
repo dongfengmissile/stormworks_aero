@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Duration;
 
 use windows_sys::Win32::Foundation::HINSTANCE;
 use windows_sys::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModuleFileNameW, GetModuleHandleW};
@@ -123,7 +122,7 @@ fn bootstrap() {
     let mut watch = crate::hang::Watch::new();
     #[cfg(feature = "logging")]
     for second in 1u64.. {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(std::time::Duration::from_secs(1));
         watch.check();
         if second % 10 != 0 {
             continue;
@@ -180,7 +179,6 @@ pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, reserved: *mut c_
         }
         SELF_MODULE.store(module as usize, Ordering::SeqCst);
         let _ = thread::Builder::new().name("stormworks-aero-bootstrap".into()).spawn(|| {
-            thread::sleep(Duration::from_millis(500));
             bootstrap();
         });
     }

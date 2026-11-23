@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 logging = ["stormworks_core/logging"]
 
 [dependencies]
-stormworks_core = { path = "../core" }
+stormworks_core = { path = "../core", features = ["swml"] }
 
 [target.'cfg(windows)'.dependencies]
 minhook = "0.9"

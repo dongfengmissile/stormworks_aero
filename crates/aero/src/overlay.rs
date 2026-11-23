@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use hudhook::imgui::{self, Condition, Context, Io, Key, MouseButton, TableColumnFlags, TableColumnSetup, TableFlags, TableRowFlags, TextureId, Ui};
+use hudhook::imgui::{self, Condition, Context, Io, MouseButton, TableColumnFlags, TableColumnSetup, TableFlags, TableRowFlags, TextureId, Ui};
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 
 use crate::defs::Library;
@@ -470,7 +470,7 @@ impl Overlay {
                 self.tool
             ));
             match pick {
-                Some(face) => self.apply_tool(&m, face, io.key_ctrl && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0),
+                Some(face) => self.apply_tool(&m, face, crate::settings::WING_PICK_KEY.down(ui) && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0),
                 None => self.status = "no block under the cursor".into(),
             }
         }
@@ -1355,7 +1355,7 @@ impl Overlay {
     /// Hover preview: the faces a press here would change, lit up over the vehicle.
     fn hover_preview(&mut self, ui: &Ui, m: &Arc<Model>) {
         let io = ui.io();
-        let pick = io.key_ctrl && self.tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0;
+        let pick = crate::settings::WING_PICK_KEY.down(ui) && self.tool == Tool::Wing && crate::toolbar::WING_MODE.load(Ordering::Relaxed) == 0;
         let face = if io.want_capture_mouse { None } else { crate::toolbar::pointer().and_then(|at| self.pick_world(at, io.display_size, false)) };
         let key = face.map(|f| (f, self.tool, crate::toolbar::WING_MODE.load(Ordering::Relaxed), pick, Arc::as_ptr(m) as usize, self.des.wings.len()));
         if key != self.hover_key {
@@ -1901,14 +1901,14 @@ impl Overlay {
         // imgui-rs builds the draw-list slice from a null pointer when a frame draws nothing,
         // which panics under debug assertions (and is UB anyway): always emit one invisible quad.
         ui.get_foreground_draw_list().add_rect([-4.0, -4.0], [-3.0, -3.0], [0.0, 0.0, 0.0, 0.01]).filled(true).build();
-        if ui.is_key_pressed(Key::F7) {
+        if crate::settings::ANALYSIS_KEY.pressed(ui) {
             self.open = !self.open;
         }
-        if ui.is_key_pressed(Key::F9) {
+        if crate::settings::FLIGHT_DATA_KEY.pressed(ui) {
             self.flight_data = !self.flight_data;
         }
         crate::flight::DEBUG_WANTED.store(self.flight_data, Ordering::Relaxed);
-        if ui.is_key_pressed(Key::F8) {
+        if crate::settings::VEHICLES_KEY.pressed(ui) {
             self.vehicles = !self.vehicles;
         }
         if self.vehicles {
@@ -1935,8 +1935,7 @@ impl Overlay {
         }
         let mut open = self.open;
         ui.window("Aero analysis##aero").size([840.0, 700.0], Condition::FirstUseEver).opened(&mut open).build(|| {
-            let io = ui.io();
-            if io.key_ctrl && ui.is_key_pressed(Key::Z) && ui.is_window_focused_with_flags(imgui::WindowFocusedFlags::ROOT_AND_CHILD_WINDOWS) {
+            if crate::settings::UNDO_KEY.pressed(ui) && ui.is_window_focused_with_flags(imgui::WindowFocusedFlags::ROOT_AND_CHILD_WINDOWS) {
                 self.undo_designation();
             }
             self.header(ui);

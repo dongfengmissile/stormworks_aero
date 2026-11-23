@@ -290,6 +290,7 @@ dependencies = [
 name = "stormworks_core"
 version = "0.1.0"
 dependencies = [
+ "imgui",
  "minhook",
  "windows-sys",
 ]

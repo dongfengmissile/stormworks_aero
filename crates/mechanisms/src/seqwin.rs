@@ -3,7 +3,7 @@
 //! ImGui, `pose` and `marks`, so the UI mock (`tools/uimock`) renders it too; the host
 //! (`mechmode`) saves the moves and poses the vehicle.
 
-use imgui::{Key, MouseButton, MouseCursor, Ui};
+use imgui::{MouseButton, MouseCursor, Ui};
 
 use crate::ui::{hover_tip, BAD, CL_COLOR, DIM, GOOD, WARN};
 
@@ -233,13 +233,13 @@ pub(crate) fn contents(ui: &Ui, lanes: &[Lane], s: &mut State) -> Vec<Act> {
     timeline(ui, lanes, s, &mut acts);
     inspector(ui, lanes, s, &mut acts);
     if ui.is_window_focused_with_flags(imgui::WindowFocusedFlags::ROOT_AND_CHILD_WINDOWS) && !ui.io().want_text_input {
-        if ui.is_key_pressed(Key::Space) {
+        if crate::plugin::PLAY_KEY.pressed(ui) {
             if s.blocked {
                 acts.push(Act::Error);
             }
             play(s, s.back);
         }
-        if let Some((r, k)) = s.sel.filter(|_| ui.is_key_pressed(Key::Delete)) {
+        if let Some((r, k)) = s.sel.filter(|_| crate::plugin::DELETE_KEY.pressed(ui)) {
             delete_move(s, r, k, &mut acts);
         }
     }
@@ -391,7 +391,7 @@ fn header(ui: &Ui, s: &mut State, acts: &mut Vec<Act>) {
             ui.close_current_popup();
         }
         ui.same_line();
-        if ui.button_with_size("Cancel", [90.0, 0.0]) || ui.is_key_pressed(Key::Escape) {
+        if ui.button_with_size("Cancel", [90.0, 0.0]) || crate::plugin::CANCEL_KEY.pressed(ui) {
             ui.close_current_popup();
         }
     });
@@ -415,7 +415,7 @@ fn rename_popup(ui: &Ui, s: &mut State, acts: &mut Vec<Act>) {
             ui.close_current_popup();
         }
         ui.same_line();
-        if ui.button_with_size("Cancel", [90.0, 0.0]) || ui.is_key_pressed(Key::Escape) {
+        if ui.button_with_size("Cancel", [90.0, 0.0]) || crate::plugin::CANCEL_KEY.pressed(ui) {
             ui.close_current_popup();
         }
     });
